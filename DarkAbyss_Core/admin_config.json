@@ -1,0 +1,6 @@
+{
+  "allow_server_administrators": true,
+  "allowed_user_ids": [],
+  "allowed_role_ids": [],
+  "audit_channel_id": null
+}
