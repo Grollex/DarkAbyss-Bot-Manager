@@ -33,6 +33,7 @@ logs/
 # Local runtime files and secrets
 DarkAbyss_Core/admin_bot.lock
 DarkAbyss_Core/admin_bot_token.txt
+DarkAbyss_Core/admin_config.json
 .env
 .env.*
 

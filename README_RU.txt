@@ -8,9 +8,11 @@ Discord Admin Bot, Discord-only edition
 Быстрый запуск:
 1. Установить Python 3.11+.
 2. Запустить setup.bat.
-3. Вставить токен бота в DarkAbyss_Core\admin_bot_token.txt.
-4. В Discord Developer Portal включить Server Members Intent.
-5. Пригласить бота на сервер с granular permissions:
+3. setup.bat установит зависимости и создаст пользовательские каталоги/файлы данных.
+4. Вставить токен бота в созданный файл %LOCALAPPDATA%\DarkAbyssBotManager\secrets\admin_bot_token.txt.
+   Если задан DARKABYSS_DATA_DIR, файл токена находится в <DARKABYSS_DATA_DIR>\secrets\admin_bot_token.txt.
+5. В Discord Developer Portal включить Server Members Intent.
+6. Пригласить бота на сервер с granular permissions:
    - View Channels
    - Send Messages
    - Read Message History
@@ -20,7 +22,7 @@ Discord Admin Bot, Discord-only edition
    - Moderate Members
    - Kick Members
    - Ban Members
-6. Запустить Admin.bat.
+7. Запустить Admin.bat.
 
 Важно про права:
 - Administrator не обязателен для bot account, если выданы перечисленные выше права.
@@ -31,13 +33,14 @@ Discord Admin Bot, Discord-only edition
 
 Доступ:
 - По умолчанию /execute доступен администраторам Discord-сервера.
-- Дополнительных людей можно добавить в DarkAbyss_Core\admin_config.json:
+- Дополнительных людей можно добавить в %LOCALAPPDATA%\DarkAbyssBotManager\config\admin.json:
+  Если задан DARKABYSS_DATA_DIR, пользовательский конфиг находится в <DARKABYSS_DATA_DIR>\config\admin.json.
   allowed_user_ids: Discord user IDs
   allowed_role_ids: Discord role IDs
 - Если нужно запретить всем администраторам и оставить только allowlist, поставь:
   "allow_server_administrators": false
 - audit_channel_id можно поставить в ID текстового канала для логов действий.
-- admin_config.json валидируется строго при старте. Строки "true" и "false" не принимаются вместо boolean true/false.
+- config\admin.json валидируется строго при старте. Строки "true" и "false" не принимаются вместо boolean true/false.
 
 Поддерживаемые действия /execute:
 - send_message: channel + content
@@ -75,7 +78,17 @@ Audit logging:
 - Все действия ограничены текущим Discord-сервером, где вызвана команда.
 - Если Discord отказывает действию, проверь role hierarchy, права бота и permissions конкретного канала.
 
-Git и токен:
-- Скопируй DarkAbyss_Core\admin_bot_token.example.txt в DarkAbyss_Core\admin_bot_token.txt.
-- Вставляй настоящий токен только в DarkAbyss_Core\admin_bot_token.txt.
-- DarkAbyss_Core\admin_bot_token.txt специально не отслеживается Git и не должен попадать в коммиты.
+Git и пользовательские данные:
+- Файлы программы можно заменять при обновлениях: пользовательские настройки, токен и runtime-файлы живут отдельно от кода.
+- По умолчанию данные пользователя хранятся в %LOCALAPPDATA%\DarkAbyssBotManager\.
+- Текущий layout данных:
+  - config\admin.json — пользовательский конфиг админ-бота.
+  - secrets\admin_bot_token.txt — настоящий токен Discord-бота.
+  - runtime\admin_bot.lock — lock-файл одного запущенного экземпляра.
+  - logs\ — каталог для будущих логов.
+- При первом запуске config\admin.json создаётся из программного шаблона DarkAbyss_Core\defaults\admin_config.json.
+- Для токена можно ориентироваться на шаблон DarkAbyss_Core\admin_bot_token.example.txt, но настоящий токен вставляй только в secrets\admin_bot_token.txt внутри пользовательских данных.
+- DarkAbyss_Core\admin_bot_token.txt и DarkAbyss_Core\admin_config.json считаются legacy runtime-файлами и не отслеживаются Git.
+- Если legacy config/token рядом с Admin.py уже существуют, они импортируются в новый каталог только если новых файлов ещё нет. Существующие файлы в %LOCALAPPDATA%\DarkAbyssBotManager\ никогда не перезаписываются legacy-файлами.
+- Legacy token со значением PUT_DISCORD_BOT_TOKEN_HERE считается placeholder и не импортируется как настоящий секрет.
+- Для разработки и тестов можно задать DARKABYSS_DATA_DIR, чтобы полностью переопределить корень пользовательских данных.

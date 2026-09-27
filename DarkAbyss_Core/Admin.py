@@ -8,29 +8,18 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-
-BASE_DIR = Path(__file__).resolve().parent
-ROOT_DIR = BASE_DIR.parent
-TOKEN_PATH = BASE_DIR / "admin_bot_token.txt"
-CONFIG_PATH = BASE_DIR / "admin_config.json"
-LOCK_PATH = BASE_DIR / "admin_bot.lock"
-
-DEFAULT_CONFIG = {
-    "allow_server_administrators": True,
-    "allowed_user_ids": [],
-    "allowed_role_ids": [],
-    "audit_channel_id": None,
-}
+import app_paths
 
 bot_lock_handle = None
 
 
 def load_token() -> str:
-    if not TOKEN_PATH.exists():
-        raise RuntimeError(f"Token file not found: {TOKEN_PATH}")
-    token = TOKEN_PATH.read_text(encoding="utf-8").strip()
-    if not token or token == "PUT_DISCORD_BOT_TOKEN_HERE":
-        raise RuntimeError("Put the Discord bot token into DarkAbyss_Core/admin_bot_token.txt")
+    app_paths.ensure_user_data()
+    if not app_paths.ADMIN_TOKEN_PATH.exists():
+        raise RuntimeError(f"Token file not found: {app_paths.ADMIN_TOKEN_PATH}")
+    token = app_paths.ADMIN_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    if not token or token == app_paths.TOKEN_PLACEHOLDER:
+        raise RuntimeError(f"Put the Discord bot token into {app_paths.ADMIN_TOKEN_PATH}")
     return token
 
 
@@ -77,29 +66,26 @@ def validate_config(config: dict) -> dict:
 
 
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
-        return validate_config(dict(DEFAULT_CONFIG))
+    app_paths.ensure_user_data()
 
     try:
-        loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        loaded = json.loads(app_paths.ADMIN_CONFIG_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid admin_config.json: {exc}") from exc
+        raise RuntimeError(f"Invalid admin config {app_paths.ADMIN_CONFIG_PATH}: {exc}") from exc
 
     if not isinstance(loaded, dict):
-        raise RuntimeError("Invalid admin_config.json: root value must be an object.")
+        raise RuntimeError(f"Invalid admin config {app_paths.ADMIN_CONFIG_PATH}: root value must be an object.")
 
-    config = dict(DEFAULT_CONFIG)
-    config.update(loaded)
     try:
-        return validate_config(config)
+        return validate_config(loaded)
     except ValueError as exc:
-        raise RuntimeError(f"Invalid admin_config.json: {exc}") from exc
+        raise RuntimeError(f"Invalid admin config {app_paths.ADMIN_CONFIG_PATH}: {exc}") from exc
 
 
 def acquire_single_instance_lock() -> bool:
     global bot_lock_handle
-    bot_lock_handle = LOCK_PATH.open("a+b")
+    app_paths.ensure_user_data()
+    bot_lock_handle = app_paths.ADMIN_LOCK_PATH.open("a+b")
     try:
         msvcrt.locking(bot_lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
