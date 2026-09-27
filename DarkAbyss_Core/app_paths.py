@@ -26,6 +26,7 @@ CONFIG_DIR = DATA_ROOT / "config"
 SECRETS_DIR = DATA_ROOT / "secrets"
 RUNTIME_DIR = DATA_ROOT / "runtime"
 LOGS_DIR = DATA_ROOT / "logs"
+INSTANCES_DIR = DATA_ROOT / "instances"
 
 ADMIN_CONFIG_PATH = CONFIG_DIR / "admin.json"
 ADMIN_TOKEN_PATH = SECRETS_DIR / "admin_bot_token.txt"
@@ -36,7 +37,7 @@ LEGACY_ADMIN_TOKEN_PATH = PROGRAM_ROOT / "admin_bot_token.txt"
 
 
 def ensure_user_directories() -> None:
-    for directory in (CONFIG_DIR, SECRETS_DIR, RUNTIME_DIR, LOGS_DIR):
+    for directory in (CONFIG_DIR, SECRETS_DIR, RUNTIME_DIR, LOGS_DIR, INSTANCES_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
 
