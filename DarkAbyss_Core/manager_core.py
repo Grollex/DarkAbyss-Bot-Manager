@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -7,7 +8,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Callable
+from typing import BinaryIO, Callable, Mapping
 
 import app_paths
 import bot_registry
@@ -66,6 +67,24 @@ class ProcessStatus:
     exit_code: int | None
 
 
+@dataclass(frozen=True)
+class InstanceInfo:
+    instance_id: str
+    display_name: str
+    bot_type: str
+    bot_type_display_name: str
+    bot_version: str
+    state: str
+    pid: int | None
+    started_at: datetime | None
+    uptime_seconds: float | None
+    exit_code: int | None
+    config_path: Path
+    logs_dir: Path
+    stdout_log_path: Path
+    stderr_log_path: Path
+
+
 @dataclass
 class _ProcessRecord:
     instance_id: str
@@ -114,30 +133,39 @@ class BotProcessManager:
         self._launch_spec_builder = launch_spec_builder
         self._popen_factory = popen_factory
         self._records: dict[str, _ProcessRecord] = {}
-        self._last_status: dict[str, ProcessStatus] = {}
+        self._operation_locks: dict[str, threading.RLock] = {}
         self._lock = threading.RLock()
 
     def start(self, instance_id: str) -> ProcessStatus:
-        with self._lock:
-            record = self._records.get(instance_id)
-            if record is not None:
-                status = self._refresh_record(record)
-                if status.state == STATE_RUNNING:
-                    raise ProcessAlreadyRunningError(f"Instance already running: {instance_id}")
+        operation_lock = self._get_operation_lock(instance_id)
+        with operation_lock:
+            with self._lock:
+                record = self._records.get(instance_id)
+                if record is not None:
+                    status = self._refresh_record(record)
+                    if status.state == STATE_RUNNING:
+                        raise ProcessAlreadyRunningError(f"Instance already running: {instance_id}")
 
             instance, bot_type = self._load_instance_and_type(instance_id)
-            launch_spec = self._launch_spec_builder(instance, bot_type)
+            try:
+                launch_spec = self._launch_spec_builder(instance, bot_type)
+                self._validate_launch_spec(instance, launch_spec)
+            except ManagerCoreError:
+                raise
+            except Exception as exc:
+                raise ProcessStartError(f"Failed to build launch spec for instance {instance_id!r}: {exc}") from exc
+
             stdout_handle = None
             stderr_handle = None
             try:
-                launch_spec.stdout_log_path.parent.mkdir(parents=True, exist_ok=True)
-                launch_spec.stderr_log_path.parent.mkdir(parents=True, exist_ok=True)
+                child_env = dict(launch_spec.env)
+                child_env["DARKABYSS_DATA_DIR"] = str(app_paths.DATA_ROOT.resolve())
                 stdout_handle = launch_spec.stdout_log_path.open("ab")
                 stderr_handle = launch_spec.stderr_log_path.open("ab")
                 process = self._popen_factory(
                     [launch_spec.executable, *launch_spec.args],
                     cwd=launch_spec.cwd,
-                    env=launch_spec.env,
+                    env=child_env,
                     stdout=stdout_handle,
                     stderr=stderr_handle,
                     stdin=subprocess.DEVNULL,
@@ -158,40 +186,51 @@ class BotProcessManager:
                 stdout_handle=stdout_handle,
                 stderr_handle=stderr_handle,
             )
-            self._records[instance.id] = record
-            return self._status_from_record(record)
+            with self._lock:
+                self._records[instance.id] = record
+                return self._status_from_record(record)
 
     def stop(self, instance_id: str, timeout: float = 10.0) -> ProcessStatus:
-        with self._lock:
-            record = self._records.get(instance_id)
-            if record is None:
-                raise ProcessNotManagedError(f"No process managed for instance: {instance_id}")
+        timeout_value = self._validate_timeout(timeout)
+        operation_lock = self._get_operation_lock(instance_id)
+        with operation_lock:
+            with self._lock:
+                record = self._records.get(instance_id)
+                if record is None:
+                    raise ProcessNotManagedError(f"No process managed for instance: {instance_id}")
 
-            status = self._refresh_record(record)
-            if status.state != STATE_RUNNING:
-                return status
+                status = self._refresh_record(record)
+                if status.state != STATE_RUNNING:
+                    return status
 
             try:
                 record.process.terminate()
                 try:
-                    exit_code = record.process.wait(timeout=timeout)
+                    exit_code = record.process.wait(timeout=timeout_value)
                 except subprocess.TimeoutExpired:
                     record.process.kill()
                     exit_code = record.process.wait()
             except Exception as exc:
                 raise ProcessStopError(f"Failed to stop instance {instance_id!r}: {exc}") from exc
 
-            record.exit_code = exit_code
-            record.stopped = True
-            return self._status_from_record(record)
+            with self._lock:
+                record.exit_code = exit_code
+                record.stopped = True
+                return self._status_from_record(record)
 
     def restart(self, instance_id: str, timeout: float = 10.0) -> ProcessStatus:
-        with self._lock:
-            record = self._records.get(instance_id)
-            if record is not None:
-                status = self._refresh_record(record)
-                if status.state == STATE_RUNNING:
-                    self.stop(instance_id, timeout=timeout)
+        self._validate_timeout(timeout)
+        operation_lock = self._get_operation_lock(instance_id)
+        with operation_lock:
+            with self._lock:
+                record = self._records.get(instance_id)
+                if record is not None:
+                    status = self._refresh_record(record)
+                    running = status.state == STATE_RUNNING
+                else:
+                    running = False
+            if running:
+                self.stop(instance_id, timeout=timeout)
             return self.start(instance_id)
 
     def status(self, instance_id: str) -> ProcessStatus:
@@ -210,30 +249,43 @@ class BotProcessManager:
                 uptime_seconds=None,
                 exit_code=None,
             )
-            self._last_status[instance.id] = status
             return status
 
     def list_status(self) -> list[ProcessStatus]:
-        with self._lock:
-            statuses: list[ProcessStatus] = []
-            for instance in instance_store.list_instances():
-                statuses.append(self.status(instance.id))
-            return statuses
+        try:
+            instances = instance_store.list_instances()
+        except (instance_store.InstanceStoreError, OSError) as exc:
+            raise ManagerCoreError(f"Failed to list bot instances: {exc}") from exc
+        return [self.status(instance.id) for instance in sorted(instances, key=lambda item: item.id)]
+
+    def get_instance_info(self, instance_id: str) -> InstanceInfo:
+        instance, bot_type = self._load_instance_and_type(instance_id)
+        status = self.status(instance.id)
+        return self._instance_info(instance, bot_type, status)
+
+    def list_instance_info(self) -> list[InstanceInfo]:
+        infos: list[InstanceInfo] = []
+        try:
+            instances = instance_store.list_instances()
+        except (instance_store.InstanceStoreError, OSError) as exc:
+            raise ManagerCoreError(f"Failed to list bot instances: {exc}") from exc
+        for instance in sorted(instances, key=lambda item: item.id):
+            try:
+                bot_type = bot_registry.get_bot_type(instance.bot_type)
+            except (bot_registry.BotRegistryError, OSError) as exc:
+                raise ManagerCoreError(
+                    f"Invalid bot type {instance.bot_type!r} for instance {instance.id!r}: {exc}"
+                ) from exc
+            infos.append(self._instance_info(instance, bot_type, self.status(instance.id)))
+        return infos
 
     def shutdown_all(self, timeout: float = 10.0) -> dict[str, ProcessStatus | ManagerCoreError]:
+        self._validate_timeout(timeout)
         with self._lock:
-            instance_ids = list(self._records)
+            instance_ids = sorted(self._records)
         results: dict[str, ProcessStatus | ManagerCoreError] = {}
         for instance_id in instance_ids:
             try:
-                with self._lock:
-                    record = self._records.get(instance_id)
-                    if record is None:
-                        continue
-                    status = self._refresh_record(record)
-                    if status.state != STATE_RUNNING:
-                        results[instance_id] = status
-                        continue
                 results[instance_id] = self.stop(instance_id, timeout=timeout)
             except ManagerCoreError as exc:
                 results[instance_id] = exc
@@ -257,6 +309,86 @@ class BotProcessManager:
                 f"Invalid bot type {instance.bot_type!r} for instance {instance_id!r}: {exc}"
             ) from exc
         return instance, bot_type
+
+    def _get_operation_lock(self, instance_id: str) -> threading.RLock:
+        try:
+            valid_id = instance_store.validate_instance_id(instance_id)
+        except instance_store.InstanceStoreError as exc:
+            raise ManagerCoreError(f"Invalid bot instance {instance_id!r}: {exc}") from exc
+        with self._lock:
+            lock = self._operation_locks.get(valid_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._operation_locks[valid_id] = lock
+            return lock
+
+    def _instance_info(
+        self,
+        instance: instance_store.BotInstance,
+        bot_type: bot_registry.BotType,
+        status: ProcessStatus,
+    ) -> InstanceInfo:
+        return InstanceInfo(
+            instance_id=instance.id,
+            display_name=instance.display_name,
+            bot_type=instance.bot_type,
+            bot_type_display_name=bot_type.display_name,
+            bot_version=bot_type.version,
+            state=status.state,
+            pid=status.pid,
+            started_at=status.started_at,
+            uptime_seconds=status.uptime_seconds,
+            exit_code=status.exit_code,
+            config_path=instance.paths.config,
+            logs_dir=instance.paths.logs_dir,
+            stdout_log_path=instance.paths.logs_dir / STDOUT_LOG_NAME,
+            stderr_log_path=instance.paths.logs_dir / STDERR_LOG_NAME,
+        )
+
+    def _validate_timeout(self, timeout: float) -> float:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise ManagerCoreError(f"timeout must be a non-negative number, got {timeout!r}")
+        timeout_value = float(timeout)
+        if not math.isfinite(timeout_value) or timeout_value < 0:
+            raise ManagerCoreError(f"timeout must be a finite non-negative number, got {timeout!r}")
+        return timeout_value
+
+    def _validate_launch_spec(self, instance: instance_store.BotInstance, launch_spec: LaunchSpec) -> None:
+        if not isinstance(launch_spec, LaunchSpec):
+            raise ProcessStartError(f"Invalid launch spec for instance {instance.id!r}: expected LaunchSpec.")
+        if not isinstance(launch_spec.executable, str) or not launch_spec.executable.strip():
+            raise ProcessStartError(f"Invalid launch spec for instance {instance.id!r}: executable must be non-empty.")
+        if not isinstance(launch_spec.args, tuple) or not all(isinstance(arg, str) for arg in launch_spec.args):
+            raise ProcessStartError(f"Invalid launch spec for instance {instance.id!r}: args must be a tuple of strings.")
+        if not isinstance(launch_spec.cwd, Path) or not launch_spec.cwd.is_dir():
+            raise ProcessStartError(f"Invalid launch spec for instance {instance.id!r}: cwd must be an existing directory.")
+        if not self._env_is_valid(launch_spec.env):
+            raise ProcessStartError(
+                f"Invalid launch spec for instance {instance.id!r}: env must map strings to strings."
+            )
+        self._validate_log_path(instance, launch_spec.stdout_log_path, "stdout_log_path")
+        self._validate_log_path(instance, launch_spec.stderr_log_path, "stderr_log_path")
+
+    def _env_is_valid(self, env: object) -> bool:
+        if not isinstance(env, Mapping):
+            return False
+        return all(isinstance(key, str) and isinstance(value, str) for key, value in env.items())
+
+    def _validate_log_path(self, instance: instance_store.BotInstance, path: Path, field_name: str) -> None:
+        if not isinstance(path, Path):
+            raise ProcessStartError(f"Invalid launch spec for instance {instance.id!r}: {field_name} must be a Path.")
+        logs_dir = instance.paths.logs_dir.resolve()
+        resolved_path = path.resolve(strict=False)
+        try:
+            resolved_path.relative_to(logs_dir)
+        except ValueError as exc:
+            raise ProcessStartError(
+                f"Invalid launch spec for instance {instance.id!r}: {field_name} must stay inside {logs_dir}."
+            ) from exc
+        if resolved_path.parent != logs_dir:
+            raise ProcessStartError(
+                f"Invalid launch spec for instance {instance.id!r}: {field_name} must be directly under {logs_dir}."
+            )
 
     def _record_is_running(self, record: _ProcessRecord) -> bool:
         return record.process.poll() is None
@@ -288,7 +420,6 @@ class BotProcessManager:
                 uptime_seconds=None,
                 exit_code=record.exit_code,
             )
-        self._last_status[record.instance_id] = status
         return status
 
     def _close_record_handles(self, record: _ProcessRecord) -> None:

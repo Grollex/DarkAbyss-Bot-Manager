@@ -244,6 +244,65 @@ Not implemented yet:
 - packaging
 - Alehandro migration
 
+## Phase 3B Manager Core Hardening
+
+Phase 3B keeps Manager Core GUI-independent while adding safer read models and lifecycle hardening for future GUI/headless callers.
+
+Public read APIs now include:
+
+- `get_instance_info(instance_id)`
+- `list_instance_info()`
+
+`InstanceInfo` is an immutable GUI-facing snapshot. It includes identity, bot type metadata, current process status, config path, logs directory, and Manager-owned stdout/stderr log paths. It does not expose token contents, config contents, secret contents, or mutable user data.
+
+`list_status()` and `list_instance_info()` return instances sorted by `instance_id`.
+
+All public read APIs refresh owned process records before reporting state. If a child exited naturally, `status()`, `get_instance_info()`, `list_status()`, and `list_instance_info()` report `EXITED`, capture the exit code, and finalize Manager-owned log handles.
+
+Public Manager APIs normalize storage and registry failures as `ManagerCoreError` subclasses or `ManagerCoreError` itself. Malformed instances are reported clearly and are not silently skipped during listing.
+
+## Manager Core Concurrency
+
+Manager Core uses:
+
+- a small global lock for shared dictionaries
+- per-instance lifecycle locks for `start()`, `stop()`, and `restart()`
+
+Same-instance lifecycle operations are serialized, so two concurrent `start("admin-main")` calls cannot create duplicate managed children.
+
+Different instances remain independent. A blocking stop for `admin-main` does not hold the global manager lock while waiting on the process, so status/read operations for `admin-second` can still complete.
+
+## LaunchSpec Validation
+
+Before spawning a child process, Manager Core validates:
+
+- executable is a non-empty string
+- args is a tuple of strings
+- cwd exists and is a directory
+- env maps strings to strings
+- stdout/stderr log paths stay directly under the selected instance's `logs/` directory
+
+Child processes are still launched with argument lists only. Manager Core does not use shell execution.
+
+Manager Core copies the `LaunchSpec` environment before spawn and enforces `DARKABYSS_DATA_DIR` itself for the child process. Custom launch-spec builders cannot omit or override the selected Manager data root, and their original environment mapping is not mutated.
+
+Manager-created process logs are limited to:
+
+```text
+<DATA_ROOT>/instances/<instance_id>/logs/process.stdout.log
+<DATA_ROOT>/instances/<instance_id>/logs/process.stderr.log
+```
+
+Manager Core does not read token contents, does not edit config/token files, and does not place token values in command arguments.
+
+## Shutdown and Failure Behavior
+
+Invalid timeout values are rejected. A timeout of `0` is allowed and means terminate, immediately escalate to kill if the child is still running, then reap.
+
+If stopping one instance fails, `shutdown_all()` still attempts all other managed records and returns a result or error per considered instance.
+
+Process ownership remains in-memory only. Phase 3B still does not add PID files, persisted process state, auto-start, auto-restart, GUI, daemon/service mode, HTTP, WebSocket, updater, or packaging.
+
 ## Future Phases
 
 Future phases may add:
