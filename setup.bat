@@ -14,5 +14,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Setup finished. Edit the generated admin token file shown above, then run Admin.bat.
+python DarkAbyss_Core\admin_instance.py
+if errorlevel 1 (
+    echo Default Admin instance initialization failed.
+    pause
+    exit /b 1
+)
+
+echo Setup finished. Edit the admin-main token file shown above, then run Admin.bat.
 pause

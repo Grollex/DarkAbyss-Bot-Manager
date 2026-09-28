@@ -137,8 +137,28 @@ def _validate_loaded_layout(instance_id: str, paths: InstancePaths) -> None:
             raise InstanceStoreError(f"Instance {instance_id}: required directory missing or not a directory: {label}")
 
 
-def create_instance(bot_type_id: str, instance_id: str, display_name: str | None = None) -> BotInstance:
-    bot_type = bot_registry.get_bot_type(bot_type_id)
+def _write_initial_instance_files(
+    paths: InstancePaths,
+    metadata: dict,
+    config_bytes: bytes,
+    token_bytes: bytes,
+) -> None:
+    paths.secrets_dir.mkdir()
+    paths.runtime_dir.mkdir()
+    paths.logs_dir.mkdir()
+    paths.data_dir.mkdir()
+    _write_json(paths.metadata, metadata)
+    paths.config.write_bytes(config_bytes)
+    paths.token.write_bytes(token_bytes)
+
+
+def _create_instance_atomic(
+    bot_type: bot_registry.BotType,
+    instance_id: str,
+    display_name: str | None,
+    config_bytes: bytes,
+    token_bytes: bytes,
+) -> BotInstance:
     valid_instance_id = validate_instance_id(instance_id)
     resolved_display_name = _validate_display_name(display_name, bot_type.display_name)
     paths = get_instance_paths(valid_instance_id)
@@ -153,20 +173,13 @@ def create_instance(bot_type_id: str, instance_id: str, display_name: str | None
     staging_root = Path(tempfile.mkdtemp(prefix=f"{valid_instance_id}.", suffix=".tmp", dir=staging_parent))
     staging_paths = _paths_for_root(staging_root)
     try:
-        staging_paths.secrets_dir.mkdir()
-        staging_paths.runtime_dir.mkdir()
-        staging_paths.logs_dir.mkdir()
-        staging_paths.data_dir.mkdir()
-
         metadata = {
             "schema_version": INSTANCE_SCHEMA_VERSION,
             "id": valid_instance_id,
             "bot_type": bot_type.id,
             "display_name": resolved_display_name,
         }
-        _write_json(staging_paths.metadata, metadata)
-        shutil.copyfile(bot_type.default_config, staging_paths.config)
-        staging_paths.token.write_text(app_paths.TOKEN_PLACEHOLDER + "\n", encoding="utf-8")
+        _write_initial_instance_files(staging_paths, metadata, config_bytes, token_bytes)
         if paths.root.exists():
             raise InstanceAlreadyExistsError(f"Instance already exists: {valid_instance_id}")
         staging_root.rename(paths.root)
@@ -175,6 +188,13 @@ def create_instance(bot_type_id: str, instance_id: str, display_name: str | None
         raise
 
     return load_instance(valid_instance_id)
+
+
+def create_instance(bot_type_id: str, instance_id: str, display_name: str | None = None) -> BotInstance:
+    bot_type = bot_registry.get_bot_type(bot_type_id)
+    config_bytes = bot_type.default_config.read_bytes()
+    token_bytes = (app_paths.TOKEN_PLACEHOLDER + "\n").encode("utf-8")
+    return _create_instance_atomic(bot_type, instance_id, display_name, config_bytes, token_bytes)
 
 
 def load_instance(instance_id: str) -> BotInstance:

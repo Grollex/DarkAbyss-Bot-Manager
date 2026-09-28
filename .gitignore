@@ -42,3 +42,8 @@ user_data/
 backups/
 updates/
 downloads/
+/config/
+/secrets/
+/runtime/
+/logs/
+/instances/

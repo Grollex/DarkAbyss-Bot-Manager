@@ -83,8 +83,8 @@ class InstanceStoreTests(unittest.TestCase):
             existing = instance_store.create_instance("admin", "admin-existing")
             existing.paths.config.write_text("existing config", encoding="utf-8")
 
-            with mock.patch.object(instance_store.shutil, "copyfile", side_effect=RuntimeError("copy failed")):
-                with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            with mock.patch.object(instance_store, "_write_initial_instance_files", side_effect=RuntimeError("write failed")):
+                with self.assertRaisesRegex(RuntimeError, "write failed"):
                     instance_store.create_instance("admin", "admin-main")
 
             failed_paths = instance_store.get_instance_paths("admin-main")

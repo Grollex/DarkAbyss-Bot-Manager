@@ -1,5 +1,7 @@
+import argparse
 import json
 import msvcrt
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -8,18 +10,77 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import admin_instance
 import app_paths
+import bot_registry
+import instance_store
 
 bot_lock_handle = None
 
 
-def load_token() -> str:
-    app_paths.ensure_user_data()
-    if not app_paths.ADMIN_TOKEN_PATH.exists():
-        raise RuntimeError(f"Token file not found: {app_paths.ADMIN_TOKEN_PATH}")
-    token = app_paths.ADMIN_TOKEN_PATH.read_text(encoding="utf-8").strip()
+@dataclass(frozen=True)
+class AdminRuntime:
+    instance_id: str
+    config_path: Path
+    token_path: Path
+    lock_path: Path
+
+
+runtime_context: AdminRuntime | None = None
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run one Discord Admin Bot instance.")
+    parser.add_argument("--instance", default=admin_instance.DEFAULT_ADMIN_INSTANCE_ID)
+    return parser.parse_args(argv)
+
+
+def resolve_runtime(instance_id: str = admin_instance.DEFAULT_ADMIN_INSTANCE_ID) -> AdminRuntime:
+    try:
+        if instance_id == admin_instance.DEFAULT_ADMIN_INSTANCE_ID:
+            instance = admin_instance.ensure_admin_instance(instance_id)
+        else:
+            instance = instance_store.load_instance(instance_id)
+    except (
+        admin_instance.AdminInstanceError,
+        bot_registry.BotRegistryError,
+        instance_store.InstanceStoreError,
+        OSError,
+    ) as exc:
+        raise RuntimeError(f"Invalid admin instance {instance_id!r}: {exc}") from exc
+
+    if instance.bot_type != admin_instance.ADMIN_BOT_TYPE_ID:
+        raise RuntimeError(
+            f"Invalid admin instance {instance_id!r}: "
+            f"bot_type {instance.bot_type!r}; expected 'admin'."
+        )
+
+    return AdminRuntime(
+        instance_id=instance.id,
+        config_path=instance.paths.config,
+        token_path=instance.paths.token,
+        lock_path=instance.paths.runtime_dir / "admin_bot.lock",
+    )
+
+
+def set_runtime(runtime: AdminRuntime) -> None:
+    global runtime_context
+    runtime_context = runtime
+
+
+def get_runtime() -> AdminRuntime:
+    if runtime_context is None:
+        raise RuntimeError("Admin runtime is not initialized.")
+    return runtime_context
+
+
+def load_token(runtime: AdminRuntime | None = None) -> str:
+    selected_runtime = runtime or get_runtime()
+    if not selected_runtime.token_path.exists():
+        raise RuntimeError(f"Token file not found: {selected_runtime.token_path}")
+    token = selected_runtime.token_path.read_text(encoding="utf-8").strip()
     if not token or token == app_paths.TOKEN_PLACEHOLDER:
-        raise RuntimeError(f"Put the Discord bot token into {app_paths.ADMIN_TOKEN_PATH}")
+        raise RuntimeError(f"Put the Discord bot token into {selected_runtime.token_path}")
     return token
 
 
@@ -65,27 +126,29 @@ def validate_config(config: dict) -> dict:
     return config
 
 
-def load_config() -> dict:
-    app_paths.ensure_user_data()
+def load_config(runtime: AdminRuntime | None = None) -> dict:
+    selected_runtime = runtime or get_runtime()
 
     try:
-        loaded = json.loads(app_paths.ADMIN_CONFIG_PATH.read_text(encoding="utf-8"))
+        loaded = json.loads(selected_runtime.config_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Admin config not found or unreadable: {selected_runtime.config_path}") from exc
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid admin config {app_paths.ADMIN_CONFIG_PATH}: {exc}") from exc
+        raise RuntimeError(f"Invalid admin config {selected_runtime.config_path}: {exc}") from exc
 
     if not isinstance(loaded, dict):
-        raise RuntimeError(f"Invalid admin config {app_paths.ADMIN_CONFIG_PATH}: root value must be an object.")
+        raise RuntimeError(f"Invalid admin config {selected_runtime.config_path}: root value must be an object.")
 
     try:
         return validate_config(loaded)
     except ValueError as exc:
-        raise RuntimeError(f"Invalid admin config {app_paths.ADMIN_CONFIG_PATH}: {exc}") from exc
+        raise RuntimeError(f"Invalid admin config {selected_runtime.config_path}: {exc}") from exc
 
 
-def acquire_single_instance_lock() -> bool:
+def acquire_single_instance_lock(runtime: AdminRuntime | None = None) -> bool:
     global bot_lock_handle
-    app_paths.ensure_user_data()
-    bot_lock_handle = app_paths.ADMIN_LOCK_PATH.open("a+b")
+    selected_runtime = runtime or get_runtime()
+    bot_lock_handle = selected_runtime.lock_path.open("a+b")
     try:
         msvcrt.locking(bot_lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
@@ -420,11 +483,14 @@ def select_channel(
 
 if __name__ == "__main__":
     try:
-        load_config()
-        token = load_token()
+        args = parse_args()
+        runtime = resolve_runtime(args.instance)
+        set_runtime(runtime)
+        load_config(runtime)
+        token = load_token(runtime)
     except RuntimeError as exc:
         print(exc)
         raise SystemExit(1) from exc
 
-    if acquire_single_instance_lock():
+    if acquire_single_instance_lock(runtime):
         bot.run(token)
