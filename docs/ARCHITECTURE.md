@@ -134,13 +134,120 @@ Each instance has separate:
 
 Running multiple instances means running multiple independent OS processes, one selected instance per process.
 
-## Future Manager Core
+## Phase 3A Manager Core
 
-Future Manager Core will supervise these independent instance processes.
+Phase 3A adds a GUI-independent process supervision layer in:
+
+```text
+DarkAbyss_Core/manager_core.py
+```
+
+Manager Core owns process lifecycle only. Bot processes own bot functionality.
+
+Current lifecycle API:
+
+- `start(instance_id)`
+- `stop(instance_id, timeout=...)`
+- `restart(instance_id, timeout=...)`
+- `status(instance_id)`
+- `list_status()`
+- `shutdown_all(timeout=...)`
+
+One Bot Instance maps to one OS process. Multiple instances are independent processes:
+
+```text
+Manager Core
+    ├── admin-main process
+    └── admin-second process
+```
+
+Manager Core resolves launch targets through:
+
+```text
+Bot Instance -> bot_type -> Bot Type manifest -> entrypoint
+```
+
+It does not hardcode `Admin.py`.
+
+## Entrypoint Contract
+
+Managed bot entrypoints must accept:
+
+```text
+--instance <instance_id>
+```
+
+The current source-runtime launch strategy is:
+
+```text
+sys.executable <bot_type.entrypoint> --instance <instance_id>
+```
+
+Launch construction is isolated behind `LaunchSpec` so later packaged/runtime launch strategies can replace it without rewriting process supervision.
+
+Manager Core launches children with argument lists only. It does not use `shell=True`, `cmd /c`, PowerShell, `os.system`, `eval`, or `exec`.
+
+## Process Status Model
+
+Manager Core exposes immutable process status snapshots:
+
+- `instance_id`
+- `bot_type`
+- `state`
+- `pid`
+- `started_at`
+- `uptime_seconds`
+- `exit_code`
+
+States:
+
+- `STOPPED`: no running child is owned by this Manager Core session.
+- `RUNNING`: the owned child is still running according to `process.poll()`.
+- `EXITED`: the owned child exited naturally and its exit code was captured.
+
+Before first start, valid instances report `STOPPED` with no PID and no exit code.
+
+After explicit `stop()`, status is `STOPPED` and retains the final exit code. Natural child exit is detected by polling `status()` and reported as `EXITED`.
+
+## Process Ownership Boundary
+
+Phase 3A process ownership is in-memory only.
+
+The Manager Core object owns only child processes that it started during the current Python session. It does not adopt arbitrary PIDs after restart, does not persist process handles, and is not a daemon or service.
+
+Future persistent process adoption/service mode must be designed later.
+
+## Manager Logs
+
+Child stdout/stderr are redirected to instance-owned logs:
+
+```text
+<DATA_ROOT>/instances/<instance_id>/logs/process.stdout.log
+<DATA_ROOT>/instances/<instance_id>/logs/process.stderr.log
+```
+
+Logs are opened in append mode. They are user-owned runtime data and must not be tracked by Git.
+
+Manager Core does not put bot tokens in process command lines and does not log token contents.
+
+## Phase 3A Non-Goals
 
 Not implemented yet:
 
-- subprocess supervisor
+- persistent auto-start or auto-restart policy
+- restart delay/limit settings
+- GUI or tray icon
+- daemon/service mode
+- HTTP/WebSocket/remote control
+- updater
+- GitHub integration
+- packaging
+- Alehandro migration
+
+## Future Phases
+
+Future phases may add:
+
 - GUI
 - updater
 - launcher redesign
