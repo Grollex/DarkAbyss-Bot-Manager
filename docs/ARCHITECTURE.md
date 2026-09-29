@@ -432,6 +432,73 @@ The config editor is JSON-based in Phase 5A. It displays user overrides as edita
 
 Closing the GUI must not silently orphan managed running children. If managed instances are running, Phase 5A offers an explicit stop-all-and-exit path or cancellation. It does not offer "leave running" until process adoption/persistence exists.
 
+## Phase 6A Local Update Engine
+
+The local update engine owns program code only. It must never install release payloads into `DATA_ROOT` or modify user-owned tokens, config overrides, config metadata, databases, logs, runtime files, instance data, or backups.
+
+Phase 6A uses a prepared local release directory, not network downloads and not archive extraction. A release directory contains:
+
+```text
+release.json
+<program payload files>
+```
+
+The release manifest schema is:
+
+```json
+{
+  "schema_version": 1,
+  "version": "1.0.0",
+  "files": [
+    {
+      "path": "DarkAbyss_Core/example.py",
+      "sha256": "<64 hex characters>",
+      "size": 123
+    }
+  ]
+}
+```
+
+The engine validates manifests strictly: schema version, version string, unique normalized relative paths, exact file sizes, and SHA-256 hashes. Release paths must stay inside the release payload root and the resulting installed version directory. Absolute paths, Windows drive paths, `..` traversal, symlinks that could redirect outside containment, and reserved user-data roots such as `instances`, `secrets`, `runtime`, `logs`, `backups`, `downloads`, `user_data`, root `config`, and database roots are rejected.
+
+The application-owned install layout is:
+
+```text
+<PROGRAM_INSTALL_ROOT>/
+    versions/
+        <version>/
+    updates/
+        staging/
+    current.json
+```
+
+`PROGRAM_INSTALL_ROOT` is injectable for tests and future packaging. It is separate from `DATA_ROOT`. The source checkout is not moved or rewritten by Phase 6A.
+
+`PROGRAM_INSTALL_ROOT` and `DATA_ROOT` must be disjoint trees. The updater rejects an install root equal to `DATA_ROOT`, inside `DATA_ROOT`, or containing `DATA_ROOT`. Program update state and user-owned runtime state must never overlap.
+
+Staging copies a fully verified local release into a unique application-owned staging directory under `<PROGRAM_INSTALL_ROOT>/updates/staging/`. The staged bytes are verified before publication. Only after the full copy succeeds does the engine publish the staged directory into `<PROGRAM_INSTALL_ROOT>/versions/<version>/` using a same-filesystem rename. Existing installed versions are not overwritten silently, and incomplete staging is cleaned on handled failure.
+
+Updater-owned structural directories are:
+
+- `<PROGRAM_INSTALL_ROOT>/versions/`
+- `<PROGRAM_INSTALL_ROOT>/updates/`
+- `<PROGRAM_INSTALL_ROOT>/updates/staging/`
+
+Before creating or writing through any of these paths, the engine validates every existing structural component. Existing structural components must be real directories, must not be symlinks, and must resolve inside the install root. This containment check happens before `mkdir`, temporary staging creation, payload copy, or version publication, so a pre-existing symlinked `updates`, `updates/staging`, or `versions` path cannot redirect writes outside the install root.
+
+Activation changes only `<PROGRAM_INSTALL_ROOT>/current.json`:
+
+```json
+{
+  "schema_version": 1,
+  "version": "1.0.0"
+}
+```
+
+The pointer write is atomic: temporary file in the same directory, flush/fsync, then `os.replace`. Activation verifies the installed version metadata before updating the pointer. If pointer writing fails, the previous `current.json` remains valid. No mutable `current/` program directory is populated.
+
+Previous version directories are retained for future rollback support. Phase 6A does not implement automatic rollback, network downloading, GitHub integration, packaging, or config/database migration execution. It may install migration code as program files, but it does not run migrations or modify user data during activation.
+
 ## Future Phases
 
 Future phases may add:
