@@ -1,5 +1,4 @@
 import argparse
-import json
 import msvcrt
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -13,6 +12,7 @@ from discord.ext import commands
 import admin_instance
 import app_paths
 import bot_registry
+import config_store
 import instance_store
 
 bot_lock_handle = None
@@ -130,14 +130,9 @@ def load_config(runtime: AdminRuntime | None = None) -> dict:
     selected_runtime = runtime or get_runtime()
 
     try:
-        loaded = json.loads(selected_runtime.config_path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise RuntimeError(f"Admin config not found or unreadable: {selected_runtime.config_path}") from exc
-    except json.JSONDecodeError as exc:
+        loaded = config_store.load_effective_config(selected_runtime.instance_id)
+    except config_store.ConfigStoreError as exc:
         raise RuntimeError(f"Invalid admin config {selected_runtime.config_path}: {exc}") from exc
-
-    if not isinstance(loaded, dict):
-        raise RuntimeError(f"Invalid admin config {selected_runtime.config_path}: root value must be an object.")
 
     try:
         return validate_config(loaded)

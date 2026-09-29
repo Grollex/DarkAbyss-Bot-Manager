@@ -303,6 +303,94 @@ If stopping one instance fails, `shutdown_all()` still attempts all other manage
 
 Process ownership remains in-memory only. Phase 3B still does not add PID files, persisted process state, auto-start, auto-restart, GUI, daemon/service mode, HTTP, WebSocket, updater, or packaging.
 
+## Phase 4A Versioned Configuration
+
+Phase 4A separates program-owned configuration defaults from user-owned overrides.
+
+Program-owned files:
+
+- bot type manifests
+- default config files such as `DarkAbyss_Core/defaults/admin_config.json`
+- declarative config schemas such as `bots/admin/config.schema.json`
+- migration code
+
+User-owned files:
+
+- instance `config.json` override files
+- instance `config.meta.json` version metadata
+- config migration backups under `<DATA_ROOT>/backups`
+- tokens, runtime files, logs, databases, and bot data
+
+Runtime effective config is:
+
+```text
+bot type default config + instance config.json overrides
+```
+
+Dictionaries merge recursively. Scalar values replace defaults. Lists replace defaults. Missing override fields inherit program defaults. The merge returns a fresh dictionary for runtime consumers and never mutates program defaults or user override files.
+
+New instances use an empty override file:
+
+```json
+{}
+```
+
+They also receive `config.meta.json` at the bot type's current `config_version`. This lets future program defaults flow into fields the user never overrode.
+
+Existing Phase 2/3 full `config.json` files remain compatible. They are treated as explicit user overrides, so values already present in the old file keep their behavior when merged with newer defaults.
+
+## Config Versions and Migrations
+
+Bot type manifests declare:
+
+- `config_schema`
+- `config_version`
+
+`config_schema` is validated as a safe program-owned file path. It must be relative, stay inside the program tree, stay outside `DATA_ROOT`, exist, and be a regular file.
+
+Instance config metadata lives beside the user override file:
+
+```text
+<DATA_ROOT>/instances/<instance_id>/config.meta.json
+```
+
+Current metadata shape:
+
+```json
+{
+  "schema_version": 1,
+  "config_version": 1
+}
+```
+
+An existing instance without `config.meta.json` is legacy config version `0`. The conservative `0 -> 1` migration validates that `config.json` is a usable JSON object, creates a backup, and atomically writes metadata. It does not rewrite config bytes when no transformation is needed.
+
+Public effective-config loading always ensures the instance config is current before returning runtime values. Legacy `0 -> 1` migration therefore happens automatically on the first effective-config load, including Admin runtime config loads.
+
+Stale configs are never interpreted with newer defaults/schema unless a supported migration path completes first. If no migration path exists, effective config is not returned.
+
+The `0 -> 1` migration is idempotent. After metadata is current, repeated effective-config loads validate the current config but do not create additional migration backups.
+
+If metadata reports a config version newer than the program supports, Manager/runtime code fails clearly and never downgrades automatically.
+
+## Config Backups
+
+Before a config migration marks an existing user config as current, it creates a backup under:
+
+```text
+<DATA_ROOT>/backups/instances/<instance_id>/config/<unique-backup-id>/
+    config.json
+    backup.json
+```
+
+The backed-up `config.json` is byte-for-byte identical to the original user config. `backup.json` contains safe metadata only: backup schema version, instance id, source/target config versions, UTC creation time, and the SHA-256 of the backed-up config bytes.
+
+Backups never include token contents, secret files, environment variables, logs, runtime files, databases, or unrelated user data. Backup paths are generated internally and must remain under `app_paths.BACKUPS_DIR`.
+
+Migration writes to config metadata are atomic. A failed migration must leave the original config, token, and user data untouched and must not leave a successful current-version marker behind.
+
+If metadata writing fails after a backup was completed, the valid backup may remain. This is safe user data and is not treated as a successful migration marker.
+
 ## Future Phases
 
 Future phases may add:

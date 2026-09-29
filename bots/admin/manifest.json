@@ -4,5 +4,7 @@
   "display_name": "Admin Bot",
   "version": "1.0.0",
   "entrypoint": "DarkAbyss_Core/Admin.py",
-  "default_config": "DarkAbyss_Core/defaults/admin_config.json"
+  "default_config": "DarkAbyss_Core/defaults/admin_config.json",
+  "config_schema": "bots/admin/config.schema.json",
+  "config_version": 1
 }

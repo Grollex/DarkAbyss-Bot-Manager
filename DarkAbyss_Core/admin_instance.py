@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import json
+
 import app_paths
 import bot_registry
 import instance_store
@@ -12,14 +14,27 @@ class AdminInstanceError(RuntimeError):
     pass
 
 
-def _read_migration_config_or_default() -> bytes:
+def _read_migration_config_or_empty_override() -> bytes:
     for config_path in (
         app_paths.PHASE1_ADMIN_CONFIG_PATH,
         app_paths.LEGACY_SOURCE_ADMIN_CONFIG_PATH,
     ):
         if config_path.is_file():
             return config_path.read_bytes()
-    return app_paths.DEFAULT_ADMIN_CONFIG_PATH.read_bytes()
+    return b"{}\n"
+
+
+def _config_meta_bytes(config_version: int) -> bytes:
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_version": config_version,
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
 
 
 def _token_bytes_if_real(path) -> bytes | None:
@@ -64,8 +79,9 @@ def ensure_admin_instance(instance_id: str = DEFAULT_ADMIN_INSTANCE_ID) -> insta
         bot_type=bot_type,
         instance_id=instance_id,
         display_name=bot_type.display_name,
-        config_bytes=_read_migration_config_or_default(),
+        config_bytes=_read_migration_config_or_empty_override(),
         token_bytes=_read_migration_token_or_placeholder(),
+        config_meta_bytes=_config_meta_bytes(bot_type.config_version),
     )
 
 

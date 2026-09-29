@@ -38,6 +38,8 @@ class BotRegistryTests(unittest.TestCase):
             "version": "1.0.0",
             "entrypoint": "DarkAbyss_Core/Admin.py",
             "default_config": "DarkAbyss_Core/defaults/admin_config.json",
+            "config_schema": "bots/admin/config.schema.json",
+            "config_version": 1,
         }
 
     def test_registry_discovers_admin_bot_type(self):
@@ -59,6 +61,8 @@ class BotRegistryTests(unittest.TestCase):
             self.assertEqual(bot_type.id, "admin")
             self.assertTrue(bot_type.entrypoint.samefile(PROJECT_ROOT / "DarkAbyss_Core" / "Admin.py"))
             self.assertTrue(bot_type.default_config.samefile(PROJECT_ROOT / "DarkAbyss_Core" / "defaults" / "admin_config.json"))
+            self.assertTrue(bot_type.config_schema.samefile(PROJECT_ROOT / "bots" / "admin" / "config.schema.json"))
+            self.assertEqual(bot_type.config_version, 1)
 
     def test_missing_manifest_is_rejected_clearly(self):
         with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as bots_dir:
@@ -101,6 +105,26 @@ class BotRegistryTests(unittest.TestCase):
             self.write_manifest(Path(bots_dir), "admin", manifest)
 
             with self.assertRaisesRegex(bot_registry.BotRegistryError, "must be a file"):
+                bot_registry.discover_bot_types(Path(bots_dir))
+
+    def test_manifest_config_schema_path_is_safely_validated(self):
+        with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as bots_dir:
+            bot_registry = self.load_modules(Path(data_dir))
+            manifest = self.valid_manifest("admin")
+            manifest["config_schema"] = "../evil.schema.json"
+            self.write_manifest(Path(bots_dir), "admin", manifest)
+
+            with self.assertRaisesRegex(bot_registry.BotRegistryError, "path traversal"):
+                bot_registry.discover_bot_types(Path(bots_dir))
+
+    def test_manifest_bool_config_version_is_rejected(self):
+        with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as bots_dir:
+            bot_registry = self.load_modules(Path(data_dir))
+            manifest = self.valid_manifest("admin")
+            manifest["config_version"] = True
+            self.write_manifest(Path(bots_dir), "admin", manifest)
+
+            with self.assertRaisesRegex(bot_registry.BotRegistryError, "config_version"):
                 bot_registry.discover_bot_types(Path(bots_dir))
 
     def test_registry_discovery_does_not_import_or_execute_admin_py(self):

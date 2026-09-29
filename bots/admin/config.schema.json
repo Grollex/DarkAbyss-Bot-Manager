@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "type": "object",
+  "required": [
+    "allow_server_administrators",
+    "allowed_user_ids",
+    "allowed_role_ids",
+    "audit_channel_id"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "allow_server_administrators": {
+      "type": "boolean"
+    },
+    "allowed_user_ids": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        ]
+      }
+    },
+    "allowed_role_ids": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        ]
+      }
+    },
+    "audit_channel_id": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      ]
+    }
+  }
+}

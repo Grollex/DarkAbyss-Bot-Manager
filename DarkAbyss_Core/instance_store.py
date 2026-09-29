@@ -29,6 +29,7 @@ class InstancePaths:
     root: Path
     metadata: Path
     config: Path
+    config_meta: Path
     token: Path
     secrets_dir: Path
     runtime_dir: Path
@@ -58,6 +59,7 @@ def get_instance_paths(instance_id: str) -> InstancePaths:
         root=root,
         metadata=root / "instance.json",
         config=root / "config.json",
+        config_meta=root / "config.meta.json",
         token=root / "secrets" / "token.txt",
         secrets_dir=root / "secrets",
         runtime_dir=root / "runtime",
@@ -108,6 +110,7 @@ def _paths_for_root(root: Path) -> InstancePaths:
         root=root,
         metadata=root / "instance.json",
         config=root / "config.json",
+        config_meta=root / "config.meta.json",
         token=root / "secrets" / "token.txt",
         secrets_dir=root / "secrets",
         runtime_dir=root / "runtime",
@@ -142,6 +145,7 @@ def _write_initial_instance_files(
     metadata: dict,
     config_bytes: bytes,
     token_bytes: bytes,
+    config_meta_bytes: bytes | None = None,
 ) -> None:
     paths.secrets_dir.mkdir()
     paths.runtime_dir.mkdir()
@@ -149,6 +153,8 @@ def _write_initial_instance_files(
     paths.data_dir.mkdir()
     _write_json(paths.metadata, metadata)
     paths.config.write_bytes(config_bytes)
+    if config_meta_bytes is not None:
+        paths.config_meta.write_bytes(config_meta_bytes)
     paths.token.write_bytes(token_bytes)
 
 
@@ -158,6 +164,7 @@ def _create_instance_atomic(
     display_name: str | None,
     config_bytes: bytes,
     token_bytes: bytes,
+    config_meta_bytes: bytes | None = None,
 ) -> BotInstance:
     valid_instance_id = validate_instance_id(instance_id)
     resolved_display_name = _validate_display_name(display_name, bot_type.display_name)
@@ -179,7 +186,7 @@ def _create_instance_atomic(
             "bot_type": bot_type.id,
             "display_name": resolved_display_name,
         }
-        _write_initial_instance_files(staging_paths, metadata, config_bytes, token_bytes)
+        _write_initial_instance_files(staging_paths, metadata, config_bytes, token_bytes, config_meta_bytes)
         if paths.root.exists():
             raise InstanceAlreadyExistsError(f"Instance already exists: {valid_instance_id}")
         staging_root.rename(paths.root)
@@ -192,9 +199,19 @@ def _create_instance_atomic(
 
 def create_instance(bot_type_id: str, instance_id: str, display_name: str | None = None) -> BotInstance:
     bot_type = bot_registry.get_bot_type(bot_type_id)
-    config_bytes = bot_type.default_config.read_bytes()
+    config_bytes = b"{}\n"
+    config_meta_bytes = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_version": bot_type.config_version,
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
     token_bytes = (app_paths.TOKEN_PLACEHOLDER + "\n").encode("utf-8")
-    return _create_instance_atomic(bot_type, instance_id, display_name, config_bytes, token_bytes)
+    return _create_instance_atomic(bot_type, instance_id, display_name, config_bytes, token_bytes, config_meta_bytes)
 
 
 def load_instance(instance_id: str) -> BotInstance:

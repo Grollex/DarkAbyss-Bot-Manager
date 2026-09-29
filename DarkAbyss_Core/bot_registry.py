@@ -27,6 +27,8 @@ class BotType:
     version: str
     entrypoint: Path
     default_config: Path
+    config_schema: Path
+    config_version: int
     manifest_path: Path
 
 
@@ -103,6 +105,10 @@ def load_bot_type(bot_type_dir: Path) -> BotType:
 
     entrypoint = _resolve_program_path(manifest.get("entrypoint"), "entrypoint", bot_type_id)
     default_config = _resolve_program_path(manifest.get("default_config"), "default_config", bot_type_id)
+    config_schema = _resolve_program_path(manifest.get("config_schema"), "config_schema", bot_type_id)
+    config_version = manifest.get("config_version")
+    if isinstance(config_version, bool) or not isinstance(config_version, int) or config_version < 1:
+        raise BotRegistryError(f"Bot type {bot_type_id}: config_version must be a positive integer.")
 
     return BotType(
         schema_version=schema_version,
@@ -111,6 +117,8 @@ def load_bot_type(bot_type_dir: Path) -> BotType:
         version=version,
         entrypoint=entrypoint,
         default_config=default_config,
+        config_schema=config_schema,
+        config_version=config_version,
         manifest_path=manifest_path.resolve(),
     )
 

@@ -32,6 +32,7 @@ class AppPathsTests(unittest.TestCase):
             self.assertTrue(app_paths.RUNTIME_DIR.is_dir())
             self.assertTrue(app_paths.LOGS_DIR.is_dir())
             self.assertTrue(app_paths.INSTANCES_DIR.is_dir())
+            self.assertTrue(app_paths.BACKUPS_DIR.is_dir())
             self.assertFalse(app_paths.ADMIN_CONFIG_PATH.exists())
             self.assertFalse(app_paths.ADMIN_TOKEN_PATH.exists())
 
@@ -125,6 +126,7 @@ class AppPathsTests(unittest.TestCase):
             self.assertTrue((data_root / "runtime").is_dir())
             self.assertTrue((data_root / "logs").is_dir())
             self.assertTrue((data_root / "instances").is_dir())
+            self.assertTrue((data_root / "backups").is_dir())
             self.assertFalse((data_root / "config" / "admin.json").exists())
             self.assertFalse((data_root / "secrets" / "admin_bot_token.txt").exists())
 

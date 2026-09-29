@@ -22,7 +22,7 @@ VALID_ADMIN_CONFIG = {
 def load_modules(data_root: Path, *names: str):
     sys.path.insert(0, str(CORE_ROOT))
     os.environ["DARKABYSS_DATA_DIR"] = str(data_root)
-    for module_name in ("Admin", "admin_instance", "instance_store", "bot_registry", "app_paths"):
+    for module_name in ("Admin", "admin_instance", "config_store", "instance_store", "bot_registry", "app_paths"):
         sys.modules.pop(module_name, None)
     return [importlib.import_module(name) for name in names]
 
@@ -193,16 +193,19 @@ class AdminInstanceMigrationTests(unittest.TestCase):
             self.assertEqual(loaded.paths.token.read_bytes(), custom_token)
             self.assertEqual(unknown_file.read_text(encoding="utf-8"), "keep")
 
-    def test_no_phase1_data_creates_default_config_and_placeholder_token(self):
+    def test_no_phase1_data_creates_empty_override_and_placeholder_token(self):
         with tempfile.TemporaryDirectory() as data_dir:
-            admin_instance, app_paths = load_modules(Path(data_dir), "admin_instance", "app_paths")
+            admin_instance, app_paths, config_store = load_modules(
+                Path(data_dir),
+                "admin_instance",
+                "app_paths",
+                "config_store",
+            )
 
             instance = admin_instance.ensure_admin_instance()
 
-            self.assertEqual(
-                json.loads(instance.paths.config.read_text(encoding="utf-8")),
-                json.loads(app_paths.DEFAULT_ADMIN_CONFIG_PATH.read_text(encoding="utf-8")),
-            )
+            self.assertEqual(json.loads(instance.paths.config.read_text(encoding="utf-8")), {})
+            self.assertEqual(config_store.load_effective_config(instance.id), json.loads(app_paths.DEFAULT_ADMIN_CONFIG_PATH.read_text(encoding="utf-8")))
             self.assertEqual(instance.paths.token.read_text(encoding="utf-8"), app_paths.TOKEN_PLACEHOLDER + "\n")
 
     def test_placeholder_phase1_token_is_not_migrated_as_credential(self):

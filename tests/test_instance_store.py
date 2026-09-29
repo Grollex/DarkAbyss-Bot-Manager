@@ -33,6 +33,7 @@ class InstanceStoreTests(unittest.TestCase):
             self.assertEqual(instance.display_name, "Admin Bot")
             self.assertTrue(instance.paths.metadata.is_file())
             self.assertTrue(instance.paths.config.is_file())
+            self.assertTrue(instance.paths.config_meta.is_file())
             self.assertTrue(instance.paths.token.is_file())
             self.assertTrue(instance.paths.runtime_dir.is_dir())
             self.assertTrue(instance.paths.logs_dir.is_dir())
@@ -48,15 +49,19 @@ class InstanceStoreTests(unittest.TestCase):
                 },
             )
 
-    def test_default_config_is_copied_and_placeholder_token_created(self):
+    def test_empty_override_config_metadata_and_placeholder_token_created(self):
         with tempfile.TemporaryDirectory() as data_dir:
             instance_store, _app_paths = self.load_modules(Path(data_dir))
 
             instance = instance_store.create_instance("admin", "admin-main")
 
+            self.assertEqual(json.loads(instance.paths.config.read_text(encoding="utf-8")), {})
             self.assertEqual(
-                json.loads(instance.paths.config.read_text(encoding="utf-8")),
-                json.loads((PROJECT_ROOT / "DarkAbyss_Core" / "defaults" / "admin_config.json").read_text(encoding="utf-8")),
+                json.loads(instance.paths.config_meta.read_text(encoding="utf-8")),
+                {
+                    "schema_version": 1,
+                    "config_version": 1,
+                },
             )
             self.assertEqual(instance.paths.token.read_text(encoding="utf-8"), "PUT_DISCORD_BOT_TOKEN_HERE\n")
 
