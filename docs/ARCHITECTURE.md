@@ -407,6 +407,31 @@ The GUI-facing configuration APIs are:
 
 Ordinary config edits do not create migration backups. Backups are created only by supported config migrations before metadata is marked current.
 
+## Phase 5A Minimal GUI
+
+The Windows GUI is a frontend only. It must not host Discord bot execution and must not duplicate process lifecycle logic.
+
+Phase 5A dependencies flow one way:
+
+```text
+GUI / Qt frontend
+  -> Manager Core
+  -> ConfigStore
+  -> InstanceStore / BotRegistry
+```
+
+Bot children remain separate OS processes owned by `BotProcessManager`. The GUI owns one manager instance for its session and calls `list_instance_info()`, `get_instance_info()`, `start()`, `stop()`, `restart()`, and `shutdown_all()` instead of launching shells or running bot code in the GUI process.
+
+Qt is isolated to the frontend layer. `manager_core.py`, `config_store.py`, `instance_store.py`, `bot_registry.py`, and `Admin.py` remain headless and must not import PySide6.
+
+The GUI uses a lightweight `QTimer` for read-only status refresh. It does not poll Discord and does not implement auto-restart.
+
+Potentially blocking lifecycle operations run through a small Qt worker/thread path so the UI thread is not blocked by `stop()`, `restart()`, or `shutdown_all()`. `start()` uses the same path for consistency. While an action is active for an instance, duplicate actions for that instance are disabled.
+
+The config editor is JSON-based in Phase 5A. It displays user overrides as editable JSON and effective config as read-only JSON. Saves go through `ConfigStore.save_config_overrides()` only; the GUI does not write `config.json` directly and does not read or display token files.
+
+Closing the GUI must not silently orphan managed running children. If managed instances are running, Phase 5A offers an explicit stop-all-and-exit path or cancellation. It does not offer "leave running" until process adoption/persistence exists.
+
 ## Future Phases
 
 Future phases may add:
