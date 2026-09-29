@@ -573,6 +573,73 @@ ZIP preparation has independent resource limits for extracted payload bytes and 
 
 Phase 7A does not add GUI automatic update installation, unattended updates, rollback/recovery, GitHub publishing, PyInstaller packaging, or Discord runtime behavior changes. Activation remains an explicit caller decision through `update_engine.activate_staged_release()`.
 
+## Phase 8A Rollback and Recovery Backend
+
+Phase 8A keeps rollback GUI-independent and local to the already installed program versions managed by `update_engine.py`.
+
+Rollback is a pointer operation only:
+
+```text
+<PROGRAM_INSTALL_ROOT>/
+    versions/
+        1.0.0/
+        1.1.0/
+    current.json
+```
+
+No program files are copied, restored from backups, downloaded, or deleted during rollback. No user-owned data is rolled back or modified. Tokens, config overrides, config metadata, databases, instance data, logs, and backups remain byte-identical across activation, rollback, and recovery.
+
+`current.json` remains schema version 1 and is extended compatibly with optional `previous_version`:
+
+```json
+{
+  "schema_version": 1,
+  "version": "1.1.0",
+  "previous_version": "1.0.0"
+}
+```
+
+Old Phase 6 pointers without `previous_version` remain valid. First activation records `previous_version` as `null`. `get_current_version()` continues to return only the active version, while `get_activation_state()` returns both current and previous pointer fields.
+
+Activation records the former current version atomically in the same `current.json` write. There is no second state file. If pointer writing fails, the previous valid `current.json` remains byte-identical.
+
+Explicit rollback APIs:
+
+- `rollback_to_version(target_version, install_root)`
+- `rollback_to_previous(install_root)`
+
+`rollback_to_version()` requires the target version directory to already exist under `versions/`, pass full Phase 6 `inspect_release()` verification, and have a `release.json` version matching the requested target. A rollback from `1.1.0` to `1.0.0` writes `version = 1.0.0` and `previous_version = 1.1.0`, enabling an explicit forward switch later. Rolling back to the already-current version is a no-op and does not rewrite the pointer.
+
+`rollback_to_previous()` never guesses. It reads `previous_version` from the activation state, requires it to be present, and delegates to `rollback_to_version()`.
+
+Explicit recovery API:
+
+```text
+recover_current_pointer(target_version, install_root)
+```
+
+Recovery is for an unusable `current.json`: missing, malformed, pointing to a missing version, or pointing to a corrupt installed version. The caller must explicitly provide the target version. Recovery verifies the target installed version with the same Phase 6 release checks and atomically writes a fresh `current.json` with no inferred previous version. If the current pointer is already healthy, recovery is rejected as unnecessary.
+
+No Phase 8A operation selects versions by lexical order, directory mtime, or "latest installed" heuristics. Corruption never triggers automatic repair or network download.
+
+Health inspection is non-mutating:
+
+```text
+check_install_health(install_root)
+```
+
+Health states:
+
+- `HEALTHY`: pointer parses, current version exists, release verification passes, and release version matches pointer.
+- `NO_CURRENT_POINTER`: `current.json` is absent.
+- `INVALID_CURRENT_POINTER`: `current.json` is malformed, unsupported, non-file, symlinked, or contains invalid version fields.
+- `CURRENT_VERSION_MISSING`: pointer is valid but the selected version directory is absent.
+- `CURRENT_VERSION_CORRUPT`: selected version exists but fails release manifest, size, hash, or version checks.
+
+Rollback and recovery preserve Phase 6 path safety: `versions/` is a real structural directory, `current.json` symlinks are rejected, version directories remain inside the install root, and `PROGRAM_INSTALL_ROOT` stays disjoint from `DATA_ROOT`.
+
+Phase 8A still does not delete old versions, prune versions, add automatic unattended rollback, add GUI updater controls, add PyInstaller packaging, or change Discord bot behavior.
+
 ## Future Phases
 
 Future phases may add:

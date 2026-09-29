@@ -323,6 +323,296 @@ class UpdateEngineTests(unittest.TestCase):
         self.assertEqual(update_engine.get_current_version(install_root), "1.0.0")
         self.assertEqual(json.loads((install_root / "current.json").read_text(encoding="utf-8"))["version"], "1.0.0")
 
+    def test_old_current_json_without_previous_version_remains_readable(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+        (install_root / "current.json").write_text(
+            json.dumps({"schema_version": 1, "version": "1.0.0"}) + "\n",
+            encoding="utf-8",
+        )
+
+        state = update_engine.get_activation_state(install_root)
+
+        self.assertEqual(update_engine.get_current_version(install_root), "1.0.0")
+        self.assertEqual(state.version, "1.0.0")
+        self.assertIsNone(state.previous_version)
+
+    def test_first_activation_records_null_previous_version(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+
+        result = update_engine.activate_staged_release("1.0.0", install_root)
+        pointer = json.loads((install_root / "current.json").read_text(encoding="utf-8"))
+
+        self.assertIsNone(result.previous_version)
+        self.assertIsNone(pointer["previous_version"])
+
+    def test_activation_records_previous_version_and_state_reader(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root / "one", version="1.0.0")
+        self.valid_release(release_root / "two", version="1.1.0")
+        update_engine.stage_release(release_root / "one", install_root)
+        update_engine.activate_staged_release("1.0.0", install_root)
+        update_engine.stage_release(release_root / "two", install_root)
+
+        result = update_engine.activate_staged_release("1.1.0", install_root)
+        state = update_engine.get_activation_state(install_root)
+        pointer = json.loads((install_root / "current.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result.previous_version, "1.0.0")
+        self.assertEqual(state.version, "1.1.0")
+        self.assertEqual(state.previous_version, "1.0.0")
+        self.assertEqual(pointer["previous_version"], "1.0.0")
+
+    def test_rollback_to_version_switches_pointer_only(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root / "one", version="1.0.0", files={"app/file.txt": b"one"})
+        self.valid_release(release_root / "two", version="1.1.0", files={"app/file.txt": b"two"})
+        update_engine.stage_release(release_root / "one", install_root)
+        update_engine.activate_staged_release("1.0.0", install_root)
+        update_engine.stage_release(release_root / "two", install_root)
+        update_engine.activate_staged_release("1.1.0", install_root)
+
+        result = update_engine.rollback_to_version("1.0.0", install_root)
+        state = update_engine.get_activation_state(install_root)
+
+        self.assertTrue(result.changed)
+        self.assertEqual(result.version, "1.0.0")
+        self.assertEqual(result.previous_version, "1.1.0")
+        self.assertEqual(state.version, "1.0.0")
+        self.assertEqual(state.previous_version, "1.1.0")
+        self.assertTrue((install_root / "versions" / "1.0.0").is_dir())
+        self.assertTrue((install_root / "versions" / "1.1.0").is_dir())
+
+    def test_rollback_to_previous_uses_recorded_previous_version(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root / "one", version="1.0.0")
+        self.valid_release(release_root / "two", version="1.1.0")
+        update_engine.stage_release(release_root / "one", install_root)
+        update_engine.activate_staged_release("1.0.0", install_root)
+        update_engine.stage_release(release_root / "two", install_root)
+        update_engine.activate_staged_release("1.1.0", install_root)
+
+        result = update_engine.rollback_to_previous(install_root)
+
+        self.assertEqual(result.version, "1.0.0")
+        self.assertEqual(result.previous_version, "1.1.0")
+        self.assertEqual(update_engine.get_activation_state(install_root).previous_version, "1.1.0")
+
+    def test_rollback_to_previous_without_previous_fails(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+        update_engine.activate_staged_release("1.0.0", install_root)
+
+        with self.assertRaisesRegex(update_engine.RollbackError, "previous_version"):
+            update_engine.rollback_to_previous(install_root)
+
+    def test_rollback_target_missing_fails(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.1.0")
+        update_engine.stage_release(release_root, install_root)
+        update_engine.activate_staged_release("1.1.0", install_root)
+
+        with self.assertRaisesRegex(update_engine.RollbackError, "does not exist"):
+            update_engine.rollback_to_version("1.0.0", install_root)
+
+    def test_rollback_target_corrupt_hash_fails(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root / "one", version="1.0.0", files={"app/file.txt": b"one"})
+        self.valid_release(release_root / "two", version="1.1.0", files={"app/file.txt": b"two"})
+        update_engine.stage_release(release_root / "one", install_root)
+        update_engine.stage_release(release_root / "two", install_root)
+        update_engine.activate_staged_release("1.1.0", install_root)
+        (install_root / "versions" / "1.0.0" / "app" / "file.txt").write_bytes(b"corrupt")
+
+        with self.assertRaisesRegex(update_engine.RollbackError, "failed verification"):
+            update_engine.rollback_to_version("1.0.0", install_root)
+
+        self.assertEqual(update_engine.get_current_version(install_root), "1.1.0")
+
+    def test_rollback_target_release_version_mismatch_fails(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.1.0")
+        update_engine.stage_release(release_root, install_root)
+        update_engine.activate_staged_release("1.1.0", install_root)
+        mismatch_dir = install_root / "versions" / "1.0.0"
+        self.valid_release(mismatch_dir, version="9.9.9", files={"app/file.txt": b"wrong"})
+
+        with self.assertRaisesRegex(update_engine.RollbackError, "metadata mismatch"):
+            update_engine.rollback_to_version("1.0.0", install_root)
+
+    def test_rollback_current_version_is_noop(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+        update_engine.activate_staged_release("1.0.0", install_root)
+        before = (install_root / "current.json").read_bytes()
+
+        result = update_engine.rollback_to_version("1.0.0", install_root)
+
+        self.assertFalse(result.changed)
+        self.assertEqual((install_root / "current.json").read_bytes(), before)
+
+    def test_rollback_pointer_write_failure_preserves_previous_pointer(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root / "one", version="1.0.0")
+        self.valid_release(release_root / "two", version="1.1.0")
+        update_engine.stage_release(release_root / "one", install_root)
+        update_engine.activate_staged_release("1.0.0", install_root)
+        update_engine.stage_release(release_root / "two", install_root)
+        update_engine.activate_staged_release("1.1.0", install_root)
+        before = (install_root / "current.json").read_bytes()
+
+        with mock.patch.object(update_engine.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(update_engine.RollbackError, "replace failed"):
+                update_engine.rollback_to_version("1.0.0", install_root)
+
+        self.assertEqual((install_root / "current.json").read_bytes(), before)
+        self.assertEqual(update_engine.get_current_version(install_root), "1.1.0")
+
+    def test_recovery_from_missing_current_pointer_to_explicit_target(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+
+        result = update_engine.recover_current_pointer("1.0.0", install_root)
+
+        self.assertEqual(result.version, "1.0.0")
+        self.assertIsNone(result.previous_version)
+        self.assertEqual(update_engine.get_current_version(install_root), "1.0.0")
+
+    def test_recovery_from_malformed_current_pointer(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+        (install_root / "current.json").write_text("{bad", encoding="utf-8")
+
+        result = update_engine.recover_current_pointer("1.0.0", install_root)
+
+        self.assertEqual(result.version, "1.0.0")
+        self.assertEqual(update_engine.get_current_version(install_root), "1.0.0")
+
+    def test_recovery_pointer_write_failure_preserves_malformed_pointer_and_user_data(self):
+        update_engine, data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0", files={"app/file.txt": b"payload"})
+        update_engine.stage_release(release_root, install_root)
+        token = data_root / "instances" / "admin-main" / "secrets" / "token.txt"
+        config = data_root / "instances" / "admin-main" / "config.json"
+        database = data_root / "instances" / "admin-main" / "data" / "state.db"
+        token.parent.mkdir(parents=True)
+        database.parent.mkdir(parents=True)
+        token.write_bytes(b"TOKEN_SENTINEL")
+        config.write_bytes(b'{"override": true}')
+        database.write_bytes(b"DB_SENTINEL")
+        user_before = {path: path.read_bytes() for path in (token, config, database)}
+        current_path = install_root / "current.json"
+        current_path.write_bytes(b"{bad")
+        pointer_before = current_path.read_bytes()
+        version_file = install_root / "versions" / "1.0.0" / "app" / "file.txt"
+        version_before = version_file.read_bytes()
+
+        with mock.patch.object(update_engine.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(update_engine.RecoveryError, "replace failed"):
+                update_engine.recover_current_pointer("1.0.0", install_root)
+
+        self.assertEqual(current_path.read_bytes(), pointer_before)
+        self.assertEqual(version_file.read_bytes(), version_before)
+        self.assertEqual({path: path.read_bytes() for path in (token, config, database)}, user_before)
+        self.assertEqual(list(install_root.glob(".current.json.*.tmp")), [])
+
+    def test_recovery_to_missing_target_fails_without_guessing(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+
+        with self.assertRaisesRegex(update_engine.RecoveryError, "does not exist"):
+            update_engine.recover_current_pointer("2.0.0", install_root)
+
+        self.assertIsNone(update_engine.get_current_version(install_root))
+
+    def test_recovery_to_corrupt_target_fails(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0", files={"app/file.txt": b"one"})
+        update_engine.stage_release(release_root, install_root)
+        (install_root / "versions" / "1.0.0" / "app" / "file.txt").write_bytes(b"corrupt")
+
+        with self.assertRaisesRegex(update_engine.RecoveryError, "failed verification"):
+            update_engine.recover_current_pointer("1.0.0", install_root)
+
+        self.assertFalse((install_root / "current.json").exists())
+
+    def test_recovery_rejects_unnecessary_healthy_pointer(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+        update_engine.activate_staged_release("1.0.0", install_root)
+
+        with self.assertRaisesRegex(update_engine.RecoveryError, "healthy"):
+            update_engine.recover_current_pointer("1.0.0", install_root)
+
+    def test_install_health_states(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+
+        self.assertEqual(update_engine.check_install_health(install_root).state, update_engine.NO_CURRENT_POINTER)
+
+        install_root.mkdir(parents=True, exist_ok=True)
+        (install_root / "current.json").write_text("{bad", encoding="utf-8")
+        self.assertEqual(update_engine.check_install_health(install_root).state, update_engine.INVALID_CURRENT_POINTER)
+
+        (install_root / "current.json").write_text(
+            json.dumps({"schema_version": 1, "version": "1.0.0"}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(update_engine.check_install_health(install_root).state, update_engine.CURRENT_VERSION_MISSING)
+
+        self.valid_release(release_root, version="1.0.0", files={"app/file.txt": b"one"})
+        update_engine.stage_release(release_root, install_root)
+        self.assertEqual(update_engine.check_install_health(install_root).state, update_engine.HEALTHY)
+
+        (install_root / "versions" / "1.0.0" / "app" / "file.txt").write_bytes(b"corrupt")
+        self.assertEqual(update_engine.check_install_health(install_root).state, update_engine.CURRENT_VERSION_CORRUPT)
+
+    def test_malformed_previous_version_is_rejected(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0")
+        update_engine.stage_release(release_root, install_root)
+        (install_root / "current.json").write_text(
+            json.dumps({"schema_version": 1, "version": "1.0.0", "previous_version": True}) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(update_engine.CurrentPointerError, "previous_version"):
+            update_engine.get_activation_state(install_root)
+
+    def test_rollback_recovery_preserve_user_sentinels_and_versions(self):
+        update_engine, data_root, install_root, release_root = self.with_engine()
+        token = data_root / "instances" / "admin-main" / "secrets" / "token.txt"
+        config = data_root / "instances" / "admin-main" / "config.json"
+        database = data_root / "instances" / "admin-main" / "data" / "state.db"
+        token.parent.mkdir(parents=True)
+        database.parent.mkdir(parents=True)
+        token.write_bytes(b"TOKEN_SENTINEL")
+        config.write_bytes(b'{"override": true}')
+        database.write_bytes(b"DB_SENTINEL")
+        before = {path: path.read_bytes() for path in (token, config, database)}
+        self.valid_release(release_root / "one", version="1.0.0", files={"app/file.txt": b"one"})
+        self.valid_release(release_root / "two", version="1.1.0", files={"app/file.txt": b"two"})
+        update_engine.stage_release(release_root / "one", install_root)
+        update_engine.activate_staged_release("1.0.0", install_root)
+        update_engine.stage_release(release_root / "two", install_root)
+        update_engine.activate_staged_release("1.1.0", install_root)
+        update_engine.rollback_to_previous(install_root)
+        (install_root / "current.json").write_text("{bad", encoding="utf-8")
+        update_engine.recover_current_pointer("1.1.0", install_root)
+
+        self.assertEqual({path: path.read_bytes() for path in (token, config, database)}, before)
+        self.assertTrue((install_root / "versions" / "1.0.0").is_dir())
+        self.assertTrue((install_root / "versions" / "1.1.0").is_dir())
+        self.assertEqual(update_engine.get_current_version(install_root), "1.1.0")
+
     def test_current_pointer_write_failure_preserves_old_pointer(self):
         update_engine, _data_root, install_root, release_root = self.with_engine()
         self.valid_release(release_root / "one", version="1.0.0")
@@ -352,6 +642,24 @@ class UpdateEngineTests(unittest.TestCase):
 
         self.assertEqual(outside_current.read_bytes(), outside_bytes)
         self.assertTrue((install_root / "current.json").is_symlink())
+
+    def test_broken_current_pointer_symlink_is_invalid_and_not_replaced(self):
+        update_engine, _data_root, install_root, release_root = self.with_engine()
+        self.valid_release(release_root, version="1.0.0", files={"app/file.txt": b"payload"})
+        update_engine.stage_release(release_root, install_root)
+        install_root.mkdir(parents=True, exist_ok=True)
+        missing_target = install_root.parent / "missing-current-target.json"
+        current_link = install_root / "current.json"
+        self.create_file_symlink_or_skip(missing_target, current_link)
+
+        with self.assertRaises(update_engine.CurrentPointerError):
+            update_engine.get_activation_state(install_root)
+        self.assertEqual(update_engine.check_install_health(install_root).state, update_engine.INVALID_CURRENT_POINTER)
+        with self.assertRaisesRegex(update_engine.RecoveryError, "regular file"):
+            update_engine.recover_current_pointer("1.0.0", install_root)
+
+        self.assertFalse(missing_target.exists())
+        self.assertTrue(current_link.is_symlink())
 
     def test_previous_version_remains_installed_after_activating_new_one(self):
         update_engine, _data_root, install_root, release_root = self.with_engine()

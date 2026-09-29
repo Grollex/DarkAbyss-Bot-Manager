@@ -64,6 +64,21 @@ class CurrentPointerError(UpdateEngineError):
     pass
 
 
+class RollbackError(UpdateEngineError):
+    pass
+
+
+class RecoveryError(UpdateEngineError):
+    pass
+
+
+HEALTHY = "HEALTHY"
+NO_CURRENT_POINTER = "NO_CURRENT_POINTER"
+INVALID_CURRENT_POINTER = "INVALID_CURRENT_POINTER"
+CURRENT_VERSION_MISSING = "CURRENT_VERSION_MISSING"
+CURRENT_VERSION_CORRUPT = "CURRENT_VERSION_CORRUPT"
+
+
 @dataclass(frozen=True)
 class ReleaseFile:
     path: str
@@ -86,11 +101,42 @@ class StageResult:
 
 
 @dataclass(frozen=True)
+class ActivationState:
+    version: str
+    previous_version: str | None
+
+
+@dataclass(frozen=True)
 class ActivationResult:
     version: str
     previous_version: str | None
     current_path: Path
     version_dir: Path
+
+
+@dataclass(frozen=True)
+class RollbackResult:
+    version: str
+    previous_version: str | None
+    current_path: Path
+    version_dir: Path
+    changed: bool
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    version: str
+    previous_version: str | None
+    current_path: Path
+    version_dir: Path
+
+
+@dataclass(frozen=True)
+class InstallHealth:
+    state: str
+    version: str | None
+    previous_version: str | None
+    error: str | None = None
 
 
 def inspect_release(release_root: Path | str) -> ReleaseInfo:
@@ -148,26 +194,16 @@ def stage_release(release_root: Path | str, install_root: Path | str) -> StageRe
 def activate_staged_release(version: str, install_root: Path | str) -> ActivationResult:
     valid_version = _validate_version(version)
     root = _prepare_install_root(install_root)
-    versions_dir = _ensure_structural_directory(root, VERSIONS_DIR_NAME, create=False)
-    version_dir = versions_dir / valid_version
-    _ensure_target_inside(root, version_dir, "version directory")
-    if not version_dir.is_dir():
-        raise ActivationError(f"Installed version does not exist: {valid_version}")
-
-    release = inspect_release(version_dir)
-    if release.version != valid_version:
-        raise ActivationError(
-            f"Installed release metadata mismatch: requested {valid_version!r}, found {release.version!r}."
-        )
-
+    version_dir = _verify_installed_version(root, valid_version, ActivationError)
     previous_version = get_current_version(root)
     current_path = root / CURRENT_POINTER_NAME
     try:
-        _atomic_write_json(
+        _atomic_write_current_pointer(
             current_path,
             {
                 "schema_version": CURRENT_SCHEMA_VERSION,
                 "version": valid_version,
+                "previous_version": previous_version,
             },
         )
     except Exception as exc:
@@ -183,10 +219,139 @@ def activate_staged_release(version: str, install_root: Path | str) -> Activatio
 
 def get_current_version(install_root: Path | str) -> str | None:
     root = _prepare_install_root(install_root, create=False)
+    state = _read_activation_state(root)
+    if state is None:
+        return None
+    _ensure_installed_version_directory(root, state.version, CurrentPointerError)
+    return state.version
+
+
+def get_activation_state(install_root: Path | str) -> ActivationState | None:
+    root = _prepare_install_root(install_root, create=False)
+    return _read_activation_state(root)
+
+
+def rollback_to_version(target_version: str, install_root: Path | str) -> RollbackResult:
+    valid_version = _validate_version(target_version, error_type=RollbackError)
+    root = _prepare_install_root(install_root, create=False)
+    state = _read_activation_state(root)
+    if state is None:
+        raise RollbackError("Cannot rollback without a valid current pointer.")
+    version_dir = _verify_installed_version(root, valid_version, RollbackError)
     current_path = root / CURRENT_POINTER_NAME
+    if state.version == valid_version:
+        return RollbackResult(
+            version=state.version,
+            previous_version=state.previous_version,
+            current_path=current_path,
+            version_dir=version_dir,
+            changed=False,
+        )
+
+    try:
+        _atomic_write_current_pointer(
+            current_path,
+            {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "version": valid_version,
+                "previous_version": state.version,
+            },
+        )
+    except Exception as exc:
+        raise RollbackError(f"Failed to rollback to version {valid_version!r}: {exc}") from exc
+
+    return RollbackResult(
+        version=valid_version,
+        previous_version=state.version,
+        current_path=current_path,
+        version_dir=version_dir,
+        changed=True,
+    )
+
+
+def rollback_to_previous(install_root: Path | str) -> RollbackResult:
+    root = _prepare_install_root(install_root, create=False)
+    state = _read_activation_state(root)
+    if state is None:
+        raise RollbackError("Cannot rollback to previous without a current pointer.")
+    if state.previous_version is None:
+        raise RollbackError("No previous_version is recorded in current.json.")
+    return rollback_to_version(state.previous_version, root)
+
+
+def recover_current_pointer(target_version: str, install_root: Path | str) -> RecoveryResult:
+    valid_version = _validate_version(target_version, error_type=RecoveryError)
+    root = _prepare_install_root(install_root)
+    health = check_install_health(root)
+    if health.state == HEALTHY:
+        raise RecoveryError("Current pointer is already healthy; recovery is unnecessary.")
+    version_dir = _verify_installed_version(root, valid_version, RecoveryError)
+    current_path = root / CURRENT_POINTER_NAME
+    try:
+        _atomic_write_current_pointer(
+            current_path,
+            {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "version": valid_version,
+                "previous_version": None,
+            },
+        )
+    except Exception as exc:
+        raise RecoveryError(f"Failed to recover current pointer to version {valid_version!r}: {exc}") from exc
+    return RecoveryResult(
+        version=valid_version,
+        previous_version=None,
+        current_path=current_path,
+        version_dir=version_dir,
+    )
+
+
+def check_install_health(install_root: Path | str) -> InstallHealth:
+    root = _prepare_install_root(install_root, create=False)
+    try:
+        state = _read_activation_state(root)
+    except CurrentPointerError as exc:
+        return InstallHealth(
+            state=INVALID_CURRENT_POINTER,
+            version=None,
+            previous_version=None,
+            error=str(exc),
+        )
+    if state is None:
+        return InstallHealth(
+            state=NO_CURRENT_POINTER,
+            version=None,
+            previous_version=None,
+        )
+    try:
+        _verify_installed_version(root, state.version, CurrentPointerError)
+    except CurrentPointerError as exc:
+        message = str(exc)
+        health_state = (
+            CURRENT_VERSION_MISSING
+            if "does not exist" in message or "Required update structural directory is missing" in message
+            else CURRENT_VERSION_CORRUPT
+        )
+        return InstallHealth(
+            state=health_state,
+            version=state.version,
+            previous_version=state.previous_version,
+            error=message,
+        )
+    return InstallHealth(
+        state=HEALTHY,
+        version=state.version,
+        previous_version=state.previous_version,
+    )
+
+
+def _read_activation_state(root: Path) -> ActivationState | None:
+    current_path = root / CURRENT_POINTER_NAME
+    if current_path.is_symlink():
+        raise CurrentPointerError(f"Current pointer is not a regular file: {current_path}")
     if not current_path.exists():
         return None
-    if not current_path.is_file() or current_path.is_symlink():
+    if not current_path.is_file():
         raise CurrentPointerError(f"Current pointer is not a regular file: {current_path}")
     try:
         payload = json.loads(current_path.read_text(encoding="utf-8"))
@@ -202,12 +367,14 @@ def get_current_version(install_root: Path | str) -> str | None:
     if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != CURRENT_SCHEMA_VERSION:
         raise CurrentPointerError(f"Unsupported current.json schema_version {schema_version!r}.")
     version = _validate_version(payload.get("version"), error_type=CurrentPointerError)
-    versions_dir = _ensure_structural_directory(root, VERSIONS_DIR_NAME, create=False)
-    version_dir = versions_dir / version
-    _ensure_target_inside(root, version_dir, "version directory")
-    if not version_dir.is_dir():
-        raise CurrentPointerError(f"Current version is not installed: {version}")
-    return version
+    previous_value = payload.get("previous_version")
+    if previous_value is None:
+        previous_version = None
+    elif isinstance(previous_value, str):
+        previous_version = _validate_version(previous_value, error_type=CurrentPointerError)
+    else:
+        raise CurrentPointerError(f"Invalid current.json previous_version {previous_value!r}.")
+    return ActivationState(version=version, previous_version=previous_version)
 
 
 def list_installed_versions(install_root: Path | str) -> list[str]:
@@ -345,6 +512,41 @@ def _copy_release_to_staging(release: ReleaseInfo, staging_root: Path) -> None:
         shutil.copyfile(source_path, destination_path)
 
 
+def _ensure_installed_version_directory(
+    root: Path,
+    version: str,
+    error_type: type[UpdateEngineError],
+) -> Path:
+    try:
+        versions_dir = _ensure_structural_directory(root, VERSIONS_DIR_NAME, create=False)
+        version_dir = versions_dir / version
+        _ensure_target_inside(root, version_dir, "version directory")
+        if not version_dir.is_dir():
+            raise error_type(f"Installed version does not exist: {version}")
+        return version_dir
+    except UpdateEngineError as exc:
+        if isinstance(exc, error_type):
+            raise
+        raise error_type(f"Failed to resolve installed version {version!r}: {exc}") from exc
+
+
+def _verify_installed_version(
+    root: Path,
+    version: str,
+    error_type: type[UpdateEngineError],
+) -> Path:
+    version_dir = _ensure_installed_version_directory(root, version, error_type)
+    try:
+        release = inspect_release(version_dir)
+    except UpdateEngineError as exc:
+        raise error_type(f"Installed version {version!r} failed verification: {exc}") from exc
+    if release.version != version:
+        raise error_type(
+            f"Installed release metadata mismatch: requested {version!r}, found {release.version!r}."
+        )
+    return version_dir
+
+
 def _prepare_install_root(install_root: Path | str, create: bool = True) -> Path:
     root = Path(install_root).resolve()
     _ensure_install_root_disjoint_from_data_root(root)
@@ -412,6 +614,12 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
         raise
+
+
+def _atomic_write_current_pointer(path: Path, payload: dict) -> None:
+    if path.is_symlink():
+        raise CurrentPointerError(f"Current pointer is not a regular file: {path}")
+    _atomic_write_json(path, payload)
 
 
 def _sha256_file(path: Path) -> str:
