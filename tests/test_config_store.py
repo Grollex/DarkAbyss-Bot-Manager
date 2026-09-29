@@ -34,6 +34,10 @@ def load_modules(data_root: Path, *names: str):
     return [importlib.import_module(name) for name in names]
 
 
+def copy_via_json(payload):
+    return json.loads(json.dumps(payload))
+
+
 class ConfigStoreTests(unittest.TestCase):
     def create_instance(self, instance_store, instance_id: str = "admin-main"):
         return instance_store.create_instance("admin", instance_id)
@@ -66,6 +70,46 @@ class ConfigStoreTests(unittest.TestCase):
                 json.loads(app_paths.DEFAULT_ADMIN_CONFIG_PATH.read_text(encoding="utf-8")),
             )
 
+    def test_load_config_overrides_returns_empty_fresh_copy_for_fresh_instance(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+
+            overrides = config_store.load_config_overrides(instance.id)
+            overrides["allowed_user_ids"] = ["999"]
+
+            self.assertEqual(config_store.load_config_overrides(instance.id), {})
+            self.assertEqual(json.loads(instance.paths.config.read_text(encoding="utf-8")), {})
+
+    def test_config_snapshot_contains_independent_dicts_and_current_version(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store, app_paths = load_modules(
+                Path(data_dir),
+                "config_store",
+                "instance_store",
+                "app_paths",
+            )
+            instance = self.create_instance(instance_store)
+            instance.paths.config.write_text('{"allowed_user_ids": ["123"]}\n', encoding="utf-8")
+
+            snapshot = config_store.get_config_snapshot(instance.id)
+
+            self.assertEqual(snapshot.instance_id, instance.id)
+            self.assertEqual(snapshot.bot_type, "admin")
+            self.assertEqual(snapshot.config_version, 1)
+            self.assertEqual(snapshot.overrides, {"allowed_user_ids": ["123"]})
+            self.assertEqual(snapshot.defaults, json.loads(app_paths.DEFAULT_ADMIN_CONFIG_PATH.read_text(encoding="utf-8")))
+            self.assertEqual(snapshot.effective["allowed_user_ids"], ["123"])
+
+            snapshot.defaults["allow_server_administrators"] = False
+            snapshot.overrides["allowed_user_ids"].append("456")
+            snapshot.effective["allowed_role_ids"].append("789")
+
+            fresh_snapshot = config_store.get_config_snapshot(instance.id)
+            self.assertTrue(fresh_snapshot.defaults["allow_server_administrators"])
+            self.assertEqual(fresh_snapshot.overrides["allowed_user_ids"], ["123"])
+            self.assertEqual(fresh_snapshot.effective["allowed_role_ids"], [])
+
     def test_partial_override_changes_only_specified_field(self):
         with tempfile.TemporaryDirectory() as data_dir:
             config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
@@ -89,6 +133,28 @@ class ConfigStoreTests(unittest.TestCase):
 
             self.assertEqual(effective["allowed_user_ids"], ["123"])
 
+    def test_save_partial_override_persists_only_override_and_effective_reflects_it(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+
+            saved = config_store.save_config_overrides(instance.id, {"allow_server_administrators": False})
+
+            self.assertEqual(saved, {"allow_server_administrators": False})
+            self.assertEqual(json.loads(instance.paths.config.read_text(encoding="utf-8")), {"allow_server_administrators": False})
+            effective = config_store.load_effective_config(instance.id)
+            self.assertFalse(effective["allow_server_administrators"])
+            self.assertEqual(effective["allowed_user_ids"], [])
+
+    def test_save_list_override_replaces_default_list(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+
+            config_store.save_config_overrides(instance.id, {"allowed_user_ids": ["123", "456"]})
+
+            self.assertEqual(config_store.load_effective_config(instance.id)["allowed_user_ids"], ["123", "456"])
+
     def test_recursive_dictionary_merge_synthetic_fixture(self):
         with tempfile.TemporaryDirectory() as data_dir:
             config_store, = load_modules(Path(data_dir), "config_store")
@@ -99,6 +165,33 @@ class ConfigStoreTests(unittest.TestCase):
             )
 
             self.assertEqual(merged, {"outer": {"keep": 1, "replace": 3}, "list": [2]})
+
+    def test_save_recursive_dict_override_merges_with_synthetic_defaults(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store, bot_registry = load_modules(
+                Path(data_dir),
+                "config_store",
+                "instance_store",
+                "bot_registry",
+            )
+            instance = self.create_instance(instance_store)
+            default_path = Path(data_dir) / "synthetic-default.json"
+            default_payload = {
+                **VALID_ADMIN_CONFIG,
+                "nested": {
+                    "keep": "default",
+                    "change": "default",
+                },
+            }
+            default_path.write_text(json.dumps(default_payload), encoding="utf-8")
+            bot_type = replace(bot_registry.get_bot_type("admin"), default_config=default_path)
+
+            with mock.patch.object(config_store.bot_registry, "get_bot_type", return_value=bot_type):
+                config_store.save_config_overrides(instance.id, {"nested": {"change": "override"}})
+                effective = config_store.load_effective_config(instance.id)
+
+            self.assertEqual(effective["nested"], {"keep": "default", "change": "override"})
+            self.assertEqual(json.loads(instance.paths.config.read_text(encoding="utf-8")), {"nested": {"change": "override"}})
 
     def test_existing_full_phase3_config_preserves_effective_values(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -414,6 +507,21 @@ class ConfigStoreTests(unittest.TestCase):
 
             self.assertEqual(metadata_target.read_bytes(), metadata_bytes)
 
+    def test_save_rejects_symlinked_config_without_writing_target(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+            target_path = instance.paths.root / "target.txt"
+            target_bytes = b"TARGET_BYTES"
+            target_path.write_bytes(target_bytes)
+            instance.paths.config.unlink()
+            self.create_file_symlink_or_skip(target_path, instance.paths.config)
+
+            with self.assertRaisesRegex(config_store.ConfigStoreError, "symlink"):
+                config_store.save_config_overrides(instance.id, {"allowed_user_ids": ["123"]})
+
+            self.assertEqual(target_path.read_bytes(), target_bytes)
+
     def test_schema_failure_is_clear(self):
         with tempfile.TemporaryDirectory() as data_dir:
             config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
@@ -422,6 +530,119 @@ class ConfigStoreTests(unittest.TestCase):
 
             with self.assertRaisesRegex(config_store.ConfigValidationError, "allow_server_administrators"):
                 config_store.load_effective_config(instance.id)
+
+    def test_save_invalid_override_preserves_original_bytes(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+            original = b'{\n  "allowed_user_ids": ["123"]\n}\n'
+            instance.paths.config.write_bytes(original)
+
+            with self.assertRaisesRegex(config_store.ConfigValidationError, "allow_server_administrators"):
+                config_store.save_config_overrides(instance.id, {"allow_server_administrators": "yes"})
+
+            self.assertEqual(instance.paths.config.read_bytes(), original)
+
+    def test_save_rejects_non_dict_overrides(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+            original = instance.paths.config.read_bytes()
+
+            with self.assertRaisesRegex(config_store.ConfigValidationError, "overrides"):
+                config_store.save_config_overrides(instance.id, ["not", "object"])
+
+            self.assertEqual(instance.paths.config.read_bytes(), original)
+
+    def test_save_migrates_legacy_v0_before_writing(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store, app_paths = load_modules(
+                Path(data_dir),
+                "config_store",
+                "instance_store",
+                "app_paths",
+            )
+            instance = self.create_instance(instance_store)
+            legacy = json.dumps(VALID_ADMIN_CONFIG).encode("utf-8")
+            instance.paths.config.write_bytes(legacy)
+            instance.paths.config_meta.unlink()
+
+            config_store.save_config_overrides(instance.id, {"allowed_user_ids": ["123"]})
+
+            self.assertEqual(json.loads(instance.paths.config_meta.read_text(encoding="utf-8"))["config_version"], 1)
+            backups = [path for path in (app_paths.BACKUPS_DIR / "instances" / instance.id / "config").iterdir() if path.is_dir()]
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / "config.json").read_bytes(), legacy)
+            self.assertEqual(json.loads(instance.paths.config.read_text(encoding="utf-8")), {"allowed_user_ids": ["123"]})
+
+    def test_save_unsupported_migration_path_preserves_config(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store, bot_registry = load_modules(
+                Path(data_dir),
+                "config_store",
+                "instance_store",
+                "bot_registry",
+            )
+            instance = self.create_instance(instance_store)
+            original = json.dumps(VALID_ADMIN_CONFIG).encode("utf-8")
+            instance.paths.config.write_bytes(original)
+            instance.paths.config_meta.unlink()
+            bot_type = replace(bot_registry.get_bot_type("admin"), config_version=2)
+
+            with mock.patch.object(config_store.bot_registry, "get_bot_type", return_value=bot_type):
+                with self.assertRaisesRegex(config_store.ConfigMigrationError, "no migration path"):
+                    config_store.save_config_overrides(instance.id, {"allowed_user_ids": ["123"]})
+
+            self.assertEqual(instance.paths.config.read_bytes(), original)
+            self.assertFalse(instance.paths.config_meta.exists())
+
+    def test_save_future_config_version_preserves_config(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+            original = instance.paths.config.read_bytes()
+            instance.paths.config_meta.write_text('{"schema_version": 1, "config_version": 999}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(config_store.ConfigStoreError, "newer than supported"):
+                config_store.save_config_overrides(instance.id, {"allowed_user_ids": ["123"]})
+
+            self.assertEqual(instance.paths.config.read_bytes(), original)
+
+    def test_save_atomic_write_failure_preserves_original_bytes(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+            original = b'{\n  "allowed_user_ids": ["123"]\n}\n'
+            instance.paths.config.write_bytes(original)
+
+            with mock.patch.object(config_store, "_atomic_write_bytes", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(config_store.ConfigStoreError, "replace failed"):
+                    config_store.save_config_overrides(instance.id, {"allowed_user_ids": ["456"]})
+
+            self.assertEqual(instance.paths.config.read_bytes(), original)
+
+    def test_save_malformed_current_config_is_not_silently_overwritten(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+            original = b"{not-json"
+            instance.paths.config.write_bytes(original)
+
+            with self.assertRaisesRegex(config_store.ConfigStoreError, "Invalid instance config JSON"):
+                config_store.save_config_overrides(instance.id, {"allowed_user_ids": ["123"]})
+
+            self.assertEqual(instance.paths.config.read_bytes(), original)
+
+    def test_save_does_not_mutate_caller_dict(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            config_store, instance_store = load_modules(Path(data_dir), "config_store", "instance_store")
+            instance = self.create_instance(instance_store)
+            proposed = {"allowed_user_ids": ["123"], "nested": {"value": ["keep"]}}
+            original = copy_via_json(proposed)
+
+            config_store.save_config_overrides(instance.id, proposed)
+
+            self.assertEqual(proposed, original)
 
     def test_two_instances_have_independent_overrides_versions_and_backups(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -458,6 +679,17 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(loaded["allowed_user_ids"], [123])
             self.assertEqual(loaded["allowed_role_ids"], [])
             self.assertIsNone(loaded["audit_channel_id"])
+
+    def test_admin_load_config_after_save_sees_saved_effective_override(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            Admin, config_store, instance_store = load_modules(Path(data_dir), "Admin", "config_store", "instance_store")
+            instance = instance_store.create_instance("admin", "admin-main")
+
+            config_store.save_config_overrides(instance.id, {"allowed_user_ids": ["123"]})
+            loaded = Admin.load_config(Admin.resolve_runtime(instance.id))
+
+            self.assertEqual(loaded["allowed_user_ids"], [123])
+            self.assertTrue(loaded["allow_server_administrators"])
 
     def test_admin_legacy_config_migration_preserves_values(self):
         with tempfile.TemporaryDirectory() as data_dir:

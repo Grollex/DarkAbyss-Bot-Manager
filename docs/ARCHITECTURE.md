@@ -391,6 +391,22 @@ Migration writes to config metadata are atomic. A failed migration must leave th
 
 If metadata writing fails after a backup was completed, the valid backup may remain. This is safe user data and is not treated as a successful migration marker.
 
+## Phase 4B Config Editing API
+
+Future frontends must use ConfigStore APIs instead of writing instance `config.json` directly.
+
+The GUI-facing configuration APIs are:
+
+- `get_config_snapshot(instance_id)`
+- `load_config_overrides(instance_id)`
+- `save_config_overrides(instance_id, overrides)`
+
+`config.json` remains an overrides-only user file. `get_config_snapshot()` returns separate fresh dictionaries for defaults, user overrides, and effective runtime config. Runtime normalization never rewrites user files.
+
+`save_config_overrides()` first ensures the instance config version is current, validates proposed overrides by merging them with bot type defaults, and writes the override file atomically only after validation succeeds. Invalid overrides, stale unsupported config versions, unsafe paths, malformed current config, and write failures leave the previous override bytes intact.
+
+Ordinary config edits do not create migration backups. Backups are created only by supported config migrations before metadata is marked current.
+
 ## Future Phases
 
 Future phases may add:

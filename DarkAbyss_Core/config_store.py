@@ -8,6 +8,7 @@ import re
 import shutil
 import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +31,16 @@ class ConfigMigrationError(ConfigStoreError):
 
 class ConfigValidationError(ConfigStoreError):
     pass
+
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    instance_id: str
+    bot_type: str
+    config_version: int
+    overrides: dict
+    defaults: dict
+    effective: dict
 
 
 def _load_json_file(path: Path, label: str) -> object:
@@ -240,6 +251,10 @@ def _meta_bytes(config_version: int) -> bytes:
     ).encode("utf-8")
 
 
+def _overrides_bytes(overrides: dict) -> bytes:
+    return (json.dumps(overrides, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 def _ensure_backup_path_is_safe(path: Path) -> None:
     try:
         path.resolve().relative_to(app_paths.BACKUPS_DIR.resolve())
@@ -321,6 +336,58 @@ def load_effective_config(instance_id: str) -> dict:
             f"Instance {instance.id}: config version {current_version} is not current after migration."
         )
     return _load_effective_config_current(instance, bot_type)
+
+
+def load_config_overrides(instance_id: str) -> dict:
+    ensure_config_current(instance_id)
+    instance, _bot_type = _load_instance_and_bot_type(instance_id)
+    return copy.deepcopy(_load_user_overrides(instance))
+
+
+def get_config_snapshot(instance_id: str) -> ConfigSnapshot:
+    ensure_config_current(instance_id)
+    instance, bot_type = _load_instance_and_bot_type(instance_id)
+    config_version = _read_config_meta(instance, bot_type)
+    if config_version != bot_type.config_version:
+        raise ConfigMigrationError(
+            f"Instance {instance.id}: config version {config_version} is not current after migration."
+        )
+    defaults = _load_default_config(bot_type)
+    overrides = _load_user_overrides(instance)
+    effective = _merge_config(defaults, overrides)
+    _validate_effective_config(effective, bot_type)
+    return ConfigSnapshot(
+        instance_id=instance.id,
+        bot_type=instance.bot_type,
+        config_version=config_version,
+        overrides=copy.deepcopy(overrides),
+        defaults=copy.deepcopy(defaults),
+        effective=copy.deepcopy(effective),
+    )
+
+
+def save_config_overrides(instance_id: str, overrides: dict) -> dict:
+    ensure_config_current(instance_id)
+    instance, bot_type = _load_instance_and_bot_type(instance_id)
+    current_version = _read_config_meta(instance, bot_type)
+    if current_version != bot_type.config_version:
+        raise ConfigMigrationError(
+            f"Instance {instance.id}: config version {current_version} is not current after migration."
+        )
+    _ensure_config_file_safe(instance)
+    if not isinstance(overrides, dict):
+        raise ConfigValidationError("Config overrides must be a JSON object.")
+
+    proposed_overrides = copy.deepcopy(overrides)
+    defaults = _load_default_config(bot_type)
+    effective = _merge_config(defaults, proposed_overrides)
+    _validate_effective_config(effective, bot_type)
+
+    try:
+        _atomic_write_bytes(instance.paths.config, _overrides_bytes(proposed_overrides))
+    except Exception as exc:
+        raise ConfigStoreError(f"Failed to write config overrides for instance {instance.id!r}: {exc}") from exc
+    return copy.deepcopy(proposed_overrides)
 
 
 def ensure_config_current(instance_id: str) -> int:
