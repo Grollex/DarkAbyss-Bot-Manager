@@ -476,16 +476,21 @@ def select_channel(
     raise ValueError(f"{action} requires channel or voice_channel.")
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
     try:
-        args = parse_args()
+        args = parse_args(argv)
         runtime = resolve_runtime(args.instance)
         set_runtime(runtime)
         load_config(runtime)
         token = load_token(runtime)
     except RuntimeError as exc:
         print(exc)
-        raise SystemExit(1) from exc
+        return 1
 
     if acquire_single_instance_lock(runtime):
         bot.run(token)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

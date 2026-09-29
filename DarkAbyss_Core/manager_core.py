@@ -13,6 +13,7 @@ from typing import BinaryIO, Callable, Mapping
 import app_paths
 import bot_registry
 import instance_store
+import runtime_layout
 
 STATE_STOPPED = "STOPPED"
 STATE_RUNNING = "RUNNING"
@@ -119,6 +120,60 @@ def build_source_launch_spec(
         stdout_log_path=instance.paths.logs_dir / STDOUT_LOG_NAME,
         stderr_log_path=instance.paths.logs_dir / STDERR_LOG_NAME,
     )
+
+
+def build_packaged_launch_spec(
+    instance: instance_store.BotInstance,
+    bot_type: bot_registry.BotType,
+    app_executable: Path | str,
+    version_dir: Path | str,
+) -> LaunchSpec:
+    version_dir_path = Path(version_dir)
+    executable_path = Path(app_executable)
+    if version_dir_path.is_symlink():
+        raise ProcessStartError(f"Packaged version directory must not be a symlink: {version_dir_path}")
+    resolved_version_dir = version_dir_path.resolve()
+    if not resolved_version_dir.is_dir():
+        raise ProcessStartError(f"Packaged version directory does not exist: {resolved_version_dir}")
+    if executable_path.is_symlink():
+        raise ProcessStartError(f"Packaged app executable must not be a symlink: {executable_path}")
+    resolved_executable = executable_path.resolve()
+    if not runtime_layout.path_is_inside(resolved_executable, resolved_version_dir):
+        raise ProcessStartError(
+            f"Packaged app executable must stay inside version directory: {resolved_executable}"
+        )
+    if resolved_executable.is_symlink() or not resolved_executable.is_file():
+        raise ProcessStartError(f"Packaged app executable is missing or not a regular file: {resolved_executable}")
+    if resolved_executable.name != runtime_layout.app_executable_name():
+        raise ProcessStartError(
+            f"Packaged app executable must be named {runtime_layout.app_executable_name()}: {resolved_executable}"
+        )
+    if resolved_executable.parent != resolved_version_dir:
+        raise ProcessStartError(f"Packaged app executable must be directly inside version directory: {resolved_executable}")
+
+    env = os.environ.copy()
+    env["DARKABYSS_DATA_DIR"] = str(app_paths.DATA_ROOT.resolve())
+    return LaunchSpec(
+        executable=str(resolved_executable),
+        args=("--bot-runner", bot_type.id, "--instance", instance.id),
+        cwd=resolved_version_dir,
+        env=env,
+        stdout_log_path=instance.paths.logs_dir / STDOUT_LOG_NAME,
+        stderr_log_path=instance.paths.logs_dir / STDERR_LOG_NAME,
+    )
+
+
+def build_packaged_launch_spec_builder(
+    app_executable: Path | str,
+    version_dir: Path | str,
+) -> Callable[[instance_store.BotInstance, bot_registry.BotType], LaunchSpec]:
+    def build(
+        instance: instance_store.BotInstance,
+        bot_type: bot_registry.BotType,
+    ) -> LaunchSpec:
+        return build_packaged_launch_spec(instance, bot_type, app_executable, version_dir)
+
+    return build
 
 
 class BotProcessManager:

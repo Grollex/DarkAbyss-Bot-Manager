@@ -25,6 +25,10 @@ build/
 dist/
 *.egg-info/
 *.spec
+!packaging/
+!packaging/*.spec
+*.toc
+*.pkg
 
 # Logs
 *.log

@@ -47,7 +47,59 @@ Phase 5A GUI не хранит и не показывает токены. Ток
 
 Если GUI владеет запущенными процессами, закрытие окна требует остановить управляемые экземпляры или отменить закрытие. В Phase 5A режим "оставить запущенными после закрытия GUI" ещё не включён.
 
-Упаковка в `.exe`, updater и GitHub-интеграция пока не реализованы.
+GUI updater и GitHub Actions release pipeline пока не реализованы.
+
+## Windows packaged runtime для разработчика
+
+Phase 9A добавляет основу `.exe`-запуска без системного Python на машине пользователя.
+
+Целевая структура дистрибутива:
+
+```text
+DarkAbyssBotManager\
+    Launcher.exe
+    current.json
+    versions\<version>\
+        DarkAbyssApp.exe
+        release.json
+        _internal\...
+```
+
+Исходный режим разработки остаётся прежним:
+
+```bat
+python DarkAbyss_Core\manager_gui.py
+python DarkAbyss_Core\Admin.py --instance admin-main
+```
+
+Локальная Windows-сборка:
+
+```bat
+python -m pip install -r requirements-build.txt
+build_windows.bat 0.9.0
+```
+
+Скрипт собирает PyInstaller intermediate output и затем формирует готовое дерево:
+
+```text
+dist\DarkAbyssBotManager\
+    Launcher.exe
+    current.json
+    versions\0.9.0\
+        DarkAbyssApp.exe
+        release.json
+        _internal\...
+```
+
+`DarkAbyssApp.exe` поддерживает `--manager` и `--bot-runner admin --instance <id>`. В packaged mode Manager Core запускает дочерние боты отдельными процессами через `DarkAbyssApp.exe --bot-runner ...`, не через `Admin.py` и не через shell.
+
+Если нужно вручную проверить генерацию `release.json` для version directory:
+
+```bat
+python DarkAbyss_Core\release_manifest.py dist\DarkAbyssApp 0.9.0
+```
+
+В пакет нельзя включать реальные токены, пользовательские config/database/logs/backups, содержимое `%LOCALAPPDATA%`, generated instances или временные update/download артефакты. Выдача токена пока остаётся ручной: токен хранится только в user-data token file, не в программе.
 
 ## Экземпляры бота
 

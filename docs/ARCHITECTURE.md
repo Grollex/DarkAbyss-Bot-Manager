@@ -640,13 +640,90 @@ Rollback and recovery preserve Phase 6 path safety: `versions/` is a real struct
 
 Phase 8A still does not delete old versions, prune versions, add automatic unattended rollback, add GUI updater controls, add PyInstaller packaging, or change Discord bot behavior.
 
+## Phase 9A Windows Packaged Runtime Foundation
+
+Phase 9A introduces the first packaged runtime shape without changing Discord bot behavior or adding CI automation.
+
+The target Windows distribution layout is:
+
+```text
+DarkAbyssBotManager/
+    Launcher.exe
+    current.json
+    versions/
+        0.9.0/
+            DarkAbyssApp.exe
+            release.json
+            _internal/
+                bots/
+                DarkAbyss_Core/defaults/
+                PyInstaller support files
+```
+
+`Launcher.exe` is stable bootstrap code. It reads `current.json`, delegates pointer and installed-version validation to the existing update engine health checks, resolves `versions/<version>/DarkAbyssApp.exe`, and starts it as `DarkAbyssApp.exe --manager`. It does not download updates, mutate user data, repair unhealthy pointers, pick a random installed version, or use shell execution. If the pointer is missing, malformed, symlinked, points to a missing version, or points to a corrupt version, startup fails clearly.
+
+`DarkAbyssApp.exe` is the versioned application. It has explicit modes:
+
+```text
+DarkAbyssApp.exe --manager
+DarkAbyssApp.exe --bot-runner admin --instance admin-main
+```
+
+Manager GUI mode starts `manager_gui.main()`. Bot-runner mode calls the selected bot runtime in the current process and does not spawn another child from inside the runner. Each managed bot instance still remains a separate OS process because Manager Core launches a separate `DarkAbyssApp.exe --bot-runner ...` process per instance.
+
+Source mode remains unchanged:
+
+```text
+python DarkAbyss_Core/manager_gui.py
+python DarkAbyss_Core/Admin.py --instance admin-main
+```
+
+Manager Core now has two explicit launch-spec strategies:
+
+- Source strategy: `sys.executable <bot_type.entrypoint> --instance <instance_id>`.
+- Packaged strategy: `<version_dir>/DarkAbyssApp.exe --bot-runner <bot_type> --instance <instance_id>`.
+
+Both strategies produce argument lists only. Manager Core keeps enforcing `shell=False`, instance log ownership, and `DARKABYSS_DATA_DIR = app_paths.DATA_ROOT.resolve()` for child processes. Tokens are still read from user-data files and are never passed on the command line or embedded into environment variables.
+
+Program resource resolution is centralized in `runtime_layout.py`. Source checkouts resolve resources from the repository root. Frozen PyInstaller runtimes resolve program-owned resources from the bundle resource root. `app_paths.DATA_ROOT` remains controlled by `DARKABYSS_DATA_DIR` or OS user-data defaults and must not become the PyInstaller temporary directory or the versioned program directory.
+
+The versioned application uses PyInstaller `--onedir` through `packaging/DarkAbyssApp.spec`. The version directory is already the atomic deployment unit, so onedir avoids onefile extraction semantics, improves startup, keeps resources inspectable, and fits rollback by pointer switch. `Launcher.exe` is a small separate bootstrap built from `packaging/Launcher.spec`.
+
+Developer builds require an explicit version:
+
+```text
+build_windows.bat 0.9.0
+```
+
+The build script first creates raw PyInstaller output under `dist/DarkAbyssApp/` and `dist/Launcher.exe`, then `packaging/assemble_distribution.py` assembles the bootable tree:
+
+```text
+dist/DarkAbyssBotManager/
+    Launcher.exe
+    current.json
+    versions/
+        0.9.0/
+            DarkAbyssApp.exe
+            release.json
+            _internal/...
+```
+
+The assembler validates the requested version, copies only the versioned app bundle under `versions/<version>/`, copies the stable launcher only to the distribution root, generates and verifies the version `release.json`, writes the initial pointer with `previous_version = null`, and validates that launcher resolution selects exactly the assembled app.
+
+`release_manifest.py` generates deterministic `release.json` files from packaged version directories. It writes normalized relative paths, SHA-256 hashes, byte sizes, and stable ordering; rejects symlinks; excludes `release.json` itself; and rejects reserved user-data roots such as `secrets`, `instances`, `logs`, `backups`, `updates`, and databases. The generated manifest must pass `update_engine.inspect_release()`.
+
+The first distributable archive should be pre-bootstrapped with a valid `current.json` and one installed version directory. A clean user machine should not need system Python, pip, setup.bat, or a source checkout to double-click `Launcher.exe` and open the Manager GUI.
+
+Current limitation: token provisioning remains manual. The packaged Manager can initialize user-data directories and bot instances, but users still place their Discord token into the generated instance token file outside the program directory.
+
+Phase 9A does not add GitHub Actions, automatic GUI update controls, automatic rollback policy, PyInstaller release publishing, or changes to Discord command behavior.
+
 ## Future Phases
 
 Future phases may add:
 
-- GUI
-- updater
-- launcher redesign
-- GitHub integration
-- packaging
+- GitHub Actions release builds
+- GUI updater controls
+- packaged release publishing
+- token provisioning UX
 - Windows service/systemd/Docker

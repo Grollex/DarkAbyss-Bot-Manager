@@ -197,6 +197,20 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertTrue(hasattr(self.manager_gui, "main"))
         self.assertEqual(self.manager_gui.QApplication.instance(), self.app)
 
+    def test_default_window_manager_uses_source_launch_strategy(self):
+        window = self.manager_gui.ManagerMainWindow(auto_refresh=False)
+
+        def close_without_prompt():
+            window._allow_close = True
+            window.close()
+
+        self.addCleanup(close_without_prompt)
+
+        self.assertEqual(
+            window.manager._launch_spec_builder,
+            self.manager_gui.manager_core.build_source_launch_spec,
+        )
+
     def test_main_window_populates_two_fake_instances_sorted(self):
         window = self.make_window()
 

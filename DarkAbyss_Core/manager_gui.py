@@ -511,14 +511,14 @@ def bootstrap_for_gui() -> None:
     admin_instance.ensure_admin_instance()
 
 
-def main() -> int:
+def main(manager: manager_core.BotProcessManager | None = None) -> int:
     app = QApplication(sys.argv)
     try:
         bootstrap_for_gui()
     except Exception as exc:
         QMessageBox.critical(None, "DarkAbyss Bot Manager", f"Startup failed: {exc}")
         return 1
-    window = ManagerMainWindow()
+    window = ManagerMainWindow(manager=manager)
     window.resize(980, 720)
     window.show()
     return app.exec()

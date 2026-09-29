@@ -7,12 +7,13 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable
 
 import app_paths
+import runtime_layout
 
 SUPPORTED_SCHEMA_VERSION = 1
 SAFE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-BOTS_DIR = PROJECT_ROOT / "bots"
+PROJECT_ROOT = runtime_layout.resource_root()
+BOTS_DIR = runtime_layout.bots_root()
 
 
 class BotRegistryError(ValueError):

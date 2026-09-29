@@ -1,9 +1,11 @@
 import os
 from pathlib import Path
 
+import runtime_layout
+
 TOKEN_PLACEHOLDER = "PUT_DISCORD_BOT_TOKEN_HERE"
 
-PROGRAM_ROOT = Path(__file__).resolve().parent
+PROGRAM_ROOT = runtime_layout.core_root()
 DEFAULTS_DIR = PROGRAM_ROOT / "defaults"
 DEFAULT_ADMIN_CONFIG_PATH = DEFAULTS_DIR / "admin_config.json"
 
