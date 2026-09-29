@@ -499,6 +499,80 @@ The pointer write is atomic: temporary file in the same directory, flush/fsync, 
 
 Previous version directories are retained for future rollback support. Phase 6A does not implement automatic rollback, network downloading, GitHub integration, packaging, or config/database migration execution. It may install migration code as program files, but it does not run migrations or modify user data during activation.
 
+## Phase 7A GitHub Releases Transport
+
+Phase 7A adds a GUI-independent GitHub Releases transport layer in:
+
+```text
+DarkAbyss_Core/github_updates.py
+```
+
+GitHub integration is transport only:
+
+```text
+GitHub Releases
+    -> downloaded ZIP artifact
+    -> safe local extraction/preparation
+    -> update_engine.inspect_release()
+    -> update_engine.stage_release()
+    -> explicit update_engine.activate_staged_release()
+```
+
+The GitHub layer does not duplicate Phase 6 manifest validation, per-file SHA-256 verification, version publication, or `current.json` activation. The Phase 6 `release.json` remains the authoritative payload manifest, and ZIP extraction success is never treated as equivalent to release verification.
+
+Repository owner/name are explicit API inputs. Public GitHub Releases work without authentication. An optional GitHub token may be supplied by API parameter or `GITHUB_TOKEN` for API requests only; it is never persisted, never placed in URLs, and is not forwarded to unrelated redirected hosts.
+
+Supported lookups:
+
+- latest stable release from GitHub Releases, excluding drafts and prereleases by default
+- prereleases only when explicitly allowed
+- exact tag lookup
+
+Version normalization is intentionally small: `v1.2.3` maps to `1.2.3`; unrelated tag formats are not silently remapped. The selected GitHub tag version, expected asset name, and extracted `release.json` version must match before staging.
+
+The deterministic release asset name is:
+
+```text
+darkabyss-release-<version>.zip
+```
+
+The ZIP must contain the Phase 6 release layout directly at archive root:
+
+```text
+release.json
+DarkAbyss_Core/...
+bots/...
+```
+
+Archives with an extra parent directory are not accepted. ZIP extraction is explicit and hardened: absolute paths, `..` traversal, Windows drive paths, backslash separators, symlink entries, special files, duplicate normalized paths, and case-colliding paths are rejected. `extractall()` is not used.
+
+Network policy:
+
+- API requests use HTTPS GitHub API endpoints with an explicit `User-Agent` and finite timeout.
+- Asset downloads require HTTPS and allow only GitHub/GitHubusercontent asset hosts.
+- Redirects to HTTP or unrelated hosts are rejected.
+- Authorization is removed before following a redirect to a different host.
+
+Downloads are written to a unique temporary file first under:
+
+```text
+<PROGRAM_INSTALL_ROOT>/updates/downloads/
+```
+
+Prepared extractions are written under:
+
+```text
+<PROGRAM_INSTALL_ROOT>/updates/prepared/
+```
+
+These are program/update-owned locations, not `DATA_ROOT`. Existing updater structural directories such as `updates/downloads` and `updates/prepared` must be real directories, must not be symlinks, and must resolve inside the install root before any network artifact is written or extracted. GitHub transport never writes to instances, config, secrets, logs, backups, databases, or other user-owned `DATA_ROOT` paths.
+
+Downloads are bounded and streamed. The configured maximum compressed artifact size is enforced from `Content-Length` when present and again while bytes are streamed. If GitHub asset metadata declares a size, the completed byte count must match it. If GitHub provides a SHA-256 digest, the transport validates it; if no digest exists, the layer relies on Phase 6 per-file SHA-256 verification after extraction.
+
+ZIP preparation has independent resource limits for extracted payload bytes and archive entry count. Before extraction, the transport validates `ZipInfo` metadata: the entry count must be below the configured limit, each declared uncompressed file size must be valid and within the extracted-size limit, and the total declared uncompressed size must fit within the same limit. During extraction, bytes are copied in bounded chunks; the actual bytes written for each file must exactly match its declared `ZipInfo.file_size`, and the running total must not exceed the configured extracted-size limit. Rejected archives do not proceed to Phase 6 staging or activation.
+
+Phase 7A does not add GUI automatic update installation, unattended updates, rollback/recovery, GitHub publishing, PyInstaller packaging, or Discord runtime behavior changes. Activation remains an explicit caller decision through `update_engine.activate_staged_release()`.
+
 ## Future Phases
 
 Future phases may add:
