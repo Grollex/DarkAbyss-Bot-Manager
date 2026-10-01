@@ -203,6 +203,7 @@ class AIPlatformFoundationTests(unittest.TestCase):
             ai_platform.AvailabilityState.CREDENTIAL_MISSING,
         )
         self.assertEqual(ai_platform.AvailabilityState.CREDENTIAL_INVALID.value, "CREDENTIAL_INVALID")
+        self.assertEqual(ai_platform.AvailabilityState.ACCESS_FORBIDDEN.value, "ACCESS_FORBIDDEN")
 
     def test_settings_store_persists_profiles_without_secrets(self):
         ai_platform = load_ai_platform()

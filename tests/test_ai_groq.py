@@ -105,6 +105,9 @@ class GroqAdapterTests(unittest.IsolatedAsyncioTestCase):
         response = await provider.generate(request, "groq-default")
         self.assertEqual(response.content, "ok")
         self.assertEqual(transport.calls[0]["headers"]["Authorization"], "Bearer SECRET_KEY")
+        self.assertEqual(transport.calls[0]["headers"]["User-Agent"], "DarkAbyssBotManager/AI-2B")
+        self.assertEqual(transport.calls[0]["headers"]["Accept"], "application/json")
+        self.assertEqual(transport.calls[0]["headers"]["Content-Type"], "application/json")
         self.assertNotIn("SECRET_KEY", repr(response))
         self.assertNotIn("SECRET_KEY", str(response.public_dict()))
 
@@ -116,6 +119,19 @@ class GroqAdapterTests(unittest.IsolatedAsyncioTestCase):
             await reject.generate(request, "groq-default")
         self.assertIn("invalid", str(error.exception).lower())
         self.assertNotIn("SECRET_KEY", str(error.exception))
+
+    async def test_every_groq_request_carries_stable_darkabyss_user_agent(self):
+        ai_platform, ai_groq = load_modules()
+        transport = FakeTransport([(200, self.success_payload(content="ok"))])
+        provider = ai_groq.GroqProvider(self.make_store(ai_platform), transport=transport)
+        request = ai_platform.AIRequest(
+            model_id="openai/gpt-oss-120b",
+            messages=(ai_platform.AIMessage(role="user", content="hello"),),
+        )
+        await provider.generate(request, "groq-default")
+
+        self.assertEqual(transport.calls[0]["headers"]["User-Agent"], ai_groq.GROQ_USER_AGENT)
+        self.assertTrue(transport.calls[0]["url"].startswith("https://api.groq.com/openai/v1/"))
 
     async def test_request_mapping_messages_options_and_tools(self):
         ai_platform, ai_groq = load_modules()
@@ -152,6 +168,21 @@ class GroqAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("reasoning_format", body)
         self.assertEqual(body["tools"][0]["type"], "function")
         self.assertEqual(body["tools"][0]["function"]["name"], "send_message")
+
+    async def test_gpt_oss_text_request_disables_reasoning_output(self):
+        ai_platform, ai_groq = load_modules()
+        transport = FakeTransport([(200, self.success_payload(content="ok"))])
+        provider = ai_groq.GroqProvider(self.make_store(ai_platform), transport=transport)
+        request = ai_platform.AIRequest(
+            model_id="openai/gpt-oss-120b",
+            messages=(ai_platform.AIMessage(role="user", content="hello"),),
+        )
+
+        await provider.generate(request, "groq-default")
+
+        body = transport.calls[0]["body"]
+        self.assertEqual(body["include_reasoning"], False)
+        self.assertNotIn("reasoning_format", body)
 
     async def test_assistant_tool_call_and_tool_result_message_mapping(self):
         ai_platform, ai_groq = load_modules()
@@ -316,7 +347,7 @@ class GroqAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         cases = [
             (401, "invalid"),
-            (403, "invalid"),
+            (403, "forbidden"),
             (429, "rate limit"),
             (500, "unavailable"),
         ]
@@ -330,6 +361,26 @@ class GroqAdapterTests(unittest.IsolatedAsyncioTestCase):
                     await provider.generate(request, "groq-default")
                 self.assertIn(expected, str(error.exception).lower())
                 self.assertNotIn("raw provider detail", str(error.exception))
+
+        cloudflare = ai_groq.GroqProvider(
+            self.make_store(ai_platform),
+            transport=FakeTransport(
+                [
+                    (
+                        403,
+                        {
+                            "error_code": 1010,
+                            "error_name": "browser_signature_banned",
+                            "detail": "SECRET raw provider detail",
+                        },
+                    )
+                ]
+            ),
+        )
+        with self.assertRaises(ai_groq.GroqProviderError) as cloudflare_error:
+            await cloudflare.generate(request, "groq-default")
+        self.assertIn("security gateway", str(cloudflare_error.exception))
+        self.assertNotIn("SECRET", str(cloudflare_error.exception))
 
         provider = ai_groq.GroqProvider(
             self.make_store(ai_platform),
@@ -366,6 +417,25 @@ class GroqAdapterTests(unittest.IsolatedAsyncioTestCase):
         request = ai_groq.build_groq_smoke_request()
         self.assertEqual(request.model_id, "openai/gpt-oss-120b")
         self.assertIn("KAIRO_GROQ_OK", request.messages[0].content)
+        self.assertEqual(request.options["max_completion_tokens"], 256)
+        self.assertEqual(request.options["reasoning_effort"], "low")
+
+    async def test_test_connection_maps_401_403_and_429(self):
+        ai_platform, ai_groq = load_modules()
+        cases = [
+            (401, ai_platform.AvailabilityState.CREDENTIAL_INVALID),
+            (403, ai_platform.AvailabilityState.ACCESS_FORBIDDEN),
+            (429, ai_platform.AvailabilityState.UNAVAILABLE),
+        ]
+        for status, state in cases:
+            provider = ai_groq.GroqProvider(
+                self.make_store(ai_platform),
+                transport=FakeTransport([(status, {"error": {"message": "raw SECRET provider detail"}})]),
+            )
+            with self.subTest(status=status):
+                availability = await provider.test_connection("groq-default")
+                self.assertEqual(availability.state, state)
+                self.assertNotIn("SECRET", availability.message)
 
 
 class DependencyTests(unittest.TestCase):

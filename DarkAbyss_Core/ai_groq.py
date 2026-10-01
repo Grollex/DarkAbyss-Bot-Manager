@@ -17,6 +17,7 @@ GROQ_DISPLAY_NAME = "Groq"
 GROQ_API_BASE = "https://api.groq.com/openai/v1"
 GROQ_CHAT_COMPLETIONS_PATH = "/chat/completions"
 GROQ_INITIAL_MODEL = "openai/gpt-oss-120b"
+GROQ_USER_AGENT = "DarkAbyssBotManager/AI-2B"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
 ALLOWED_REASONING_EFFORT = {"low", "medium", "high"}
@@ -159,6 +160,7 @@ class GroqProvider:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": GROQ_USER_AGENT,
         }
         status, response_bytes = await asyncio.to_thread(
             self._transport.post_json,
@@ -169,7 +171,7 @@ class GroqProvider:
             max_response_bytes=self._max_response_bytes,
         )
         if status < 200 or status >= 300:
-            raise _error_for_status(status)
+            raise _error_for_status(status, response_bytes)
         return _parse_response(response_bytes)
 
     def _load_api_key(self, credential_ref: str) -> str:
@@ -192,7 +194,7 @@ def build_groq_smoke_request() -> ai_platform.AIRequest:
                 content="Reply with exactly: KAIRO_GROQ_OK",
             ),
         ),
-        options={"max_completion_tokens": 16},
+        options={"max_completion_tokens": 256, "reasoning_effort": "low"},
     )
 
 
@@ -202,10 +204,10 @@ def _map_request(request: ai_platform.AIRequest) -> dict[str, Any]:
         "messages": [_map_message(message) for message in request.messages],
     }
     body.update(_map_options(request.options))
+    if request.model_id == GROQ_INITIAL_MODEL:
+        body["include_reasoning"] = False
     if request.tools:
         body["tools"] = [_map_tool(tool) for tool in request.tools]
-        if request.model_id == GROQ_INITIAL_MODEL:
-            body["include_reasoning"] = False
     return body
 
 
@@ -328,9 +330,13 @@ def _parse_tool_call(item: dict[str, Any]) -> ai_platform.AIToolCall:
     return ai_platform.AIToolCall(call_id=call_id, tool_name=tool_name, arguments=arguments)
 
 
-def _error_for_status(status: int) -> GroqProviderError:
-    if status in {401, 403}:
+def _error_for_status(status: int, response_bytes: bytes = b"") -> GroqProviderError:
+    if status == 401:
         return GroqProviderError("Groq credential is invalid.")
+    if status == 403:
+        if _is_cloudflare_access_block(response_bytes):
+            return GroqProviderError("Groq API access was blocked by the upstream security gateway.")
+        return GroqProviderError("Groq API access is forbidden.")
     if status == 429:
         return GroqProviderError("Groq rate limit or quota was reached.")
     if 400 <= status < 500:
@@ -344,11 +350,23 @@ def _availability_state_from_error(error: GroqProviderError) -> ai_platform.Avai
     message = str(error).lower()
     if "credential is invalid" in message:
         return ai_platform.AvailabilityState.CREDENTIAL_INVALID
+    if "access is forbidden" in message or "access was blocked" in message:
+        return ai_platform.AvailabilityState.ACCESS_FORBIDDEN
     if "credential" in message:
         return ai_platform.AvailabilityState.CREDENTIAL_MISSING
     if "rate limit" in message or "quota" in message:
         return ai_platform.AvailabilityState.UNAVAILABLE
     return ai_platform.AvailabilityState.UNAVAILABLE
+
+
+def _is_cloudflare_access_block(response_bytes: bytes) -> bool:
+    try:
+        payload = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("error_code") == 1010 or payload.get("error_name") == "browser_signature_banned"
 
 
 def _read_limited(response: Any, max_response_bytes: int) -> bytes:

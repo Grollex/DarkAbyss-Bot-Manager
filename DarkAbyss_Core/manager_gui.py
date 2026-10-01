@@ -548,8 +548,10 @@ class AIProviderSettingsDialog(QDialog):
             self.status_label.setText("Provider unavailable")
             return
         if self._credential_store.exists(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF):
-            self.status_label.setText("Key saved locally")
+            self.key_edit.setPlaceholderText("Key saved locally — leave blank to keep it")
+            self.status_label.setText("Configured — key saved locally")
         else:
+            self.key_edit.setPlaceholderText("Paste Groq API key")
             self.status_label.setText("Not configured")
 
     def save_settings(self) -> None:
@@ -617,7 +619,9 @@ class AIProviderSettingsDialog(QDialog):
         if availability.state == ai_platform.AvailabilityState.AVAILABLE:
             self.status_label.setText("Connected")
         elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_INVALID:
-            self.status_label.setText("Credential rejected")
+            self.status_label.setText("Invalid API key")
+        elif availability.state == ai_platform.AvailabilityState.ACCESS_FORBIDDEN:
+            self.status_label.setText("Access forbidden")
         elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_MISSING:
             self.status_label.setText("No key saved")
         elif "rate" in availability.message.lower() or "quota" in availability.message.lower():

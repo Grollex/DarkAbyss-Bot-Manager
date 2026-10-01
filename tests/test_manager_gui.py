@@ -864,13 +864,19 @@ class ManagerGuiTests(unittest.TestCase):
 
         reopened, _, same_store = self.make_ai_dialog()
         self.assertEqual(reopened.key_edit.text(), "")
-        self.assertIn("Key saved locally", reopened.status_label.text())
+        self.assertIn("Configured", reopened.status_label.text())
+        self.assertIn("key saved locally", reopened.status_label.text())
+        self.assertIn("leave blank to keep it", reopened.key_edit.placeholderText())
         reopened.save_settings()
         self.assertEqual(same_store.read_secret("groq", "groq-default"), "SECRET_KEY")
+        self.assertEqual(reopened.key_edit.text(), "")
+        self.assertNotIn("SECRET_KEY", reopened.status_label.text())
+        self.assertNotIn("SECRET_KEY", reopened.key_edit.placeholderText())
 
         with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok):
             reopened.remove_key()
         self.assertFalse(same_store.exists("groq", "groq-default"))
+        self.assertEqual(reopened.key_edit.placeholderText(), "Paste Groq API key")
 
     def test_ai_provider_save_preserves_other_profiles_and_existing_routing(self):
         dialog, settings_store, credential_store = self.make_ai_dialog()
@@ -938,6 +944,28 @@ class ManagerGuiTests(unittest.TestCase):
         self.wait_until(lambda: dialog.status_label.text() == "Connected")
         self.assertTrue(dialog.test_button.isEnabled())
         self.assertNotIn("SECRET_KEY", dialog.status_label.text())
+
+    def test_ai_provider_status_mapping_is_sanitized(self):
+        ai_platform = self.manager_gui.ai_platform
+        cases = [
+            (ai_platform.AvailabilityState.CREDENTIAL_INVALID, "Invalid API key"),
+            (ai_platform.AvailabilityState.ACCESS_FORBIDDEN, "Access forbidden"),
+            (ai_platform.AvailabilityState.CREDENTIAL_MISSING, "No key saved"),
+            (ai_platform.AvailabilityState.UNAVAILABLE, "Rate limit / quota reached", "quota"),
+            (ai_platform.AvailabilityState.UNAVAILABLE, "Unexpected provider response", "unexpected"),
+            (ai_platform.AvailabilityState.UNAVAILABLE, "Network unavailable", "plain unavailable"),
+        ]
+        for case in cases:
+            state = case[0]
+            expected = case[1]
+            message = case[2] if len(case) > 2 else "SECRET must not show"
+            with self.subTest(expected=expected):
+                dialog, _, _ = self.make_ai_dialog()
+                dialog._finish_test_connection(
+                    self.manager_gui.ActionResult(True, "OK", ai_platform.Availability(state, message))
+                )
+                self.assertEqual(dialog.status_label.text(), expected)
+                self.assertNotIn("SECRET", dialog.status_label.text())
 
     def test_ai_provider_close_rejected_while_test_in_progress(self):
         dialog, _, _ = self.make_ai_dialog()
