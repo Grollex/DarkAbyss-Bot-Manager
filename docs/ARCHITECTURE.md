@@ -170,6 +170,44 @@ There are no network calls on module import, registry construction, profile load
 
 AI request/response objects are provider-neutral and JSON-compatible. They contain messages, JSON-safe tool schemas, JSON-safe tool-call arguments, finish metadata, and no provider-specific raw response object. Admin Tool schemas can pass through this contract without `discord.py` objects.
 
+AI-2B adds the first optional provider adapter:
+
+- Provider: Groq
+- Initial tested model metadata: `openai/gpt-oss-120b`
+- API style: Groq OpenAI-compatible Chat Completions
+- Manager panel: `AI Providers...`
+
+Groq is not a core dependency. Core remains fully operational when Groq is not configured, the local key is missing, the optional adapter cannot load, Groq is offline, quota is exhausted, or credentials are rejected. Groq outage/key/quota failure affects only explicit AI requests.
+
+The Groq adapter uses standard-library HTTPS and performs network I/O only from explicit provider calls:
+
+- `test_connection(...)`
+- `generate(...)`
+
+No Groq request occurs on import, provider construction, registry construction, routing, Manager startup, or bot startup.
+
+Groq tool calls are data until a later orchestrator phase validates, plans, confirms, and executes them. AI-2B does not execute Admin Tools, mutate Discord, decide confirmation policy, write bot config, or route task classes. Groq built-in browser search, code execution, remote MCP, and provider-hosted tool execution are not enabled.
+
+For `openai/gpt-oss-120b`, DarkAbyss uses `reasoning_effort` (`low`, `medium`, `high`) and requests `include_reasoning = false` when sending local function tool schemas. DarkAbyss must not expose model chain-of-thought/reasoning in responses, Manager UI, Discord, logs, or audit output.
+
+The Manager `AI Providers...` dialog is device-local and global. It is not tied to the selected Discord Bot Instance and can be opened even when no bot is selected.
+
+Current Groq settings behavior:
+
+- The user enters the Groq API key inside Manager.
+- The key is stored device-locally via `CredentialStore`.
+- Existing saved keys are never re-displayed, partially displayed, or copied back into the UI.
+- Saving an empty key field preserves an existing key.
+- Removing a key is an explicit action.
+- Model/profile settings are stored separately in `<DATA_ROOT>/config/ai.json`.
+- `ai.json` contains no raw API key.
+- Editing Groq settings replaces only the `groq-default` profile. It preserves other provider profiles and existing routing assignments.
+- Malformed `ai.json` is preserved and normal Save is disabled until the user explicitly resolves the settings file.
+- Another PC uses its own device-local credential and profile settings.
+- `Test Connection` is an explicit user action and runs outside the GUI thread.
+
+AI-3 will add the orchestrator loop that can interpret model plans/tool-call data, apply confirmation policy, and call the Admin Tool Layer when authorized. AI-2B only stores settings, calls Groq explicitly, and parses model output into data.
+
 AI credentials are device-local and stored outside program versions, bot instance config, release artifacts, and the source tree:
 
 ```text

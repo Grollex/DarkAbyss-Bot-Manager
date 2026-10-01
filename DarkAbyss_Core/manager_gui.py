@@ -15,6 +15,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 import admin_instance
+import ai_platform
 import app_paths
 import bot_registry
 import config_store
@@ -42,6 +44,9 @@ import manager_core
 
 
 REFRESH_INTERVAL_MS = 1500
+GROQ_PROFILE_ID = "groq-default"
+GROQ_PROVIDER_ID = "groq"
+GROQ_CREDENTIAL_REF = "groq-default"
 
 DISCORD_DEVELOPER_PORTAL_URL = "https://discord.com/developers/applications"
 DISCORD_INVITE_BASE_URL = "https://discord.com/oauth2/authorize"
@@ -359,6 +364,8 @@ class ConfigEditorDialog(QDialog):
         self.save_button.clicked.connect(self.save_overrides)
         self.load_snapshot()
 
+
+
     @property
     def last_error(self) -> str:
         return self._last_error
@@ -390,6 +397,268 @@ class ConfigEditorDialog(QDialog):
     def _set_error(self, message: str) -> None:
         self._last_error = message
         self.status_label.setText(f"Error: {message}")
+
+
+def create_groq_provider(credential_store: ai_platform.CredentialStore):
+    try:
+        import ai_groq
+    except Exception as exc:
+        raise ai_platform.AIPlatformError("Provider unavailable.") from exc
+    return ai_groq.GroqProvider(credential_store)
+
+
+def _profile_by_id(settings: ai_platform.AISettings, profile_id: str) -> ai_platform.AIProfile | None:
+    return next((profile for profile in settings.profiles if profile.profile_id == profile_id), None)
+
+
+class AIProviderSettingsDialog(QDialog):
+    def __init__(
+        self,
+        settings_store: ai_platform.AISettingsStore | None = None,
+        credential_store: ai_platform.CredentialStore | None = None,
+        provider_factory: Callable[[ai_platform.CredentialStore], object] = create_groq_provider,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AI Providers")
+        self._settings_store = settings_store or ai_platform.AISettingsStore()
+        self._credential_store = credential_store or ai_platform.CredentialStore()
+        self._provider_factory = provider_factory
+        self._worker_handles: list[_WorkerHandle] = []
+        self._provider = None
+        self._settings_invalid = False
+        self._loaded_settings = ai_platform.AISettings()
+        self._test_in_progress = False
+
+        self.status_label = QLabel("")
+        self.key_edit = QLineEdit()
+        self.key_edit.setEchoMode(QLineEdit.Password)
+        self.show_key_checkbox = QCheckBox("Show key while editing")
+        self.model_combo = QComboBox()
+        self.reasoning_combo = QComboBox()
+        self.reasoning_combo.addItems(["low", "medium", "high"])
+        self.save_button = QPushButton("Save")
+        self.test_button = QPushButton("Test Connection")
+        self.remove_button = QPushButton("Remove Key")
+        self.close_button = QPushButton("Close")
+
+        form = QFormLayout()
+        form.addRow("Status:", self.status_label)
+        form.addRow("API Key:", self.key_edit)
+        form.addRow("", self.show_key_checkbox)
+        form.addRow("Model:", self.model_combo)
+        form.addRow("Reasoning:", self.reasoning_combo)
+
+        button_row = QHBoxLayout()
+        for button in (self.save_button, self.test_button, self.remove_button, self.close_button):
+            button_row.addWidget(button)
+        button_row.addStretch(1)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Groq"))
+        layout.addLayout(form)
+        layout.addLayout(button_row)
+        self.setLayout(layout)
+
+        self.show_key_checkbox.toggled.connect(self._toggle_key_visibility)
+        self.save_button.clicked.connect(self.save_settings)
+        self.test_button.clicked.connect(self.test_connection)
+        self.remove_button.clicked.connect(self.remove_key)
+        self.close_button.clicked.connect(self.accept)
+
+        self._load_provider_metadata()
+        self._load_settings()
+        self._refresh_status()
+
+    def _toggle_key_visibility(self, checked: bool) -> None:
+        self.key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+
+    def _load_provider_metadata(self) -> None:
+        self.model_combo.clear()
+        try:
+            self._provider = self._provider_factory(self._credential_store)
+            models = self._provider.metadata.models
+        except Exception:
+            self._provider = None
+            self.status_label.setText("Provider unavailable")
+            self.test_button.setEnabled(False)
+            return
+        for model in models:
+            self.model_combo.addItem(model.display_name, model.model_id)
+
+    def _load_settings(self) -> None:
+        try:
+            settings = self._settings_store.load()
+        except ai_platform.AIPlatformError:
+            self._settings_invalid = True
+            self._loaded_settings = ai_platform.AISettings()
+            self.status_label.setText("AI settings are invalid.")
+            self.save_button.setEnabled(False)
+            return
+        self._settings_invalid = False
+        self._loaded_settings = settings
+        profile = _profile_by_id(settings, GROQ_PROFILE_ID)
+        if profile is None:
+            profile = _profile_by_id(ai_platform.default_groq_settings(), GROQ_PROFILE_ID)
+        if profile is None:
+            return
+        model_index = self.model_combo.findData(profile.model_id)
+        if model_index >= 0:
+            self.model_combo.setCurrentIndex(model_index)
+        reasoning = str(profile.options.get("reasoning_effort", "medium"))
+        reasoning_index = self.reasoning_combo.findText(reasoning)
+        self.reasoning_combo.setCurrentIndex(reasoning_index if reasoning_index >= 0 else 1)
+
+    def _current_settings(self) -> ai_platform.AISettings | None:
+        current_model = self.model_combo.currentData()
+        existing_groq = _profile_by_id(self._loaded_settings, GROQ_PROFILE_ID)
+        if current_model is None:
+            if existing_groq is None:
+                return None
+            model_id = existing_groq.model_id
+        else:
+            model_id = str(current_model)
+        reasoning = self.reasoning_combo.currentText() or "medium"
+        profile = ai_platform.AIProfile(
+            profile_id=GROQ_PROFILE_ID,
+            provider_id=GROQ_PROVIDER_ID,
+            model_id=str(model_id),
+            credential_ref=GROQ_CREDENTIAL_REF,
+            options={"reasoning_effort": reasoning},
+        )
+        preserved_profiles = tuple(item for item in self._loaded_settings.profiles if item.profile_id != GROQ_PROFILE_ID)
+        if not self._loaded_settings.profiles and self._loaded_settings.routing == ai_platform.RoutingConfig():
+            routing = ai_platform.RoutingConfig(
+                routine_profile_id=GROQ_PROFILE_ID,
+                planner_profile_id=GROQ_PROFILE_ID,
+                creative_profile_id=GROQ_PROFILE_ID,
+            )
+        else:
+            routing = self._loaded_settings.routing
+        return ai_platform.AISettings(
+            profiles=preserved_profiles + (profile,),
+            routing=routing,
+        )
+
+    def _refresh_status(self) -> None:
+        if self._settings_invalid:
+            self.status_label.setText("AI settings are invalid.")
+            return
+        if self._provider is None:
+            self.status_label.setText("Provider unavailable")
+            return
+        if self._credential_store.exists(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF):
+            self.status_label.setText("Key saved locally")
+        else:
+            self.status_label.setText("Not configured")
+
+    def save_settings(self) -> None:
+        if self._settings_invalid:
+            self.status_label.setText("AI settings are invalid.")
+            return
+        entered_key = self.key_edit.text()
+        try:
+            if entered_key.strip():
+                self._credential_store.write_secret(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF, entered_key.strip())
+            settings = self._current_settings()
+            if settings is not None:
+                self._settings_store.save(settings)
+                self._loaded_settings = settings
+        except Exception:
+            self.status_label.setText("Save failed")
+            return
+        self.key_edit.clear()
+        self._refresh_status()
+
+    def remove_key(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Remove Groq key?",
+            "Remove the locally saved Groq API key?",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Ok:
+            return
+        try:
+            self._credential_store.delete_secret(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF)
+        except Exception:
+            self.status_label.setText("Remove failed")
+            return
+        self.key_edit.clear()
+        self._refresh_status()
+
+    def test_connection(self) -> None:
+        if self._test_in_progress:
+            return
+        if self._provider is None:
+            self.status_label.setText("Provider unavailable")
+            return
+        if not self._credential_store.exists(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF):
+            self.status_label.setText("No key saved")
+            return
+        self._set_testing_controls(True)
+        self.status_label.setText("Testing Groq...")
+
+        def run_action() -> ai_platform.Availability:
+            provider = self._provider_factory(self._credential_store)
+            import asyncio
+
+            return asyncio.run(provider.test_connection(GROQ_CREDENTIAL_REF))
+
+        self._start_worker(run_action, self._finish_test_connection)
+
+    def _finish_test_connection(self, result: ActionResult) -> None:
+        self._set_testing_controls(False)
+        if not result.ok or not isinstance(result.value, ai_platform.Availability):
+            self.status_label.setText("Network unavailable")
+            return
+        availability = result.value
+        if availability.state == ai_platform.AvailabilityState.AVAILABLE:
+            self.status_label.setText("Connected")
+        elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_INVALID:
+            self.status_label.setText("Credential rejected")
+        elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_MISSING:
+            self.status_label.setText("No key saved")
+        elif "rate" in availability.message.lower() or "quota" in availability.message.lower():
+            self.status_label.setText("Rate limit / quota reached")
+        elif "unexpected" in availability.message.lower():
+            self.status_label.setText("Unexpected provider response")
+        else:
+            self.status_label.setText("Network unavailable")
+
+    def _set_testing_controls(self, testing: bool) -> None:
+        self._test_in_progress = testing
+        self.test_button.setEnabled(not testing)
+        self.close_button.setEnabled(not testing)
+        self.save_button.setEnabled(not testing and not self._settings_invalid)
+        self.remove_button.setEnabled(not testing)
+
+    def closeEvent(self, event) -> None:
+        if self._test_in_progress:
+            self.status_label.setText("Test connection is still in progress")
+            event.ignore()
+            return
+        event.accept()
+
+    def _start_worker(self, action: Callable[[], object], finished: Callable[[ActionResult], None]) -> None:
+        thread = QThread(self)
+        worker = _ActionWorker(action)
+        bridge = _GuiCallbackBridge(finished, self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(bridge.handle_result, Qt.QueuedConnection)
+        worker.finished.connect(worker.deleteLater)
+        bridge.handled.connect(thread.quit)
+        thread.finished.connect(bridge.handle_thread_finished, Qt.QueuedConnection)
+        bridge.cleanup_requested.connect(self._cleanup_worker, Qt.QueuedConnection)
+        thread.finished.connect(thread.deleteLater)
+        self._worker_handles.append(_WorkerHandle(thread=thread, worker=worker, bridge=bridge))
+        thread.start()
+
+    @Slot(object)
+    def _cleanup_worker(self, bridge: QObject) -> None:
+        self._worker_handles = [handle for handle in self._worker_handles if handle.bridge is not bridge]
 
 
 class CreateAdminInstanceDialog(QDialog):
@@ -898,6 +1167,7 @@ class ManagerMainWindow(QMainWindow):
         self.edit_config_button = QPushButton("Advanced JSON...")
         self.edit_config_button.setToolTip("Advanced/developer settings. Normal bot setup does not require editing JSON.")
         self.create_admin_button = QPushButton("Add Bot")
+        self.ai_providers_button = QPushButton("AI Providers...")
 
         self.refresh_button.clicked.connect(self.refresh_instances)
         self.start_button.clicked.connect(self.start_selected)
@@ -906,6 +1176,7 @@ class ManagerMainWindow(QMainWindow):
         self.setup_button.clicked.connect(self.setup_selected_bot)
         self.edit_config_button.clicked.connect(self.edit_selected_config)
         self.create_admin_button.clicked.connect(self.create_admin_instance)
+        self.ai_providers_button.clicked.connect(self.open_ai_providers)
 
         button_row = QHBoxLayout()
         for button in (
@@ -916,6 +1187,7 @@ class ManagerMainWindow(QMainWindow):
             self.setup_button,
             self.edit_config_button,
             self.create_admin_button,
+            self.ai_providers_button,
         ):
             button_row.addWidget(button)
         button_row.addStretch(1)
@@ -1012,6 +1284,10 @@ class ManagerMainWindow(QMainWindow):
         self.refresh_instances()
         self._select_instance_by_id(instance_id)
         self.setup_selected_bot()
+
+    def open_ai_providers(self) -> None:
+        dialog = AIProviderSettingsDialog(parent=self)
+        dialog.exec()
 
     def closeEvent(self, event) -> None:
         if self._allow_close:

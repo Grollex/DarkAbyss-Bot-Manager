@@ -18,11 +18,12 @@ def load_ai_platform():
 
 
 class FakeProvider:
-    def __init__(self, ai_platform, provider_id="fake", state=None):
+    def __init__(self, ai_platform, provider_id="fake", state=None, fail_local=False):
         self.ai_platform = ai_platform
         self.local_availability_calls = []
         self.connection_tests = []
         self.generate_calls = []
+        self.fail_local = fail_local
         self._metadata = ai_platform.ProviderMetadata(
             provider_id=provider_id,
             display_name="Fake Provider",
@@ -43,6 +44,8 @@ class FakeProvider:
 
     def get_local_availability(self, *, credential_ref=None, credential_available=False):
         self.local_availability_calls.append((credential_ref, credential_available))
+        if self.fail_local:
+            raise RuntimeError("secret value should not leak")
         return self.ai_platform.Availability(self._state, self._state.value)
 
     async def test_connection(self, credential_ref=None):
@@ -199,6 +202,28 @@ class AIPlatformFoundationTests(unittest.TestCase):
             missing_credential_decision.availability.state,
             ai_platform.AvailabilityState.CREDENTIAL_MISSING,
         )
+        self.assertEqual(ai_platform.AvailabilityState.CREDENTIAL_INVALID.value, "CREDENTIAL_INVALID")
+
+    def test_settings_store_persists_profiles_without_secrets(self):
+        ai_platform = load_ai_platform()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "config" / "ai.json"
+            store = ai_platform.AISettingsStore(settings_path)
+            settings = ai_platform.default_groq_settings()
+            store.save(settings)
+            saved_text = settings_path.read_text(encoding="utf-8")
+            self.assertIn("groq-default", saved_text)
+            self.assertIn("openai/gpt-oss-120b", saved_text)
+            self.assertNotIn("SECRET", saved_text)
+            loaded = store.load()
+            self.assertEqual(loaded.profiles[0].profile_id, "groq-default")
+            self.assertEqual(loaded.profiles[0].options["reasoning_effort"], "medium")
+            self.assertFalse(any(settings_path.parent.glob("*.tmp")))
+
+            settings_path.write_text("{bad json", encoding="utf-8")
+            with self.assertRaises(ai_platform.AIPlatformError):
+                store.load()
+            self.assertEqual(settings_path.read_text(encoding="utf-8"), "{bad json")
 
     def test_credential_reference_public_data_never_exposes_secret(self):
         ai_platform = load_ai_platform()
@@ -270,6 +295,47 @@ class AIPlatformFoundationTests(unittest.TestCase):
         self.assertEqual(lazy.get("lazy").metadata.provider_id, "lazy")
         self.assertEqual(factory_calls, ["called"])
 
+    def test_lazy_factory_failures_and_id_mismatch_are_contained(self):
+        ai_platform = load_ai_platform()
+        lazy = ai_platform.LazyProviderRegistry()
+        lazy.register_factory("broken", lambda: (_ for _ in ()).throw(ImportError("missing optional sdk")))
+        lazy.register_factory("groq", lambda: FakeProvider(ai_platform, provider_id="not-groq"))
+        profiles = ai_platform.AIProfileStore(
+            {
+                "broken-profile": ai_platform.AIProfile("broken-profile", "broken", "model"),
+                "mismatch-profile": ai_platform.AIProfile("mismatch-profile", "groq", "model"),
+            }
+        )
+
+        broken = ai_platform.route_request(
+            task_class="ROUTINE",
+            routing=ai_platform.RoutingConfig(routine_profile_id="broken-profile"),
+            profiles=profiles,
+            providers=lazy,
+        )
+        mismatch = ai_platform.route_request(
+            task_class="ROUTINE",
+            routing=ai_platform.RoutingConfig(routine_profile_id="mismatch-profile"),
+            profiles=profiles,
+            providers=lazy,
+        )
+        self.assertEqual(broken.availability.state, ai_platform.AvailabilityState.PROVIDER_MISSING)
+        self.assertEqual(mismatch.availability.state, ai_platform.AvailabilityState.PROVIDER_MISSING)
+
+    def test_local_availability_exception_is_sanitized_unavailable(self):
+        ai_platform = load_ai_platform()
+        provider = FakeProvider(ai_platform, fail_local=True)
+        decision = ai_platform.route_request(
+            task_class="ROUTINE",
+            routing=ai_platform.RoutingConfig(routine_profile_id="profile"),
+            profiles=ai_platform.AIProfileStore(
+                {"profile": ai_platform.AIProfile("profile", "fake", "fake-model")}
+            ),
+            providers=ai_platform.ProviderRegistry({"fake": provider}),
+        )
+        self.assertEqual(decision.availability.state, ai_platform.AvailabilityState.UNAVAILABLE)
+        self.assertNotIn("secret value", decision.availability.message)
+
     def test_provider_neutral_request_response_are_json_safe(self):
         ai_platform = load_ai_platform()
         message = ai_platform.AIMessage(role="user", content="hello", metadata={"source": "test"})
@@ -305,6 +371,31 @@ class AIPlatformFoundationTests(unittest.TestCase):
         self.assertEqual(response.public_dict()["tool_calls"][0]["arguments"]["channel_id"], "123")
         with self.assertRaises(ValueError):
             ai_platform.AIToolCall(tool_name="send_message", arguments={"bad": object()})
+
+    def test_tool_message_contract_invariants(self):
+        ai_platform = load_ai_platform()
+        with self.assertRaisesRegex(ValueError, "tool_call_id"):
+            ai_platform.AIMessage(role="tool", content="{}")
+        with self.assertRaisesRegex(ValueError, "tool_call_id"):
+            ai_platform.AIMessage(role="user", content="hello", tool_call_id="call-1")
+        with self.assertRaisesRegex(ValueError, "tool_calls"):
+            ai_platform.AIMessage(
+                role="user",
+                content="hello",
+                tool_calls=(ai_platform.AIToolCall(call_id="call-1", tool_name="send_message", arguments={}),),
+            )
+        with self.assertRaisesRegex(ValueError, "call_id"):
+            ai_platform.AIMessage(
+                role="assistant",
+                content="",
+                tool_calls=(ai_platform.AIToolCall(tool_name="send_message", arguments={}),),
+            )
+        message = ai_platform.AIMessage(
+            role="assistant",
+            content="",
+            tool_calls=(ai_platform.AIToolCall(call_id="call-1", tool_name="send_message", arguments={}),),
+        )
+        self.assertEqual(message.public_dict()["tool_calls"][0]["id"], "call-1")
 
     def test_async_provider_methods_exist_but_routing_does_not_call_them(self):
         ai_platform = load_ai_platform()

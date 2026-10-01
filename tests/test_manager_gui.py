@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -27,6 +28,8 @@ def load_gui_module(data_root: Path):
         "bot_registry",
         "app_paths",
         "admin_instance",
+        "ai_platform",
+        "ai_groq",
     ):
         sys.modules.pop(module_name, None)
     return importlib.import_module("manager_gui")
@@ -798,6 +801,169 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertIn("admin-main", details)
         self.assertIn("Config path:", details)
         self.assertNotIn("token", details.lower())
+
+    def make_ai_dialog(self, provider_factory=None):
+        ai_platform = self.manager_gui.ai_platform
+        settings_store = ai_platform.AISettingsStore(Path(self.temp_dir.name) / "config" / "ai.json")
+        credential_store = ai_platform.CredentialStore(Path(self.temp_dir.name) / "secrets" / "ai")
+        provider_factory = provider_factory or self.fake_groq_provider_factory()
+        dialog = self.manager_gui.AIProviderSettingsDialog(
+            settings_store=settings_store,
+            credential_store=credential_store,
+            provider_factory=provider_factory,
+        )
+        self.addCleanup(dialog.close)
+        return dialog, settings_store, credential_store
+
+    def fake_groq_provider_factory(self, state=None):
+        ai_platform = self.manager_gui.ai_platform
+
+        class FakeProvider:
+            metadata = ai_platform.ProviderMetadata(
+                provider_id="groq",
+                display_name="Groq",
+                models=(
+                    ai_platform.ProviderModel(
+                        model_id="openai/gpt-oss-120b",
+                        display_name="GPT-OSS 120B",
+                    ),
+                ),
+            )
+
+            async def test_connection(self, credential_ref):
+                return ai_platform.Availability(state or ai_platform.AvailabilityState.AVAILABLE, "SECRET must not show")
+
+        return lambda credential_store: FakeProvider()
+
+    def test_ai_providers_button_exists_and_does_not_require_selection(self):
+        window = self.make_window()
+        self.assertEqual(window.ai_providers_button.text(), "AI Providers...")
+        window.instance_table.clearSelection()
+        fake_dialog = mock.Mock()
+        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
+        with mock.patch.object(self.manager_gui, "AIProviderSettingsDialog", return_value=fake_dialog) as dialog_class:
+            window.open_ai_providers()
+        dialog_class.assert_called_once()
+        fake_dialog.exec.assert_called_once()
+
+    def test_ai_provider_dialog_secret_save_preserve_remove_and_settings(self):
+        dialog, settings_store, credential_store = self.make_ai_dialog()
+        self.assertEqual(dialog.key_edit.echoMode(), self.manager_gui.QLineEdit.Password)
+        self.assertEqual(dialog.key_edit.text(), "")
+        self.assertEqual(dialog.model_combo.currentData(), "openai/gpt-oss-120b")
+
+        dialog.key_edit.setText("  SECRET_KEY\n")
+        dialog.reasoning_combo.setCurrentText("high")
+        dialog.save_settings()
+        self.assertEqual(dialog.key_edit.text(), "")
+        self.assertEqual(credential_store.read_secret("groq", "groq-default"), "SECRET_KEY")
+        settings_text = settings_store.path.read_text(encoding="utf-8")
+        self.assertIn("openai/gpt-oss-120b", settings_text)
+        self.assertIn('"reasoning_effort": "high"', settings_text)
+        self.assertNotIn("SECRET_KEY", settings_text)
+
+        reopened, _, same_store = self.make_ai_dialog()
+        self.assertEqual(reopened.key_edit.text(), "")
+        self.assertIn("Key saved locally", reopened.status_label.text())
+        reopened.save_settings()
+        self.assertEqual(same_store.read_secret("groq", "groq-default"), "SECRET_KEY")
+
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok):
+            reopened.remove_key()
+        self.assertFalse(same_store.exists("groq", "groq-default"))
+
+    def test_ai_provider_save_preserves_other_profiles_and_existing_routing(self):
+        dialog, settings_store, credential_store = self.make_ai_dialog()
+        ai_platform = self.manager_gui.ai_platform
+        existing = ai_platform.AISettings(
+            profiles=(
+                ai_platform.AIProfile("gemini-default", "gemini", "gemini-model"),
+                ai_platform.AIProfile("openrouter-test", "openrouter", "openrouter-model"),
+            ),
+            routing=ai_platform.RoutingConfig(
+                routine_profile_id="gemini-default",
+                planner_profile_id="openrouter-test",
+                creative_profile_id="gemini-default",
+            ),
+        )
+        settings_store.save(existing)
+
+        dialog.close()
+        dialog = self.manager_gui.AIProviderSettingsDialog(
+            settings_store=settings_store,
+            credential_store=credential_store,
+            provider_factory=self.fake_groq_provider_factory(),
+        )
+        self.addCleanup(dialog.close)
+        dialog.reasoning_combo.setCurrentText("low")
+        dialog.save_settings()
+
+        loaded = settings_store.load()
+        profile_ids = {profile.profile_id for profile in loaded.profiles}
+        self.assertEqual(profile_ids, {"gemini-default", "openrouter-test", "groq-default"})
+        self.assertEqual(loaded.routing.routine_profile_id, "gemini-default")
+        self.assertEqual(loaded.routing.planner_profile_id, "openrouter-test")
+        self.assertEqual(loaded.routing.creative_profile_id, "gemini-default")
+
+    def test_ai_provider_malformed_settings_not_overwritten_by_save(self):
+        dialog, settings_store, _credential_store = self.make_ai_dialog()
+        dialog.close()
+        settings_store.path.parent.mkdir(parents=True, exist_ok=True)
+        settings_store.path.write_bytes(b"{bad json")
+
+        dialog = self.manager_gui.AIProviderSettingsDialog(
+            settings_store=settings_store,
+            credential_store=self.manager_gui.ai_platform.CredentialStore(Path(self.temp_dir.name) / "secrets2" / "ai"),
+            provider_factory=self.fake_groq_provider_factory(),
+        )
+        self.addCleanup(dialog.close)
+        self.assertIn("AI settings are invalid", dialog.status_label.text())
+        self.assertFalse(dialog.save_button.isEnabled())
+        dialog.key_edit.setText("SECRET_KEY")
+        dialog.save_settings()
+        self.assertEqual(settings_store.path.read_bytes(), b"{bad json")
+        self.assertIn("AI settings are invalid", dialog.status_label.text())
+
+    def test_ai_provider_dialog_provider_unavailable_is_contained(self):
+        dialog, _, _ = self.make_ai_dialog(provider_factory=lambda _store: (_ for _ in ()).throw(RuntimeError("boom SECRET")))
+        self.assertIn("Provider unavailable", dialog.status_label.text())
+        self.assertFalse(dialog.test_button.isEnabled())
+
+    def test_ai_provider_test_connection_uses_worker_and_sanitized_status(self):
+        dialog, _, credential_store = self.make_ai_dialog()
+        credential_store.write_secret("groq", "groq-default", "SECRET_KEY")
+        dialog.test_connection()
+        self.assertFalse(dialog.test_button.isEnabled())
+        self.assertEqual(dialog.status_label.text(), "Testing Groq...")
+        self.wait_until(lambda: dialog.status_label.text() == "Connected")
+        self.assertTrue(dialog.test_button.isEnabled())
+        self.assertNotIn("SECRET_KEY", dialog.status_label.text())
+
+    def test_ai_provider_close_rejected_while_test_in_progress(self):
+        dialog, _, _ = self.make_ai_dialog()
+
+        class FakeEvent:
+            def __init__(self):
+                self.accepted = False
+                self.ignored = False
+
+            def accept(self):
+                self.accepted = True
+
+            def ignore(self):
+                self.ignored = True
+
+        dialog._set_testing_controls(True)
+        event = FakeEvent()
+        dialog.closeEvent(event)
+        self.assertTrue(event.ignored)
+        self.assertFalse(event.accepted)
+        self.assertIn("still in progress", dialog.status_label.text())
+
+        dialog._set_testing_controls(False)
+        event = FakeEvent()
+        dialog.closeEvent(event)
+        self.assertTrue(event.accepted)
 
 
 if __name__ == "__main__":
