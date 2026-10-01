@@ -160,6 +160,26 @@ Without AI configuration:
 
 AI features should report a clear unavailable/not-configured state instead of crashing the application. Future provider failures must be isolated to AI requests. No provider is a startup dependency, and the application must not perform provider network checks automatically at startup. Provider-specific modules and dependencies should be isolated and lazy where practical.
 
+Provider adapters expose separate local and network-facing operations:
+
+- `get_local_availability(...)`: synchronous, local only, and must not perform network I/O. Routing may call only this method.
+- `test_connection(...)`: asynchronous explicit user action; network is allowed.
+- `generate(...)`: asynchronous future AI request; network is allowed.
+
+There are no network calls on module import, registry construction, profile loading, routing, Manager startup, or bot startup.
+
+AI request/response objects are provider-neutral and JSON-compatible. They contain messages, JSON-safe tool schemas, JSON-safe tool-call arguments, finish metadata, and no provider-specific raw response object. Admin Tool schemas can pass through this contract without `discord.py` objects.
+
+AI credentials are device-local and stored outside program versions, bot instance config, release artifacts, and the source tree:
+
+```text
+<DATA_ROOT>/secrets/ai/<provider_id>/<credential_ref>.secret
+```
+
+`CredentialReference` is only a logical pointer. The same `credential_ref` such as `groq-default` may resolve to different local secrets on different computers. AI profiles and routing preferences are also device-local by default in the current architecture and do not belong to the Discord Bot Instance's portable config. This allows PC A and PC B to use different providers/profiles while hosting the same logical bot at different times. Cloud sync is not implemented.
+
+Routing distinguishes local availability states without network access: `NOT_CONFIGURED`, `PROVIDER_MISSING`, `CREDENTIAL_MISSING`, `DISABLED`, `UNAVAILABLE`, and `AVAILABLE`.
+
 Conceptual future architecture:
 
 ```text
@@ -198,6 +218,8 @@ Routing should eventually allow:
 
 The system must not hardcode provider roles such as "Gemini = routine" or "Groq = planner". Those assignments are user-selectable.
 
+Provider model task-class metadata is advisory only. A user may assign any profile to `ROUTINE`, `PLANNER`, or `CREATIVE` for testing. Hard capability checks, such as future tool-call support, belong in the orchestrator where that capability is actually required.
+
 Future user controls should allow:
 
 - automatic routing
@@ -207,17 +229,64 @@ Future user controls should allow:
 
 Compare mode is plan-only until the user chooses a plan. A fallback-generated destructive plan requires fresh review/confirmation if it differs from the original plan or comes from another provider.
 
+## Shared AI Access And Runtime Ownership
+
+Access policy and runtime host ownership are separate problems.
+
+Discord role membership is the preferred shared whitelist mechanism. Existing `allowed_role_ids` refer to roles stored by Discord; if a person gains or loses that Discord role, every active host observes the same membership without synchronizing a local user list. Explicit `allowed_user_ids` remain valid, but they are local configuration entries unless the instance configuration itself is copied or synchronized.
+
+Future AI access uses:
+
+```text
+explicit allowed user
+OR explicit allowed role
+```
+
+Discord Administrator alone must not grant AI access. Future UI should recommend role-based AI access for multi-PC use. AI-2A does not implement role provisioning UI.
+
+Runtime lease is the different question of which PC may host one bot right now. Current local process/file locks protect only one machine.
+
+Future protected shared-host mode requires an atomic remote lease:
+
+```text
+PC A owns active lease:
+    PC A = LOCAL ACTIVE
+    PC B = REMOTE ACTIVE / READ ONLY
+    PC B Start disabled
+    PC B Restart disabled
+```
+
+Lease state concept:
+
+- public bot/application identity
+- device id
+- session id
+- heartbeat
+- lease expiry
+- atomic claim
+- renew
+- release
+- controlled takeover after expiry
+
+The Discord token must never be written into lease state. Discord Application ID is a suitable future public shared bot identity and should eventually be persisted for this purpose. Strict cross-device exclusion must not pretend that a local file lock or a non-atomic Discord message is sufficient. The exact coordinator backend is not selected in AI-2A.
+
+Normal local-only operation does not require a lease coordinator. If a future user explicitly enables Protected Shared-Host Mode and its lease coordinator is unavailable, startup must fail closed for that protected instance rather than risk two active hosts.
+
+Runtime-1 is a release gate before supported multi-PC host switching, but it is not required to continue single-PC AI development.
+
 Current AI roadmap:
 
-- AI-2A: provider-neutral AI platform foundation: provider interface/registry, credential references, AI profiles, routing configuration, and availability states. Zero configured providers is a valid normal state.
+- AI-1: done; Admin Tool Layer.
+- AI-2A: provider-neutral optional AI platform foundation: provider interface/registry, credential references, AI profiles, routing configuration, and availability states. Zero configured providers is a valid normal state.
 - AI-2B: Groq adapter.
 - AI-2C: Gemini adapter.
-- Later optional: OpenRouter adapter.
 - AI-3: Orchestrator, routing, manual override, fallback, compare mode, and confirmation policy.
 - AI-4: `/ai` explicit-whitelist Discord command.
+- Runtime-1: cross-device single-host protection, mandatory before supported multi-PC host switching.
 - AI-5: dedicated AI control channel.
 - AI-6: Manager GUI AI chat.
 - AI-7: richer admin/design capabilities.
+- Later: OpenRouter adapter, generic runtime/plugin work, and remote/server infrastructure.
 
 Local inference is not part of the current core roadmap. It may only be added much later as another optional adapter.
 

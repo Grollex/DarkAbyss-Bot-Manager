@@ -416,6 +416,16 @@ class AdminToolValidationTests(unittest.IsolatedAsyncioTestCase):
         category_delete = await admin_tools.execute_tool(context, "delete_channel", {"channel_id": "90"})
         self.assertFalse(category_delete.ok)
 
+        tricky_channel = FakeChannel(102, "stage-ish", channel_type="stage_voice")
+        guild.channels.append(tricky_channel)
+        tricky_rename = await admin_tools.execute_tool(
+            context,
+            "rename_channel",
+            {"channel_id": "102", "name": "must-not-pass"},
+        )
+        self.assertFalse(tricky_rename.ok)
+        self.assertEqual(tricky_channel.name, "stage-ish")
+
 
 class AdminToolReadSerializationTests(unittest.IsolatedAsyncioTestCase):
     async def test_guild_channels_roles_and_member_details_are_structured(self):
@@ -425,20 +435,23 @@ class AdminToolReadSerializationTests(unittest.IsolatedAsyncioTestCase):
 
         summary = await admin_tools.execute_tool(context, "get_guild_summary", {})
         self.assertTrue(summary.ok)
-        self.assertEqual(summary.data["id"], 10)
+        self.assertEqual(summary.data["id"], "10")
         self.assertEqual(summary.data["channel_count"], 3)
         self.assertEqual(summary.data["role_count"], 2)
 
         channel = await admin_tools.execute_tool(context, "get_channel_details", {"channel_id": "100"})
         self.assertTrue(channel.ok)
-        self.assertEqual(channel.data["parent_id"], 90)
-        self.assertEqual(channel.data["permission_overwrites"][0]["target_id"], 200)
+        self.assertEqual(channel.data["id"], "100")
+        self.assertEqual(channel.data["parent_id"], "90")
+        self.assertEqual(channel.data["permission_overwrites"][0]["target_id"], "200")
 
         roles = await admin_tools.execute_tool(context, "list_roles", {})
+        self.assertEqual(roles.data["roles"][1]["id"], "200")
         self.assertEqual(roles.data["roles"][1]["permissions"], 4096)
 
         member = await admin_tools.execute_tool(context, "get_member_details", {"member_id": "300"})
-        self.assertEqual(member.data["role_ids"], [200])
+        self.assertEqual(member.data["id"], "300")
+        self.assertEqual(member.data["role_ids"], ["200"])
         self.assertEqual(member.data["guild_permissions"], 64)
 
     async def test_recent_messages_are_bounded_and_attachment_metadata_only(self):
@@ -458,6 +471,9 @@ class AdminToolReadSerializationTests(unittest.IsolatedAsyncioTestCase):
 
         result = await admin_tools.execute_tool(context, "get_recent_messages", {"channel_id": "100", "limit": 1})
         self.assertTrue(result.ok)
+        self.assertEqual(result.data["messages"][0]["id"], "900")
+        self.assertEqual(result.data["messages"][0]["author_id"], "800")
+        self.assertEqual(result.data["messages"][0]["attachments"][0]["id"], "700")
         self.assertEqual(result.data["messages"][0]["attachments"][0]["filename"], "file.txt")
         self.assertEqual(guild.text_channel.history_limit, 1)
 

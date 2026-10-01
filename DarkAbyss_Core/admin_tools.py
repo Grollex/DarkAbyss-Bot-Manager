@@ -594,26 +594,31 @@ def _object_type_name(value: Any) -> str:
 
 
 def _normalized_channel_type(value: Any) -> str:
-    raw_type = _object_type_name(value)
-    return str(raw_type).lower()
+    raw_type = getattr(value, "type", None)
+    name = getattr(raw_type, "name", None)
+    if isinstance(name, str):
+        return name.lower()
+    if isinstance(raw_type, str):
+        return raw_type.lower()
+    return type(value).__name__.lower()
 
 
 def _is_text_channel(value: Any) -> bool:
     if isinstance(value, discord.TextChannel):
         return True
-    return "text" in _normalized_channel_type(value)
+    return _normalized_channel_type(value) == "text"
 
 
 def _is_voice_channel(value: Any) -> bool:
     if isinstance(value, discord.VoiceChannel):
         return True
-    return "voice" in _normalized_channel_type(value)
+    return _normalized_channel_type(value) == "voice"
 
 
 def _is_category_channel(value: Any) -> bool:
     if isinstance(value, discord.CategoryChannel):
         return True
-    return "category" in _normalized_channel_type(value)
+    return _normalized_channel_type(value) == "category"
 
 
 def _resolve_channel(context: AdminToolContext, channel_id_value: Any) -> Any:
@@ -654,6 +659,16 @@ def _permissions_value(value: Any) -> int | None:
     return raw_value if isinstance(raw_value, int) else None
 
 
+def _snowflake_to_string(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and value.isdigit():
+        return value
+    return None
+
+
 def _serialize_permission_overwrite(target: Any, overwrite: Any) -> dict[str, Any]:
     allow = None
     deny = None
@@ -663,7 +678,7 @@ def _serialize_permission_overwrite(target: Any, overwrite: Any) -> dict[str, An
         allow = _permissions_value(allowed)
         deny = _permissions_value(denied)
     return {
-        "target_id": getattr(target, "id", None),
+        "target_id": _snowflake_to_string(getattr(target, "id", None)),
         "target_name": getattr(target, "name", None),
         "target_type": type(target).__name__,
         "allow": allow,
@@ -673,12 +688,14 @@ def _serialize_permission_overwrite(target: Any, overwrite: Any) -> dict[str, An
 
 def _serialize_channel(channel: Any, include_overwrites: bool = False) -> dict[str, Any]:
     data = {
-        "id": getattr(channel, "id", None),
+        "id": _snowflake_to_string(getattr(channel, "id", None)),
         "name": getattr(channel, "name", None),
         "type": str(_object_type_name(channel)),
         "position": getattr(channel, "position", None),
-        "parent_id": getattr(getattr(channel, "category", None), "id", None)
-        or getattr(getattr(channel, "parent", None), "id", None),
+        "parent_id": _snowflake_to_string(
+            getattr(getattr(channel, "category", None), "id", None)
+            or getattr(getattr(channel, "parent", None), "id", None)
+        ),
     }
     if include_overwrites:
         overwrites = getattr(channel, "overwrites", {})
@@ -691,7 +708,7 @@ def _serialize_channel(channel: Any, include_overwrites: bool = False) -> dict[s
 
 def _serialize_role(role: Any) -> dict[str, Any]:
     return {
-        "id": getattr(role, "id", None),
+        "id": _snowflake_to_string(getattr(role, "id", None)),
         "name": getattr(role, "name", None),
         "position": getattr(role, "position", None),
         "managed": bool(getattr(role, "managed", False)),
@@ -702,9 +719,9 @@ def _serialize_role(role: Any) -> dict[str, Any]:
 
 def _serialize_member(member: Any) -> dict[str, Any]:
     return {
-        "id": getattr(member, "id", None),
+        "id": _snowflake_to_string(getattr(member, "id", None)),
         "display_name": getattr(member, "display_name", None) or getattr(member, "name", None),
-        "role_ids": [getattr(role, "id", None) for role in getattr(member, "roles", [])],
+        "role_ids": [_snowflake_to_string(getattr(role, "id", None)) for role in getattr(member, "roles", [])],
         "guild_permissions": _permissions_value(getattr(member, "guild_permissions", None)),
         "timed_out_until": _isoformat_or_none(getattr(member, "timed_out_until", None)),
     }
@@ -712,7 +729,7 @@ def _serialize_member(member: Any) -> dict[str, Any]:
 
 def _serialize_attachment(attachment: Any) -> dict[str, Any]:
     return {
-        "id": getattr(attachment, "id", None),
+        "id": _snowflake_to_string(getattr(attachment, "id", None)),
         "filename": getattr(attachment, "filename", None),
         "size": getattr(attachment, "size", None),
         "content_type": getattr(attachment, "content_type", None),
@@ -722,8 +739,8 @@ def _serialize_attachment(attachment: Any) -> dict[str, Any]:
 def _serialize_message(message: Any) -> dict[str, Any]:
     author = getattr(message, "author", None)
     return {
-        "id": getattr(message, "id", None),
-        "author_id": getattr(author, "id", None),
+        "id": _snowflake_to_string(getattr(message, "id", None)),
+        "author_id": _snowflake_to_string(getattr(author, "id", None)),
         "author_display_name": getattr(author, "display_name", None) or getattr(author, "name", None),
         "timestamp": _isoformat_or_none(getattr(message, "created_at", None)),
         "content": getattr(message, "content", ""),
@@ -740,7 +757,7 @@ async def _get_guild_summary(context: AdminToolContext, arguments: dict[str, Any
     channels = list(getattr(guild, "channels", []))
     roles = list(getattr(guild, "roles", []))
     return {
-        "id": getattr(guild, "id", None),
+        "id": _snowflake_to_string(getattr(guild, "id", None)),
         "name": getattr(guild, "name", None),
         "member_count": getattr(guild, "member_count", None),
         "channel_count": len(channels),
