@@ -3,9 +3,11 @@ import importlib
 import importlib.util
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -56,6 +58,27 @@ def load_assembler(data_root: Path):
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules["assemble_distribution"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_release_artifacts(data_root: Path):
+    sys.path.insert(0, str(CORE_ROOT))
+    os.environ["DARKABYSS_DATA_DIR"] = str(data_root)
+    for module_name in (
+        "github_updates",
+        "launcher",
+        "runtime_layout",
+        "update_engine",
+        "build_release_artifacts",
+    ):
+        sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(
+        "build_release_artifacts",
+        PROJECT_ROOT / "packaging" / "build_release_artifacts.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["build_release_artifacts"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -701,6 +724,529 @@ class PackagedRuntimeTests(unittest.TestCase):
             self.assertTrue(output_link.is_symlink())
             self.assertEqual(target_file.read_bytes(), b"do not delete")
             self.assertFalse((target_root / "versions").exists())
+
+    def create_assembled_distribution(self, root: Path, version: str = "1.2.3") -> Path:
+        assembler = load_assembler(root / "data")
+        app_bundle = root / "raw-app"
+        app_bundle.mkdir()
+        (app_bundle / assembler.runtime_layout.app_executable_name()).write_bytes(b"app exe")
+        (app_bundle / "_internal").mkdir()
+        (app_bundle / "_internal" / "support.dll").write_bytes(b"dll")
+        launcher_exe = root / assembler.runtime_layout.launcher_executable_name()
+        launcher_exe.write_bytes(b"launcher")
+        return assembler.assemble_distribution(
+            version=version,
+            app_bundle_dir=app_bundle,
+            launcher_executable=launcher_exe,
+            output_dir=root / "DarkAbyssBotManager",
+        )
+
+    def test_release_artifacts_create_update_and_fresh_install_zips(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "artifacts"
+
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                tag="v1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+
+            self.assertEqual(artifacts.update_zip.name, "darkabyss-release-1.2.3.zip")
+            self.assertEqual(artifacts.fresh_install_zip.name, "DarkAbyssBotManager-1.2.3-windows.zip")
+            self.assertTrue(artifacts.update_sha256.is_file())
+            self.assertTrue(artifacts.fresh_install_sha256.is_file())
+
+            with zipfile.ZipFile(artifacts.update_zip) as archive:
+                update_members = [info.filename for info in archive.infolist()]
+            self.assertEqual(update_members, sorted(update_members))
+            self.assertIn("release.json", update_members)
+            self.assertIn(artifacts_builder.runtime_layout.app_executable_name(), update_members)
+            self.assertIn("_internal/support.dll", update_members)
+            self.assertNotIn(artifacts_builder.runtime_layout.launcher_executable_name(), update_members)
+            self.assertNotIn("current.json", update_members)
+            self.assertFalse(any(member.startswith("versions/") for member in update_members))
+            self.assertFalse(any(member.startswith("DarkAbyssBotManager/") for member in update_members))
+            self.assertFalse(any(member.startswith("secrets/") or member.startswith("instances/") for member in update_members))
+
+            with zipfile.ZipFile(artifacts.fresh_install_zip) as archive:
+                fresh_members = [info.filename for info in archive.infolist()]
+            self.assertEqual(fresh_members, sorted(fresh_members))
+            self.assertIn("DarkAbyssBotManager/Launcher.exe", fresh_members)
+            self.assertIn("DarkAbyssBotManager/current.json", fresh_members)
+            self.assertIn("DarkAbyssBotManager/versions/1.2.3/DarkAbyssApp.exe", fresh_members)
+            self.assertIn("DarkAbyssBotManager/versions/1.2.3/release.json", fresh_members)
+
+            artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+            for archive_path in (artifacts.update_zip, artifacts.fresh_install_zip):
+                expected = f"{sha256_bytes(archive_path.read_bytes())}  {archive_path.name}\n"
+                self.assertEqual((archive_path.with_name(archive_path.name + ".sha256")).read_text(encoding="utf-8"), expected)
+
+    def test_release_artifacts_reject_output_equal_distribution_without_deleting_sentinel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            sentinel = distribution / "current.json"
+            before = sentinel.read_bytes()
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "separate"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=distribution,
+                )
+
+            self.assertEqual(sentinel.read_bytes(), before)
+            self.assertTrue((distribution / "versions" / "1.2.3" / "release.json").is_file())
+
+    def test_release_artifacts_reject_output_parent_containing_distribution_without_deleting_sentinel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            sentinel = distribution / "current.json"
+            before = sentinel.read_bytes()
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "contain"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=root,
+                )
+
+            self.assertEqual(sentinel.read_bytes(), before)
+            self.assertTrue((distribution / "Launcher.exe").is_file())
+
+    def test_release_artifacts_reject_output_inside_distribution_without_deleting_sentinel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            sentinel = distribution / "versions" / "1.2.3" / "DarkAbyssApp.exe"
+            before = sentinel.read_bytes()
+            nested_output = distribution / "artifacts"
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "inside"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=nested_output,
+                )
+
+            self.assertEqual(sentinel.read_bytes(), before)
+            self.assertFalse(nested_output.exists())
+
+    def test_release_artifacts_accept_sibling_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "release-artifacts"
+
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+
+            self.assertTrue(artifacts.update_zip.is_file())
+            self.assertTrue(artifacts.fresh_install_zip.is_file())
+
+    def test_release_artifacts_update_zip_prepares_and_stages_through_github_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                tag="v1.2.3",
+                distribution=distribution,
+                output=root / "artifacts",
+            )
+            github_updates = artifacts_builder.github_updates
+            install_root = root / "install"
+            release = github_updates.GitHubReleaseInfo(
+                tag_name="v1.2.3",
+                version="1.2.3",
+                name=None,
+                draft=False,
+                prerelease=False,
+                assets=(
+                    github_updates.GitHubReleaseAsset(
+                        name="darkabyss-release-1.2.3.zip",
+                        download_url="https://github.com/example/project/releases/download/v1.2.3/darkabyss-release-1.2.3.zip",
+                        size=artifacts.update_zip.stat().st_size,
+                        sha256=sha256_bytes(artifacts.update_zip.read_bytes()),
+                    ),
+                ),
+            )
+            downloaded = github_updates.DownloadedRelease(
+                release=release,
+                asset=release.assets[0],
+                archive_path=artifacts.update_zip,
+                byte_count=artifacts.update_zip.stat().st_size,
+                sha256=sha256_bytes(artifacts.update_zip.read_bytes()),
+            )
+
+            prepared = github_updates.prepare_downloaded_release(downloaded, install_root)
+            staged = artifacts_builder.update_engine.stage_release(prepared.release_root, install_root)
+
+            self.assertEqual(prepared.version, "1.2.3")
+            self.assertEqual(staged.version, "1.2.3")
+            self.assertTrue((staged.version_dir / "release.json").is_file())
+
+    def test_release_artifacts_fresh_install_launcher_resolution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=root / "artifacts",
+            )
+            extract_root = root / "fresh"
+
+            with zipfile.ZipFile(artifacts.fresh_install_zip) as archive:
+                archive.extractall(extract_root)
+
+            target = artifacts_builder.launcher.resolve_current_app(extract_root / "DarkAbyssBotManager")
+            self.assertEqual(target.version, "1.2.3")
+            self.assertEqual(
+                target.app_executable,
+                (extract_root / "DarkAbyssBotManager" / "versions" / "1.2.3" / "DarkAbyssApp.exe").resolve(),
+            )
+
+    def test_release_artifacts_reject_malformed_or_mismatched_tags(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+
+            for tag in ("1.2.3", "v../bad", "v"):
+                with self.subTest(tag=tag):
+                    with self.assertRaises(artifacts_builder.ReleaseArtifactError):
+                        artifacts_builder.build_release_artifacts(
+                            version="1.2.3",
+                            tag=tag,
+                            distribution=distribution,
+                            output=root / f"artifacts-{tag.replace('/', '_')}",
+                        )
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "does not match"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    tag="v1.2.4",
+                    distribution=distribution,
+                    output=root / "artifacts-mismatch",
+                )
+
+    def test_release_artifacts_reject_user_data_roots_in_distribution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            secret = distribution / "versions" / "1.2.3" / "secrets" / "token.txt"
+            secret.parent.mkdir()
+            secret.write_text("FAKE_SHOULD_NOT_PACKAGE", encoding="utf-8")
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "unexpected"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=root / "artifacts",
+                )
+
+    def test_release_artifacts_reject_source_adjacent_token_file_in_distribution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            token = distribution / "versions" / "1.2.3" / "DarkAbyss_Core" / "admin_bot_token.txt"
+            token.parent.mkdir()
+            token.write_text("FAKE_SHOULD_NOT_PACKAGE", encoding="utf-8")
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "unexpected"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=root / "artifacts",
+                )
+
+    def test_release_artifacts_update_zip_is_manifest_driven_and_rejects_unmanifested_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            extra = distribution / "versions" / "1.2.3" / "unexpected.txt"
+            extra.write_text("not in release.json", encoding="utf-8")
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "unexpected"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=root / "artifacts",
+                )
+
+    def test_release_artifacts_fresh_install_zip_is_manifest_driven(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            extra = distribution / "root-extra.txt"
+            extra.write_text("not allowed", encoding="utf-8")
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "unexpected"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=root / "artifacts",
+                )
+
+    def test_release_artifacts_reject_second_installed_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            old_version = distribution / "versions" / "1.0.0"
+            old_version.mkdir()
+            (old_version / "release.json").write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "exactly"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=root / "artifacts",
+                )
+
+    def test_release_artifacts_reject_empty_second_version_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            (distribution / "versions" / "9.9.9").mkdir()
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "exactly"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=root / "artifacts",
+                )
+
+    def test_release_artifacts_reject_nested_unexpected_secret_config_database_log_files(self):
+        cases = [
+            "_internal/DarkAbyss_Core/random-secret.txt",
+            "_internal/package/config.json",
+            "_internal/package/state.sqlite",
+            "_internal/package/state.db",
+            "_internal/package/runtime.log",
+            "_internal/.git/config",
+        ]
+        for relative in cases:
+            with self.subTest(relative=relative):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    distribution = self.create_assembled_distribution(root, "1.2.3")
+                    artifacts_builder = load_release_artifacts(root / "data")
+                    extra = distribution / "versions" / "1.2.3" / Path(*relative.split("/"))
+                    extra.parent.mkdir(parents=True, exist_ok=True)
+                    extra.write_text("not allowed", encoding="utf-8")
+
+                    with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "unexpected"):
+                        artifacts_builder.build_release_artifacts(
+                            version="1.2.3",
+                            distribution=distribution,
+                            output=root / "artifacts",
+                        )
+
+    def test_release_artifacts_verify_only_rejects_stale_checksum(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "artifacts"
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+            with artifacts.update_zip.open("ab") as handle:
+                handle.write(b"tamper")
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "Checksum"):
+                artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+
+    def test_release_artifacts_verify_only_rejects_malformed_checksum(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "artifacts"
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+            artifacts.fresh_install_sha256.write_text("not a checksum\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "Checksum"):
+                artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+
+    def test_release_artifacts_verify_only_rejects_fresh_zip_extra_root_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "artifacts"
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+            self.append_zip_member(artifacts.fresh_install_zip, "DarkAbyssBotManager/extra.txt", b"extra")
+            artifacts_builder._write_sha256_file(artifacts.fresh_install_zip)
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "unexpected"):
+                artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+
+    def test_release_artifacts_verify_only_rejects_fresh_zip_unmanifested_version_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "artifacts"
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+            self.append_zip_member(
+                artifacts.fresh_install_zip,
+                "DarkAbyssBotManager/versions/1.2.3/unexpected.txt",
+                b"unexpected",
+            )
+            artifacts_builder._write_sha256_file(artifacts.fresh_install_zip)
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "unexpected"):
+                artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+
+    def test_release_artifacts_update_zip_exceeding_default_download_limit_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+
+            with mock.patch.object(artifacts_builder.github_updates, "DEFAULT_MAX_ARTIFACT_BYTES", 10):
+                with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "download size limit"):
+                    artifacts_builder.build_release_artifacts(
+                        version="1.2.3",
+                        distribution=distribution,
+                        output=root / "artifacts",
+                    )
+
+    def test_release_artifacts_verify_fresh_zip_rejects_traversal_before_extraction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "artifacts"
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+            self.write_malicious_fresh_zip(artifacts.fresh_install_zip, "../evil.txt")
+            artifacts_builder._write_sha256_file(artifacts.fresh_install_zip)
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "traversal"):
+                artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+            self.assertFalse((output / "evil.txt").exists())
+
+    def test_release_artifacts_verify_fresh_zip_rejects_absolute_and_drive_paths(self):
+        for name in ("/evil.txt", "C:/evil.txt"):
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    distribution = self.create_assembled_distribution(root, "1.2.3")
+                    artifacts_builder = load_release_artifacts(root / "data")
+                    output = root / "artifacts"
+                    artifacts = artifacts_builder.build_release_artifacts(
+                        version="1.2.3",
+                        distribution=distribution,
+                        output=output,
+                    )
+                    self.write_malicious_fresh_zip(artifacts.fresh_install_zip, name)
+                    artifacts_builder._write_sha256_file(artifacts.fresh_install_zip)
+
+                    with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "relative"):
+                        artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+
+    def test_release_artifacts_verify_fresh_zip_rejects_duplicate_case_collision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "artifacts"
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+            with zipfile.ZipFile(artifacts.fresh_install_zip, "w") as archive:
+                archive.writestr("DarkAbyssBotManager/current.json", b"{}")
+                archive.writestr("darkabyssbotmanager/current.json", b"{}")
+            artifacts_builder._write_sha256_file(artifacts.fresh_install_zip)
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "case-colliding"):
+                artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+
+    def test_release_artifacts_verify_fresh_zip_rejects_symlink_member(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            output = root / "artifacts"
+            artifacts = artifacts_builder.build_release_artifacts(
+                version="1.2.3",
+                distribution=distribution,
+                output=output,
+            )
+            symlink_info = zipfile.ZipInfo("DarkAbyssBotManager/linked.txt")
+            symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            with zipfile.ZipFile(artifacts.fresh_install_zip, "w") as archive:
+                archive.writestr(symlink_info, b"target")
+            artifacts_builder._write_sha256_file(artifacts.fresh_install_zip)
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "symlink"):
+                artifacts_builder.verify_release_artifacts(version="1.2.3", artifacts_dir=output)
+
+    def test_release_artifacts_reject_symlinked_input_where_supported(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            distribution = self.create_assembled_distribution(root, "1.2.3")
+            artifacts_builder = load_release_artifacts(root / "data")
+            outside = root / "outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            self.create_file_symlink_or_skip(outside, distribution / "versions" / "1.2.3" / "linked.txt")
+
+            with self.assertRaisesRegex(artifacts_builder.ReleaseArtifactError, "symlink"):
+                artifacts_builder.build_release_artifacts(
+                    version="1.2.3",
+                    distribution=distribution,
+                    output=root / "artifacts",
+                )
+
+    def write_malicious_fresh_zip(self, path: Path, member_name: str) -> None:
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(member_name, b"evil")
+
+    def append_zip_member(self, path: Path, member_name: str, payload: bytes) -> None:
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr(member_name, payload)
 
 
 if __name__ == "__main__":

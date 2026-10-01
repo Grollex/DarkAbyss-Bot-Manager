@@ -64,6 +64,9 @@ Instance layout:
 
 These files are user-owned. Program updates must never overwrite them.
 
+`display_name` is a mutable local Manager label. It can be changed from the GUI through `instance_store.update_instance_display_name()` without renaming the instance directory, instance ID, config, secrets, logs, runtime, or data directories. Metadata updates validate the existing instance first and atomically replace only `instance.json`.
+
+
 - `instance.json` stores minimal metadata for the instance.
 - `config.json` is mutable user configuration for that instance.
 - `secrets/token.txt` stores that instance's Discord token.
@@ -716,14 +719,97 @@ The first distributable archive should be pre-bootstrapped with a valid `current
 
 Current limitation: token provisioning remains manual. The packaged Manager can initialize user-data directories and bot instances, but users still place their Discord token into the generated instance token file outside the program directory.
 
-Phase 9A does not add GitHub Actions, automatic GUI update controls, automatic rollback policy, PyInstaller release publishing, or changes to Discord command behavior.
+Phase 9A did not add GitHub Actions, automatic GUI update controls, automatic rollback policy, PyInstaller release publishing, or changes to Discord command behavior.
+
+## Phase 10A GitHub Actions Release Pipeline
+
+Phase 10A automates production Windows release artifacts without changing the packaged runtime architecture. A release tag is authoritative: `v1.2.3` maps exactly to version `1.2.3`, and malformed or mismatched tag/version/manifest values fail before publishing.
+
+The Windows workflow lives at:
+
+```text
+.github/workflows/release.yml
+```
+
+The workflow has two jobs. `build-and-verify` runs on `windows-latest`, uses `permissions: contents: read`, sets up Python with `actions/setup-python@v5` before running any Python helper, installs `requirements-build.txt`, compiles core/build helper modules, runs the full unittest suite, executes `build_windows.bat <version>`, creates release artifacts, verifies both artifacts locally, performs artifact hygiene checks, and uploads only the four final release files as a workflow artifact.
+
+`publish-release` depends on `build-and-verify`, uses `permissions: contents: write`, downloads the verified workflow artifact, and publishes the four assets without rebuilding. Its condition is limited to actual tag pushes where `github.event_name == 'push'`, `github.ref_type == 'tag'`, and `github.ref` starts with `refs/tags/v`. `workflow_dispatch` can build and verify artifacts for inspection, but it cannot publish a GitHub Release or synthesize a production release tag.
+
+GitHub-controlled values such as `github.ref_type`, `github.ref_name`, and `inputs.version` are passed into the version-resolution step through environment variables. The PowerShell step reads those variables, and Python validation reads tag/version from environment variables rather than constructing executable source text from tag contents.
+
+There are two distinct ZIP formats:
+
+```text
+darkabyss-release-<version>.zip
+DarkAbyssBotManager-<version>-windows.zip
+```
+
+`darkabyss-release-<version>.zip` is the updater artifact consumed by Phase 7. Its archive root is the version payload directly:
+
+```text
+release.json
+DarkAbyssApp.exe
+_internal/...
+```
+
+It must not include `Launcher.exe` at archive root, `current.json`, a `versions/<version>/` wrapper, user-data roots, source-adjacent runtime token/config files, `.git`, logs, backups, databases, generated instances, or symlinks. Artifact construction is allowlist-oriented: the update ZIP contains exactly `release.json` plus files listed by that manifest. The helper validates the ZIP by feeding it through `github_updates.prepare_downloaded_release()` without network and then through `update_engine.stage_release()` in a temporary install root.
+
+The update ZIP must also remain compatible with the Phase 7 default artifact download limit. Build and verify-only paths reject an update ZIP whose compressed size is greater than `github_updates.DEFAULT_MAX_ARTIFACT_BYTES`.
+
+`DarkAbyssBotManager-<version>-windows.zip` is the fresh-install artifact. Its archive root contains a single `DarkAbyssBotManager/` directory:
+
+```text
+DarkAbyssBotManager/
+    Launcher.exe
+    current.json
+    versions/<version>/
+        DarkAbyssApp.exe
+        release.json
+        _internal/...
+```
+
+The fresh-install ZIP is validated by extracting to a temporary root and resolving `Launcher.exe -> current.json -> versions/<version>/DarkAbyssApp.exe --manager` through `launcher.resolve_current_app()`.
+
+Fresh-install artifact construction is also allowlist-oriented. It contains exactly stable root files `Launcher.exe` and `current.json`, `versions/<version>/release.json`, and the manifest-listed payload files under `versions/<version>/`. The assembled distribution is rejected if it contains a second version directory, arbitrary root files, unmanifested version files, nested `.git` content, source runtime token files, user configs, databases, logs, backups, generated instances, or other user-data roots.
+
+Release artifact creation is implemented in `packaging/build_release_artifacts.py` so CI remains a thin orchestration layer. ZIP member ordering is deterministic, member names use `/`, inputs containing symlinks are rejected, and checksum files are generated in the conventional `<sha256>  <filename>` format. The helper rejects artifact output paths that equal, contain, or sit inside the assembled distribution before any output cleanup can run. Fresh-install verification validates member names, duplicate/case collisions, symlink/special-file metadata, and root containment before extracting entries one by one; it does not use `extractall()` in the verification path. After safe extraction, the same exact distribution validator runs before launcher resolution, so verify-only rejects extra fresh-install files too.
+
+A local developer can reproduce CI artifact assembly after a successful Windows build with:
+
+```bat
+python packaging\build_release_artifacts.py --version 0.9.0 --tag v0.9.0 --distribution dist\DarkAbyssBotManager --output dist\release-artifacts
+```
+
+Phase 10A does not add GUI updater controls, automatic update checks, release publishing outside GitHub Actions, Alehandro bot migration, rollback policy changes, or Discord runtime behavior changes.
 
 ## Future Phases
 
 Future phases may add:
 
-- GitHub Actions release builds
 - GUI updater controls
 - packaged release publishing
 - token provisioning UX
 - Windows service/systemd/Docker
+
+
+## Guided Manager Setup
+
+The Manager GUI provides a `Setup Bot` wizard for normal onboarding. A user can configure an Admin bot without opening README or manually editing files:
+
+1. choose a local Manager display name;
+2. open Discord Developer Portal;
+3. enter the public Discord Application ID;
+4. paste the Discord bot token;
+5. acknowledge the external Server Members Intent toggle;
+6. configure structured access settings (`allow_server_administrators`, `allowed_user_ids`, `allowed_role_ids`, `audit_channel_id`);
+7. generate/copy/open the OAuth2 invite URL;
+   The generated URL targets Guild Install with `integration_type=0`. Both private and shareable Discord application modes are supported: `Public Bot = OFF` limits installation to the owner/developer team and may require `Installation -> Install Link = None`; `Public Bot = ON` lets another authorized server owner use the Manager-generated invite link. Public Bot does not change DarkAbyss access control, commands, whitelist, token handling, or runtime behavior.
+8. review a Ready checklist and optionally `Save && Start Bot`.
+
+The wizard stores only user-owned instance data. The Discord bot token is written atomically to `instances/<instance_id>/secrets/token.txt`, is masked by default, is never displayed back after saving, and is not included in invite URLs.
+
+Invite links are generated from named Discord permission bits for the documented granular permissions: View Channels, Send Messages, Read Message History, Manage Messages, Manage Channels, Manage Roles, Moderate Members, Kick Members, and Ban Members. The GUI does not request Discord Administrator permission.
+
+Discord-side actions such as enabling Server Members Intent, choosing private or shareable Public Bot installation access, setting Installation -> Install Link to None when needed, and authorizing the invite are represented as user acknowledgements. Manager does not claim to verify those external Discord settings locally.
+
+Raw JSON editing remains available as `Advanced JSON...` for developer/advanced overrides, but the normal Admin bot setup flow does not require it.

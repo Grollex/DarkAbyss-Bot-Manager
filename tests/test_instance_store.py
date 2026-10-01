@@ -183,6 +183,104 @@ class InstanceStoreTests(unittest.TestCase):
                         instance_store.create_instance("admin", "admin-main", display_name=invalid_name)
                     self.assertFalse(instance_store.get_instance_paths("admin-main").root.exists())
 
+    def test_update_instance_display_name_changes_only_display_name(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            instance_store, _app_paths = self.load_modules(Path(data_dir))
+            instance = instance_store.create_instance("admin", "admin-main", display_name="Old Name")
+            original_config = instance.paths.config.read_bytes()
+            original_token = instance.paths.token.read_bytes()
+
+            updated = instance_store.update_instance_display_name("admin-main", "New Manager Name")
+            metadata = json.loads(updated.paths.metadata.read_text(encoding="utf-8"))
+
+            self.assertEqual(updated.display_name, "New Manager Name")
+            self.assertEqual(updated.id, "admin-main")
+            self.assertEqual(updated.bot_type, "admin")
+            self.assertEqual(updated.schema_version, 1)
+            self.assertEqual(
+                metadata,
+                {
+                    "schema_version": 1,
+                    "id": "admin-main",
+                    "bot_type": "admin",
+                    "display_name": "New Manager Name",
+                },
+            )
+            self.assertEqual(updated.paths.config.read_bytes(), original_config)
+            self.assertEqual(updated.paths.token.read_bytes(), original_token)
+
+    def test_update_instance_display_name_preserves_unknown_metadata_keys(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            instance_store, _app_paths = self.load_modules(Path(data_dir))
+            instance = instance_store.create_instance("admin", "admin-main", display_name="Old Name")
+            metadata = json.loads(instance.paths.metadata.read_text(encoding="utf-8"))
+            metadata["future_field"] = {"value": 123}
+            metadata["another_future_flag"] = True
+            instance.paths.metadata.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+            updated = instance_store.update_instance_display_name("admin-main", "New Name")
+            updated_metadata = json.loads(updated.paths.metadata.read_text(encoding="utf-8"))
+
+            self.assertEqual(updated_metadata["display_name"], "New Name")
+            self.assertEqual(updated_metadata["future_field"], {"value": 123})
+            self.assertIs(updated_metadata["another_future_flag"], True)
+
+    def test_update_instance_display_name_rejects_empty_names(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            instance_store, _app_paths = self.load_modules(Path(data_dir))
+            instance = instance_store.create_instance("admin", "admin-main", display_name="Old Name")
+
+            for invalid_name in ("", "   "):
+                with self.subTest(display_name=invalid_name):
+                    with self.assertRaisesRegex(instance_store.InstanceStoreError, "display_name"):
+                        instance_store.update_instance_display_name("admin-main", invalid_name)
+
+            self.assertEqual(instance_store.load_instance("admin-main").display_name, "Old Name")
+            self.assertEqual(json.loads(instance.paths.metadata.read_text(encoding="utf-8"))["display_name"], "Old Name")
+
+    def test_update_instance_display_name_preserves_identity_fields(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            instance_store, _app_paths = self.load_modules(Path(data_dir))
+            instance_store.create_instance("admin", "admin-main", display_name="Old Name")
+
+            updated = instance_store.update_instance_display_name("admin-main", "Renamed")
+
+            self.assertEqual(updated.schema_version, 1)
+            self.assertEqual(updated.id, "admin-main")
+            self.assertEqual(updated.bot_type, "admin")
+            self.assertEqual(updated.paths.root.name, "admin-main")
+
+    def test_update_instance_display_name_atomic_write_failure_preserves_metadata(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            instance_store, _app_paths = self.load_modules(Path(data_dir))
+            instance = instance_store.create_instance("admin", "admin-main", display_name="Old Name")
+            original_metadata = instance.paths.metadata.read_bytes()
+
+            with mock.patch.object(instance_store.os, "replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(instance_store.InstanceStoreError, "replace failed"):
+                    instance_store.update_instance_display_name("admin-main", "New Name")
+
+            self.assertEqual(instance.paths.metadata.read_bytes(), original_metadata)
+            self.assertEqual(instance_store.load_instance("admin-main").display_name, "Old Name")
+            self.assertFalse(any(path.name.startswith(".instance.json.") for path in instance.paths.root.iterdir()))
+
+    def test_update_instance_display_name_rejects_symlinked_metadata(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            instance_store, _app_paths = self.load_modules(Path(data_dir))
+            instance = instance_store.create_instance("admin", "admin-main", display_name="Old Name")
+            target = instance.paths.root / "external-instance.json"
+            target.write_text(instance.paths.metadata.read_text(encoding="utf-8"), encoding="utf-8")
+            instance.paths.metadata.unlink()
+            try:
+                instance.paths.metadata.symlink_to(target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"Symlink creation unavailable: {exc}")
+
+            with self.assertRaisesRegex(instance_store.InstanceStoreError, "symlinked metadata"):
+                instance_store.update_instance_display_name("admin-main", "New Name")
+
+            self.assertIn("Old Name", target.read_text(encoding="utf-8"))
+
     def test_multiple_instances_have_separate_paths_and_listed(self):
         with tempfile.TemporaryDirectory() as data_dir:
             instance_store, _app_paths = self.load_modules(Path(data_dir))

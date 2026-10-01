@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -87,6 +88,22 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _read_json(path: Path, label: str) -> dict:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -103,6 +120,12 @@ def _validate_display_name(display_name: str | None, default_display_name: str) 
     if not isinstance(display_name, str) or not display_name.strip():
         raise InstanceStoreError("display_name must be a non-empty string when provided.")
     return display_name
+
+
+def _validate_updated_display_name(display_name: object) -> str:
+    if not isinstance(display_name, str) or not display_name.strip():
+        raise InstanceStoreError("display_name must be a non-empty string.")
+    return display_name.strip()
 
 
 def _paths_for_root(root: Path) -> InstancePaths:
@@ -138,6 +161,21 @@ def _validate_loaded_layout(instance_id: str, paths: InstancePaths) -> None:
     for path, label in required_dirs:
         if not path.is_dir():
             raise InstanceStoreError(f"Instance {instance_id}: required directory missing or not a directory: {label}")
+
+
+def _ensure_metadata_file_is_safe(instance_id: str, paths: InstancePaths) -> None:
+    expected_paths = get_instance_paths(instance_id)
+    if paths.metadata != expected_paths.metadata:
+        raise InstanceStoreError(f"Instance {instance_id}: unexpected metadata path: {paths.metadata}")
+    _ensure_instance_root_is_safe(paths)
+    if paths.metadata.is_symlink():
+        raise InstanceStoreError(f"Instance {instance_id}: refusing to write symlinked metadata: {paths.metadata}")
+    try:
+        paths.metadata.resolve(strict=False).relative_to(paths.root.resolve(strict=False))
+    except ValueError as exc:
+        raise InstanceStoreError(f"Instance {instance_id}: metadata path escapes instance root: {paths.metadata}") from exc
+    if not paths.metadata.is_file():
+        raise InstanceStoreError(f"Instance {instance_id}: metadata missing or not a file: {paths.metadata}")
 
 
 def _write_initial_instance_files(
@@ -250,6 +288,31 @@ def load_instance(instance_id: str) -> BotInstance:
         display_name=display_name,
         paths=paths,
     )
+
+
+def update_instance_display_name(instance_id: str, display_name: str) -> BotInstance:
+    valid_instance_id = validate_instance_id(instance_id)
+    updated_display_name = _validate_updated_display_name(display_name)
+    instance = load_instance(valid_instance_id)
+    _ensure_metadata_file_is_safe(valid_instance_id, instance.paths)
+    metadata = _read_json(instance.paths.metadata, "instance metadata")
+
+    if metadata.get("schema_version") != instance.schema_version:
+        raise InstanceStoreError(f"Instance {valid_instance_id}: metadata schema changed unexpectedly.")
+    if metadata.get("id") != instance.id:
+        raise InstanceStoreError(f"Instance {valid_instance_id}: metadata id changed unexpectedly.")
+    if metadata.get("bot_type") != instance.bot_type:
+        raise InstanceStoreError(f"Instance {valid_instance_id}: metadata bot_type changed unexpectedly.")
+
+    updated_metadata = dict(metadata)
+    updated_metadata["display_name"] = updated_display_name
+
+    try:
+        _atomic_write_json(instance.paths.metadata, updated_metadata)
+    except OSError as exc:
+        raise InstanceStoreError(f"Instance {valid_instance_id}: failed to update display_name: {exc}") from exc
+
+    return load_instance(valid_instance_id)
 
 
 def list_instances() -> list[BotInstance]:

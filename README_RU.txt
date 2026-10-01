@@ -7,29 +7,25 @@ Discord Admin Bot, Discord-only edition
 
 ## Быстрый запуск
 
-1. Установить Python 3.11+.
-2. Запустить `setup.bat`.
-3. `setup.bat` установит зависимости, создаст базовый каталог пользовательских данных и подготовит экземпляр `admin-main`.
-4. Вставить токен Discord-бота в файл:
-   `%LOCALAPPDATA%\DarkAbyssBotManager\instances\admin-main\secrets\token.txt`
-5. Если задан `DARKABYSS_DATA_DIR`, токен находится здесь:
-   `<DARKABYSS_DATA_DIR>\instances\admin-main\secrets\token.txt`
-6. При необходимости отредактировать конфиг:
-   `%LOCALAPPDATA%\DarkAbyssBotManager\instances\admin-main\config.json`
-7. Если задан `DARKABYSS_DATA_DIR`, конфиг находится здесь:
-   `<DARKABYSS_DATA_DIR>\instances\admin-main\config.json`
-8. В Discord Developer Portal включить `Server Members Intent`.
-9. Пригласить бота на сервер с granular permissions:
-   - View Channels
-   - Send Messages
-   - Read Message History
-   - Manage Messages
-   - Manage Channels
-   - Manage Roles
-   - Moderate Members
-   - Kick Members
-   - Ban Members
-10. Запустить `Admin.bat`.
+1. Запустить Manager:
+   `python DarkAbyss_Core\manager_gui.py`
+   или готовую программу:
+   `dist\DarkAbyssBotManager\Launcher.exe`
+2. Нажать `Add Bot` или выбрать уже созданный `admin-main`.
+3. Нажать `Setup Bot` и пройти пошаговый мастер внутри GUI.
+4. Мастер поможет:
+   - задать локальное имя бота в Manager;
+   - открыть Discord Developer Portal;
+   - вставить Discord bot token;
+   - включить и отметить Server Members Intent;
+   - настроить доступ через administrators, user IDs и role IDs;
+   - сгенерировать invite link с нужными granular permissions;
+   - выбрать режим установки Discord application:
+     - `Public Bot = OFF`: установить может только owner/developer team;
+     - `Public Bot = ON`: другой владелец сервера может открыть Manager-generated invite link;
+     - этот выбор не меняет DarkAbyss whitelist/access/runtime behavior;
+   - запустить бота кнопкой `Save && Start Bot`.
+5. Чтобы открыть сырой JSON-конфиг, используй `Advanced JSON...`; обычная настройка этого не требует.
 
 Настоящий токен хранится только в `secrets\token.txt` выбранного экземпляра. Не вставляй токен в файлы программы.
 
@@ -43,7 +39,9 @@ python DarkAbyss_Core\manager_gui.py
 
 GUI управляет Bot Instances через Manager Core: показывает экземпляры, запускает/останавливает/перезапускает их, создаёт дополнительные Admin-экземпляры и редактирует JSON overrides через ConfigStore.
 
-Phase 5A GUI не хранит и не показывает токены. Токены остаются в `instances\<instance_id>\secrets\token.txt`.
+Кнопка `Setup Bot` открывает понятный мастер настройки выбранного экземпляра: можно вставить Discord bot token, указать allowed user IDs, allowed role IDs, audit channel ID и режим доступа для server administrators. Рядом с каждым важным полем есть кнопка `ⓘ`: она показывает, где взять bot token, user ID, role ID или channel ID и что означает настройка.
+
+Существующий токен не показывается обратно; если поле token оставить пустым, сохранённый токен не меняется. Токены остаются в `instances\<instance_id>\secrets\token.txt` и не записываются в файлы программы.
 
 Если GUI владеет запущенными процессами, закрытие окна требует остановить управляемые экземпляры или отменить закрытие. В Phase 5A режим "оставить запущенными после закрытия GUI" ещё не включён.
 
@@ -98,6 +96,27 @@ dist\DarkAbyssBotManager\
 ```bat
 python DarkAbyss_Core\release_manifest.py dist\DarkAbyssApp 0.9.0
 ```
+
+Локальная сборка релизных ZIP-артефактов из уже собранного дерева:
+
+```bat
+python packaging\build_release_artifacts.py --version 0.9.0 --tag v0.9.0 --distribution dist\DarkAbyssBotManager --output dist\release-artifacts
+```
+
+Она создаёт два разных архива:
+
+```text
+dist\release-artifacts\darkabyss-release-0.9.0.zip
+dist\release-artifacts\DarkAbyssBotManager-0.9.0-windows.zip
+```
+
+`darkabyss-release-<version>.zip` — update artifact для Phase 7 updater. В корне ZIP лежит payload версии напрямую: `release.json`, `DarkAbyssApp.exe`, `_internal\...`; без `Launcher.exe`, `current.json` и `versions\...` wrapper.
+
+`DarkAbyssBotManager-<version>-windows.zip` — fresh-install artifact. Внутри него находится готовая папка `DarkAbyssBotManager\` с `Launcher.exe`, `current.json` и `versions\<version>\...`.
+
+GitHub Actions workflow `.github\workflows\release.yml` собирает эти архивы на Windows при push тега `v*`, проверяет тесты/manifest/update-preparation/fresh-install layout и публикует только ожидаемые ZIP и `.sha256` файлы. Ручной `workflow_dispatch` только собирает и загружает workflow artifact для проверки, но не публикует GitHub Release. Discord token для сборки не нужен.
+
+Release helper не должен писать артефакты внутрь `dist\DarkAbyssBotManager` или в его родительский каталог: output должен быть отдельным sibling-каталогом вроде `dist\release-artifacts`. Update ZIP дополнительно проверяется на совместимость с лимитом загрузки Phase 7 updater.
 
 В пакет нельзя включать реальные токены, пользовательские config/database/logs/backups, содержимое `%LOCALAPPDATA%`, generated instances или временные update/download артефакты. Выдача токена пока остаётся ручной: токен хранится только в user-data token file, не в программе.
 

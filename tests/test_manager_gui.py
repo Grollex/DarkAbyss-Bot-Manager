@@ -6,6 +6,7 @@ import time
 import unittest
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -80,14 +81,48 @@ class FakeConfigApi:
 
 
 class FakeInstanceApi:
-    def __init__(self):
+    def __init__(self, root=None):
         self.created = []
         self.error = None
+        self.root = Path(root) if root is not None else Path(tempfile.mkdtemp())
+        self.instance_id = "admin-main"
+        self.display_names = {"admin-main": "Main"}
+        self.instance_root = self.root / "instances" / self.instance_id
+        self.token_path = self.instance_root / "secrets" / "token.txt"
+        self.token_path.parent.mkdir(parents=True, exist_ok=True)
+        self.token_path.write_text("PUT_DISCORD_BOT_TOKEN_HERE\n", encoding="utf-8")
 
     def create_instance(self, bot_type, instance_id, display_name=None):
         if self.error is not None:
             raise self.error
         self.created.append((bot_type, instance_id, display_name))
+        self.display_names[instance_id] = display_name or "Admin Bot"
+        return self.load_instance(instance_id)
+
+    def load_instance(self, instance_id):
+        self.instance_id = instance_id
+        self.instance_root = self.root / "instances" / instance_id
+        self.token_path = self.instance_root / "secrets" / "token.txt"
+        self.token_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.token_path.exists():
+            self.token_path.write_text("PUT_DISCORD_BOT_TOKEN_HERE\n", encoding="utf-8")
+        paths = SimpleNamespace(
+            root=self.instance_root,
+            config=self.instance_root / "config.json",
+            config_meta=self.instance_root / "config.meta.json",
+            token=self.token_path,
+            secrets_dir=self.instance_root / "secrets",
+            runtime_dir=self.instance_root / "runtime",
+            logs_dir=self.instance_root / "logs",
+            data_dir=self.instance_root / "data",
+        )
+        return SimpleNamespace(id=instance_id, bot_type="admin", display_name=self.display_names.get(instance_id, "Admin Bot"), paths=paths)
+
+    def update_instance_display_name(self, instance_id, display_name):
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ValueError("display_name must be a non-empty string.")
+        self.display_names[instance_id] = display_name.strip()
+        return self.load_instance(instance_id)
 
 
 class FakeManager:
@@ -304,6 +339,10 @@ class ManagerGuiTests(unittest.TestCase):
         dialog = self.manager_gui.ConfigEditorDialog("admin-main", config_api)
         self.addCleanup(dialog.close)
 
+        labels = "\n".join(label.text() for label in dialog.findChildren(self.manager_gui.QLabel))
+        self.assertIn("Advanced configuration", labels)
+        self.assertIn("User overrides", labels)
+        self.assertIn("Effective config", labels)
         self.assertEqual(config_api.loaded_instance_id, "admin-main")
         self.assertIn("allowed_user_ids", dialog.overrides_edit.toPlainText())
         self.assertNotIn("token", dialog.overrides_edit.toPlainText().lower())
@@ -340,17 +379,311 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertEqual(config_api.saved, [])
         self.assertIn("object", dialog.last_error)
 
-    def test_create_admin_instance_calls_instance_store(self):
+    def test_setup_dialog_loads_guided_fields_without_showing_token(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        config_api = FakeConfigApi()
+        instance_api.token_path.write_text("FAKE_SAVED_TOKEN\n", encoding="utf-8")
+
+        dialog = self.manager_gui.BotSetupDialog("admin-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(dialog.token_edit.text(), "")
+        self.assertIn("Token is configured", dialog.token_status_label.text())
+        self.assertTrue(dialog.allow_admins_checkbox.isChecked())
+        self.assertEqual(dialog.allowed_users_edit.text(), "123")
+        self.assertEqual(dialog.display_name_edit.text(), "Main")
+        self.assertIn("Step 1 of", dialog.current_step_label.text())
+        self.assertIn("Use the", dialog.instructions_label.text())
+        self.assertIn("help", dialog.instructions_label.text())
+        self.assertEqual(dialog.token_help_button.text(), "i")
+        self.assertIn("border-radius", dialog.token_help_button.styleSheet())
+
+    def test_setup_dialog_saves_display_name_token_and_structured_config(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        config_api = FakeConfigApi()
+        dialog = self.manager_gui.BotSetupDialog("admin-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+
+        dialog.display_name_edit.setText("My Server Admin")
+        dialog.token_edit.setText("FAKE_NEW_TOKEN")
+        dialog.allow_admins_checkbox.setChecked(False)
+        dialog.allowed_users_edit.setText("111, 222")
+        dialog.allowed_roles_edit.setText("333 444")
+        dialog.audit_channel_edit.setText("555")
+
+        self.assertTrue(dialog.save_setup())
+
+        self.assertEqual(instance_api.token_path.read_text(encoding="utf-8"), "FAKE_NEW_TOKEN\n")
+        self.assertEqual(instance_api.display_names["admin-main"], "My Server Admin")
+        self.assertEqual(
+            config_api.saved[-1],
+            (
+                "admin-main",
+                {
+                    "allowed_user_ids": ["111", "222"],
+                    "allow_server_administrators": False,
+                    "allowed_role_ids": ["333", "444"],
+                    "audit_channel_id": "555",
+                },
+            ),
+        )
+
+    def test_setup_dialog_rejects_invalid_discord_ids(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        config_api = FakeConfigApi()
+        dialog = self.manager_gui.BotSetupDialog("admin-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+        dialog.allowed_users_edit.setText("not-an-id")
+
+        self.assertFalse(dialog.save_setup())
+
+        self.assertIn("digits", dialog.last_error)
+        self.assertEqual(config_api.saved, [])
+        self.assertEqual(instance_api.token_path.read_text(encoding="utf-8"), "PUT_DISCORD_BOT_TOKEN_HERE\n")
+
+    def test_setup_dialog_empty_token_preserves_existing_token(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        config_api = FakeConfigApi()
+        instance_api.token_path.write_text("FAKE_EXISTING_TOKEN\n", encoding="utf-8")
+        dialog = self.manager_gui.BotSetupDialog("admin-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+
+        dialog.token_edit.setText("")
+        self.assertTrue(dialog.save_setup())
+
+        self.assertEqual(instance_api.token_path.read_text(encoding="utf-8"), "FAKE_EXISTING_TOKEN\n")
+        self.assertNotIn("FAKE_EXISTING_TOKEN", dialog.token_status_label.text())
+
+    def test_application_id_validation_and_invite_url(self):
+        with self.assertRaisesRegex(ValueError, "required"):
+            self.manager_gui.build_discord_invite_url("")
+        with self.assertRaisesRegex(ValueError, "digits"):
+            self.manager_gui.build_discord_invite_url("abc")
+
+        invite_url = self.manager_gui.build_discord_invite_url("1234567890")
+
+        from urllib.parse import parse_qs, urlparse
+
+        parsed = urlparse(invite_url)
+        params = parse_qs(parsed.query)
+        permissions = int(params["permissions"][0])
+        self.assertEqual(params["client_id"], ["1234567890"])
+        self.assertEqual(params["scope"], ["bot applications.commands"])
+        self.assertEqual(params["integration_type"], ["0"])
+        self.assertEqual(permissions, self.manager_gui.DISCORD_ADMIN_BOT_PERMISSIONS)
+        self.assertTrue(permissions & self.manager_gui.DISCORD_PERMISSION_BITS["View Channels"])
+        self.assertTrue(permissions & self.manager_gui.DISCORD_PERMISSION_BITS["Moderate Members"])
+        self.assertFalse(permissions & (1 << 3))
+        self.assertNotIn("token", invite_url.lower())
+        self.assertNotIn("client_secret", invite_url.lower())
+
+    def test_intent_acknowledgement_is_user_confirmed_not_verified(self):
+        dialog = self.manager_gui.BotSetupDialog("admin-main", FakeInstanceApi(self.temp_dir.name), FakeConfigApi())
+        self.addCleanup(dialog.close)
+
+        self.assertFalse(dialog.intent_ack_checkbox.isChecked())
+        dialog.pages.setCurrentIndex(dialog.pages.count() - 1)
+        self.assertIn("Manager cannot verify", dialog.ready_summary_label.text())
+        self.assertIn("USER-CONFIRMED DISCORD STEPS", dialog.ready_summary_label.text())
+
+    def test_ready_summary_empty_display_name_is_missing(self):
+        dialog = self.manager_gui.BotSetupDialog("admin-main", FakeInstanceApi(self.temp_dir.name), FakeConfigApi())
+        self.addCleanup(dialog.close)
+        dialog.display_name_edit.setText("   ")
+
+        dialog.pages.setCurrentIndex(dialog.pages.count() - 1)
+
+        self.assertIn("[MISSING] Manager display name", dialog.ready_summary_label.text())
+        self.assertNotIn("[OK] Manager display name: missing", dialog.ready_summary_label.text())
+
+    def test_finish_buttons_only_available_on_final_page(self):
+        dialog = self.manager_gui.BotSetupDialog("admin-main", FakeInstanceApi(self.temp_dir.name), FakeConfigApi())
+        self.addCleanup(dialog.close)
+
+        dialog.pages.setCurrentIndex(0)
+        self.assertTrue(dialog.finish_button.isHidden())
+        self.assertTrue(dialog.start_button.isHidden())
+        self.assertFalse(dialog.next_button.isHidden())
+
+        dialog.pages.setCurrentIndex(dialog.pages.count() - 1)
+        self.assertFalse(dialog.finish_button.isHidden())
+        self.assertTrue(dialog.finish_button.isEnabled())
+        self.assertFalse(dialog.start_button.isHidden())
+        self.assertTrue(dialog.next_button.isHidden())
+
+    def test_finish_saves_and_closes_without_starting(self):
+        dialog = self.manager_gui.BotSetupDialog("admin-main", FakeInstanceApi(self.temp_dir.name), FakeConfigApi())
+        self.addCleanup(dialog.close)
+        dialog.pages.setCurrentIndex(dialog.pages.count() - 1)
+        dialog.accept = mock.Mock()
+        dialog.save_setup = mock.Mock(return_value=True)
+
+        dialog.finish_setup()
+
+        dialog.save_setup.assert_called_once()
+        dialog.accept.assert_called_once()
+        self.assertFalse(dialog.start_requested)
+
+    def test_finish_does_not_close_when_save_fails(self):
+        dialog = self.manager_gui.BotSetupDialog("admin-main", FakeInstanceApi(self.temp_dir.name), FakeConfigApi())
+        self.addCleanup(dialog.close)
+        dialog.pages.setCurrentIndex(dialog.pages.count() - 1)
+        dialog.accept = mock.Mock()
+        dialog.save_setup = mock.Mock(return_value=False)
+
+        dialog.finish_setup()
+
+        dialog.save_setup.assert_called_once()
+        dialog.accept.assert_not_called()
+        self.assertFalse(dialog.start_requested)
+
+    def test_bot_installation_guidance_covers_private_and_shareable_modes(self):
+        dialog = self.manager_gui.BotSetupDialog("admin-main", FakeInstanceApi(self.temp_dir.name), FakeConfigApi())
+        self.addCleanup(dialog.close)
+        labels = "\n".join(label.text() for label in dialog.findChildren(self.manager_gui.QLabel))
+
+        self.assertIn("Installation mode is your choice", labels)
+        self.assertIn("Public Bot = OFF", labels)
+        self.assertIn("Public Bot = ON", labels)
+        self.assertIn("generated invite link", labels)
+        self.assertIn("Install Link = None", labels)
+
+        with mock.patch.object(self.manager_gui.QMessageBox, "information") as information:
+            dialog.installation_help_button.click()
+        body = information.call_args.args[2]
+        self.assertIn("PRIVATE:", body)
+        self.assertIn("Public Bot = OFF", body)
+        self.assertIn("owner/developer team", body)
+        self.assertIn("SHAREABLE:", body)
+        self.assertIn("Public Bot = ON", body)
+        self.assertIn("Manager-generated invite link", body)
+        self.assertIn("does not change DarkAbyss access control", body)
+        self.assertNotIn("must be OFF", body)
+
+    def test_open_installation_page_uses_application_id_when_valid(self):
+        dialog = self.manager_gui.BotSetupDialog("admin-main", FakeInstanceApi(self.temp_dir.name), FakeConfigApi())
+        self.addCleanup(dialog.close)
+        dialog.application_id_edit.setText("1234567890")
+
+        with mock.patch.object(self.manager_gui.QDesktopServices, "openUrl") as open_url:
+            dialog.open_application_installation_page()
+
+        self.assertEqual(open_url.call_args.args[0].toString(), "https://discord.com/developers/applications/1234567890/installation")
+
+    def test_setup_help_buttons_open_topic_instructions(self):
+        dialog = self.manager_gui.BotSetupDialog("admin-main", FakeInstanceApi(self.temp_dir.name), FakeConfigApi())
+        self.addCleanup(dialog.close)
+
+        with mock.patch.object(self.manager_gui.QMessageBox, "information") as information:
+            dialog.display_name_help_button.click()
+            dialog.application_help_button.click()
+            dialog.installation_help_button.click()
+            dialog.token_help_button.click()
+            dialog.intent_help_button.click()
+            dialog.users_help_button.click()
+            dialog.roles_help_button.click()
+            dialog.audit_help_button.click()
+            dialog.administrators_help_button.click()
+
+        titles = [call.args[1] for call in information.call_args_list]
+        bodies = [call.args[2] for call in information.call_args_list]
+        self.assertEqual(
+            titles,
+            [
+                "Manager display name",
+                "Discord Application ID",
+                "Bot installation access",
+                "Discord bot token",
+                "Server Members Intent",
+                "Allowed user IDs",
+                "Allowed role IDs",
+                "Audit channel ID",
+                "Server administrators",
+            ],
+        )
+        self.assertIn("local label", bodies[0])
+        self.assertIn("Application ID", bodies[1])
+        self.assertIn("PRIVATE:", bodies[2])
+        self.assertIn("SHAREABLE:", bodies[2])
+        self.assertIn("Developer Portal", bodies[3])
+        self.assertIn("privileged", bodies[4])
+        self.assertIn("Copy User ID", bodies[5])
+        self.assertIn("Copy Role ID", bodies[6])
+        self.assertIn("Copy Channel ID", bodies[7])
+        self.assertIn("Administrator", bodies[8])
+
+    def test_setup_selected_bot_opens_setup_dialog(self):
+        window = self.make_window(instance_api=FakeInstanceApi(self.temp_dir.name), config_api=FakeConfigApi())
+        self.select_instance(window, "admin-main")
+        fake_dialog = mock.Mock()
+        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
+        fake_dialog.start_requested = False
+
+        with mock.patch.object(self.manager_gui, "BotSetupDialog", return_value=fake_dialog) as dialog_class:
+            window.setup_selected_bot()
+
+        dialog_class.assert_called_once()
+        self.assertEqual(dialog_class.call_args.args[0], "admin-main")
+
+    def test_main_setup_workflow_does_not_open_raw_json_editor(self):
+        window = self.make_window(instance_api=FakeInstanceApi(self.temp_dir.name), config_api=FakeConfigApi())
+        self.select_instance(window, "admin-main")
+        fake_dialog = mock.Mock()
+        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
+        fake_dialog.start_requested = False
+
+        with mock.patch.object(self.manager_gui, "ConfigEditorDialog") as config_editor, mock.patch.object(
+            self.manager_gui, "BotSetupDialog", return_value=fake_dialog
+        ):
+            window.setup_selected_bot()
+
+        config_editor.assert_not_called()
+
+    def test_advanced_json_button_remains_functional(self):
+        window = self.make_window(instance_api=FakeInstanceApi(self.temp_dir.name), config_api=FakeConfigApi())
+        self.select_instance(window, "admin-main")
+        fake_dialog = mock.Mock()
+        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
+
+        with mock.patch.object(self.manager_gui, "ConfigEditorDialog", return_value=fake_dialog) as dialog_class:
+            window.edit_selected_config()
+
+        self.assertEqual(window.edit_config_button.text(), "Advanced JSON...")
+        self.assertIn("Advanced", window.edit_config_button.toolTip())
+        dialog_class.assert_called_once()
+
+    def test_setup_save_and_start_delegates_to_existing_lifecycle_path(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        window = self.make_window(manager=manager, instance_api=FakeInstanceApi(self.temp_dir.name), config_api=FakeConfigApi())
+        self.finish_workers_immediately(window)
+        self.select_instance(window, "admin-main")
+        fake_dialog = mock.Mock()
+        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
+        fake_dialog.start_requested = True
+
+        with mock.patch.object(self.manager_gui, "BotSetupDialog", return_value=fake_dialog):
+            window.setup_selected_bot()
+
+        self.assertIn(("start", "admin-main"), manager.calls)
+
+    def test_create_admin_instance_calls_instance_store_and_opens_setup(self):
         instance_api = FakeInstanceApi()
         window = self.make_window(instance_api=instance_api)
         fake_dialog = mock.Mock()
         fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
         fake_dialog.values.return_value = ("admin-second", "Second")
+        fake_setup = mock.Mock()
+        fake_setup.exec.return_value = self.manager_gui.QDialog.Accepted
+        fake_setup.start_requested = False
 
-        with mock.patch.object(self.manager_gui, "CreateAdminInstanceDialog", return_value=fake_dialog):
+        with mock.patch.object(self.manager_gui, "CreateAdminInstanceDialog", return_value=fake_dialog), mock.patch.object(
+            self.manager_gui, "BotSetupDialog", return_value=fake_setup
+        ) as setup_class:
             window.create_admin_instance()
 
         self.assertEqual(instance_api.created, [("admin", "admin-second", "Second")])
+        setup_class.assert_called_once()
+        self.assertEqual(setup_class.call_args.args[0], "admin-second")
 
     def test_create_admin_instance_handles_filesystem_error(self):
         instance_api = FakeInstanceApi()
