@@ -130,7 +130,7 @@ The Admin Tool Layer is the safe capability boundary:
 - Destructive confirmations will live above this layer in a later orchestrator/transport phase.
 - Discord message content, usernames, channel names, role names, and other server-provided content are untrusted data. They are not system instructions, authorization, tool definitions, confirmation, or permission to execute follow-up actions.
 - The AI tool path has no shell/system execution and no arbitrary Python/code execution. It only calls explicit Discord admin capabilities registered in `admin_tools.py`.
-- The schemas are intended for future Groq, Gemini, and OpenRouter tool-calling integration without provider-specific code inside `admin_tools.py`. Those providers are not implemented yet.
+- The schemas are intended for Groq, Gemini, and future OpenRouter tool-calling integration without provider-specific code inside `admin_tools.py`.
 
 `Admin.py` still owns Discord bot startup, slash-command wiring, Discord-specific responses, and audit routing. Existing `/execute` behavior delegates to the Admin Tool Layer but keeps its current access policy and presentation.
 
@@ -188,25 +188,65 @@ No Groq request occurs on import, provider construction, registry construction, 
 
 Groq tool calls are data until a later orchestrator phase validates, plans, confirms, and executes them. AI-2B does not execute Admin Tools, mutate Discord, decide confirmation policy, write bot config, or route task classes. Groq built-in browser search, code execution, remote MCP, and provider-hosted tool execution are not enabled.
 
-For `openai/gpt-oss-120b`, DarkAbyss uses `reasoning_effort` (`low`, `medium`, `high`) and requests `include_reasoning = false` when sending local function tool schemas. DarkAbyss must not expose model chain-of-thought/reasoning in responses, Manager UI, Discord, logs, or audit output. AI-2B also applies a conservative local `max_completion_tokens <= 8192` safety/resource ceiling; this is a DarkAbyss limit, not a statement about the model's full provider-side maximum.
+For `openai/gpt-oss-120b`, DarkAbyss uses `reasoning_effort` (`low`, `medium`, `high`) and requests `include_reasoning = false` for all GPT-OSS requests, including normal text and local function-schema requests. DarkAbyss must not expose model chain-of-thought/reasoning in responses, Manager UI, Discord, logs, or audit output. AI-2B also applies a conservative local `max_completion_tokens <= 8192` safety/resource ceiling; this is a DarkAbyss limit, not a statement about the model's full provider-side maximum.
+
+AI-2C adds the second optional provider adapter:
+
+- Provider: Google Gemini
+- Provider ID: `gemini`
+- Default profile: `gemini-default`
+- Credential ref: `gemini-default`
+- Initial model metadata: `gemini-3.8-flash`, `gemini-3.5-flash-lite`
+- API style: native Gemini `generateContent` REST
+- API base: `https://generativelanguage.googleapis.com/v1beta`
+- Authentication: `x-goog-api-key`, not `Authorization: Bearer`
+- User-Agent: `DarkAbyssBotManager/AI-2C`
+
+Gemini uses direct standard-library HTTPS. No `google-genai`, `google-generativeai`, `requests`, `httpx`, OpenAI SDK, or Google provider SDK is required. Gemini network I/O occurs only from explicit `test_connection(...)` and `generate(...)` calls. There is no online model discovery in AI-2C, and Gemini credentials are not validated by prefix because Google AI Studio keys are opaque non-empty secrets.
+
+Gemini request mapping uses native `generateContent` structures:
+
+- `SYSTEM` messages become ordered `systemInstruction.parts`.
+- `USER` messages become `contents` entries with role `user`.
+- `ASSISTANT` messages become Gemini role `model`.
+- Assistant tool calls become `functionCall` parts.
+- Tool results become role `user` `functionResponse` parts matched by `tool_call_id` to the preceding assistant `AIToolCall`.
+
+Gemini local Admin Tool schemas are exposed only as `functionDeclarations`. Built-in Google Search, Google Maps, code execution, URL context, file search, computer use, provider-hosted MCP, and other hosted Gemini tools are not enabled. Function calls remain data only; AI-2C does not execute Admin Tools, mutate Discord, decide confirmation policy, or route task classes.
+
+Gemini `reasoning_effort` maps to `generationConfig.thinkingConfig.thinkingLevel` (`low`, `medium`, `high`) with `includeThoughts = false`. Thinking level controls provider computation only. AI-2C exposes only Gemini 3.x model metadata, so the Gemini adapter allowlist is deliberately small: `reasoning_effort` and `max_output_tokens`. Gemini `temperature`, `top_p`, and `top_k` are not sent. User-configured `max_output_tokens` has a conservative local DarkAbyss safety/resource ceiling of `8192`; this is not a statement about Gemini 3.8's provider-side maximum. The Gemini Test Connection smoke request uses `reasoning_effort = low` but does not force `max_output_tokens`, because Gemini thinking tokens count against output budgets. DarkAbyss never requests, displays, logs, audits, or copies chain-of-thought/thought summaries into `AIResponse.content`, Manager UI, Discord, logs, or audit output.
+
+Gemini 3 function-calling may return opaque encrypted `thoughtSignature` values. These are continuation state, not chain-of-thought text. In native Gemini REST JSON, `thoughtSignature` belongs to the `Part` as a sibling of `functionCall` or `text`; it is not nested inside `functionCall`. DarkAbyss preserves function-call signatures only inside JSON-safe `AIToolCall.metadata` as:
+
+```json
+{"gemini": {"thought_signature": "opaque-string"}}
+```
+
+When replaying Gemini assistant tool calls in a later turn, the Gemini adapter restores the signature onto the same outgoing `functionCall` Part. For parallel Gemini function calls, the first `functionCall` Part in a current model step normally carries the signature; later parallel `functionCall` Parts may have no signature. DarkAbyss preserves any later signatures if present, but it does not copy or manufacture signatures. Signature validation is current-turn-only: the current turn starts at the most recent ordinary `USER` message, `TOOL` does not start a turn, and histories with no `USER` are treated conservatively as current. Previous completed turns with missing Gemini signatures are tolerated and replayed if possible so older/provider-switched history does not invalidate the conversation.
+
+Gemini text Parts may also carry an opaque `thoughtSignature`. DarkAbyss preserves the original visible Gemini text-Part boundaries in sanitized `AIResponse.metadata` so signed and unsigned Parts can be replayed exactly. `AIResponse.content` remains a convenient concatenated visible string, but replay uses the original visible Part list when present and fails locally if metadata no longer matches the assistant content. An empty visible text Part with a signature is still preserved and replayed as a real Part. Text from Parts marked `thought: true` is never copied into `AIResponse.content` or replay metadata.
+
+When a Gemini model step emits multiple parallel function calls and the following provider-neutral `TOOL` messages contain their results, DarkAbyss matches responses only against the immediately preceding assistant function-call step, requires exactly one result per call, rejects stale/unknown/duplicate/incomplete result sets, and batches valid `functionResponse` Parts into one Gemini `role: user` content ordered by the original model call order. Sequential function-calling steps remain separate assistant/user content pairs with independent signatures. Function call IDs are exact provider IDs and Gemini 3 parsed function calls without a non-empty string ID are rejected. The adapter never stores raw provider responses or thought text for this purpose.
+
+Gemini errors are normalized without raw response bodies: `401` or explicit invalid-key reasons become `CREDENTIAL_INVALID`; `403` becomes `ACCESS_FORBIDDEN`; quota/rate-limit, billing/credit prerequisites, model unavailable, 5xx, network, and timeout conditions become safe unavailable states/messages.
 
 The Manager `AI Providers...` dialog is device-local and global. It is not tied to the selected Discord Bot Instance and can be opened even when no bot is selected.
 
-Current Groq settings behavior:
+Current AI provider settings behavior:
 
-- The user enters the Groq API key inside Manager.
+- The user enters Groq and/or Gemini API keys inside Manager.
 - The key is stored device-locally via `CredentialStore`.
 - Existing saved keys are never re-displayed, partially displayed, or copied back into the UI.
 - Saving an empty key field preserves an existing key.
 - Removing a key is an explicit action.
 - Model/profile settings are stored separately in `<DATA_ROOT>/config/ai.json`.
 - `ai.json` contains no raw API key.
-- Editing Groq settings replaces only the `groq-default` profile. It preserves other provider profiles and existing routing assignments.
+- Editing Groq settings replaces only the `groq-default` profile. Editing Gemini settings replaces only the `gemini-default` profile. Both preserve other provider profiles and existing routing assignments.
 - Malformed `ai.json` is preserved and normal Save is disabled until the user explicitly resolves the settings file.
 - Another PC uses its own device-local credential and profile settings.
 - `Test Connection` is an explicit user action and runs outside the GUI thread.
 
-AI-3 will add the orchestrator loop that can interpret model plans/tool-call data, apply confirmation policy, and call the Admin Tool Layer when authorized. AI-2B only stores settings, calls Groq explicitly, and parses model output into data.
+AI-3 will add the orchestrator loop that can interpret model plans/tool-call data, apply confirmation policy, and call the Admin Tool Layer when authorized. AI-2B/AI-2C only store settings, call providers explicitly, and parse model output into data.
 
 AI credentials are device-local and stored outside program versions, bot instance config, release artifacts, and the source tree:
 
@@ -214,9 +254,11 @@ AI credentials are device-local and stored outside program versions, bot instanc
 <DATA_ROOT>/secrets/ai/<provider_id>/<credential_ref>.secret
 ```
 
-`CredentialReference` is only a logical pointer. The same `credential_ref` such as `groq-default` may resolve to different local secrets on different computers. AI profiles and routing preferences are also device-local by default in the current architecture and do not belong to the Discord Bot Instance's portable config. This allows PC A and PC B to use different providers/profiles while hosting the same logical bot at different times. Cloud sync is not implemented.
+Gemini keys are stored at `<DATA_ROOT>/secrets/ai/gemini/gemini-default.secret`. Groq keys are stored at `<DATA_ROOT>/secrets/ai/groq/groq-default.secret`.
 
-Routing distinguishes local availability states without network access: `NOT_CONFIGURED`, `PROVIDER_MISSING`, `CREDENTIAL_MISSING`, `DISABLED`, `UNAVAILABLE`, and `AVAILABLE`.
+`CredentialReference` is only a logical pointer. The same `credential_ref` such as `groq-default` or `gemini-default` may resolve to different local secrets on different computers. AI profiles and routing preferences are also device-local by default in the current architecture and do not belong to the Discord Bot Instance's portable config. This allows PC A and PC B to use different providers/profiles while hosting the same logical bot at different times. Cloud sync is not implemented.
+
+Routing distinguishes local availability states without network access: `NOT_CONFIGURED`, `PROVIDER_MISSING`, `CREDENTIAL_MISSING`, `CREDENTIAL_INVALID`, `ACCESS_FORBIDDEN`, `DISABLED`, `UNAVAILABLE`, and `AVAILABLE`.
 
 Conceptual future architecture:
 

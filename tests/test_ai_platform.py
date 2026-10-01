@@ -355,11 +355,14 @@ class AIPlatformFoundationTests(unittest.TestCase):
             tools=(tool_schema,),
             options={"temperature": 0},
         )
+        metadata = {"gemini": {"thought_signature": "opaque", "nested": ["a", {"b": 1}]}}
         tool_call = ai_platform.AIToolCall(
             call_id="call-1",
             tool_name="send_message",
             arguments={"channel_id": "123", "content": "hi"},
+            metadata=metadata,
         )
+        metadata["gemini"]["thought_signature"] = "mutated"
         response = ai_platform.AIResponse(
             content="plan",
             tool_calls=(tool_call,),
@@ -370,8 +373,22 @@ class AIPlatformFoundationTests(unittest.TestCase):
         json.dumps(request.public_dict())
         json.dumps(response.public_dict())
         self.assertEqual(response.public_dict()["tool_calls"][0]["arguments"]["channel_id"], "123")
+        self.assertEqual(response.public_dict()["tool_calls"][0]["metadata"]["gemini"]["thought_signature"], "opaque")
+        self.assertEqual(response.public_dict()["tool_calls"][0]["metadata"]["gemini"]["nested"], ["a", {"b": 1}])
+        self.assertNotIn("SECRET", str(response.public_dict()))
+        with self.assertRaises(TypeError):
+            response.tool_calls[0].metadata["gemini"] = {}
+        with self.assertRaises(TypeError):
+            response.tool_calls[0].metadata["gemini"]["thought_signature"] = "mutated"
+        with self.assertRaises(TypeError):
+            response.tool_calls[0].metadata["gemini"]["nested"][1]["b"] = 2
+        public_copy = response.tool_calls[0].public_dict()
+        public_copy["metadata"]["gemini"]["nested"][1]["b"] = 99
+        self.assertEqual(response.tool_calls[0].metadata["gemini"]["nested"][1]["b"], 1)
         with self.assertRaises(ValueError):
             ai_platform.AIToolCall(tool_name="send_message", arguments={"bad": object()})
+        with self.assertRaises(ValueError):
+            ai_platform.AIToolCall(tool_name="send_message", arguments={}, metadata={"bad": object()})
 
     def test_tool_message_contract_invariants(self):
         ai_platform = load_ai_platform()
@@ -401,6 +418,30 @@ class AIPlatformFoundationTests(unittest.TestCase):
             tool_calls=(ai_platform.AIToolCall(call_id="call-1", tool_name="send_message", arguments={}),),
         )
         self.assertEqual(message.public_dict()["tool_calls"][0]["id"], "call-1")
+
+    def test_message_and_response_metadata_are_recursively_immutable(self):
+        ai_platform = load_ai_platform()
+        metadata = {"gemini": {"visible_text_parts": [{"text": "A", "thought_signature": None}]}}
+        message = ai_platform.AIMessage(role="assistant", content="A", metadata=metadata)
+        metadata["gemini"]["visible_text_parts"][0]["text"] = "mutated"
+        self.assertEqual(message.metadata["gemini"]["visible_text_parts"][0]["text"], "A")
+        with self.assertRaises(TypeError):
+            message.metadata["gemini"]["visible_text_parts"][0]["text"] = "mutated"
+        public_message = message.public_dict()
+        public_message["metadata"]["gemini"]["visible_text_parts"][0]["text"] = "changed"
+        self.assertEqual(message.metadata["gemini"]["visible_text_parts"][0]["text"], "A")
+        json.dumps(message.public_dict())
+
+        response_metadata = {"gemini": {"nested": ["x", {"y": 1}]}}
+        response = ai_platform.AIResponse(content="ok", metadata=response_metadata)
+        response_metadata["gemini"]["nested"][1]["y"] = 2
+        self.assertEqual(response.metadata["gemini"]["nested"][1]["y"], 1)
+        with self.assertRaises(TypeError):
+            response.metadata["gemini"]["nested"][1]["y"] = 3
+        public_response = response.public_dict()
+        public_response["metadata"]["gemini"]["nested"][1]["y"] = 4
+        self.assertEqual(response.metadata["gemini"]["nested"][1]["y"], 1)
+        json.dumps(response.public_dict())
 
     def test_async_provider_methods_exist_but_routing_does_not_call_them(self):
         ai_platform = load_ai_platform()

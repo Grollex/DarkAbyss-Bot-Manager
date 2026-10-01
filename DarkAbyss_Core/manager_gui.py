@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -47,6 +48,9 @@ REFRESH_INTERVAL_MS = 1500
 GROQ_PROFILE_ID = "groq-default"
 GROQ_PROVIDER_ID = "groq"
 GROQ_CREDENTIAL_REF = "groq-default"
+GEMINI_PROFILE_ID = "gemini-default"
+GEMINI_PROVIDER_ID = "gemini"
+GEMINI_CREDENTIAL_REF = "gemini-default"
 
 DISCORD_DEVELOPER_PORTAL_URL = "https://discord.com/developers/applications"
 DISCORD_INVITE_BASE_URL = "https://discord.com/oauth2/authorize"
@@ -407,6 +411,14 @@ def create_groq_provider(credential_store: ai_platform.CredentialStore):
     return ai_groq.GroqProvider(credential_store)
 
 
+def create_gemini_provider(credential_store: ai_platform.CredentialStore):
+    try:
+        import ai_gemini
+    except Exception as exc:
+        raise ai_platform.AIPlatformError("Provider unavailable.") from exc
+    return ai_gemini.GeminiProvider(credential_store)
+
+
 def _profile_by_id(settings: ai_platform.AISettings, profile_id: str) -> ai_platform.AIProfile | None:
     return next((profile for profile in settings.profiles if profile.profile_id == profile_id), None)
 
@@ -417,6 +429,7 @@ class AIProviderSettingsDialog(QDialog):
         settings_store: ai_platform.AISettingsStore | None = None,
         credential_store: ai_platform.CredentialStore | None = None,
         provider_factory: Callable[[ai_platform.CredentialStore], object] = create_groq_provider,
+        gemini_provider_factory: Callable[[ai_platform.CredentialStore], object] = create_gemini_provider,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -424,11 +437,14 @@ class AIProviderSettingsDialog(QDialog):
         self._settings_store = settings_store or ai_platform.AISettingsStore()
         self._credential_store = credential_store or ai_platform.CredentialStore()
         self._provider_factory = provider_factory
+        self._gemini_provider_factory = gemini_provider_factory
         self._worker_handles: list[_WorkerHandle] = []
         self._provider = None
+        self._gemini_provider = None
         self._settings_invalid = False
         self._loaded_settings = ai_platform.AISettings()
         self._test_in_progress = False
+        self._gemini_test_in_progress = False
 
         self.status_label = QLabel("")
         self.key_edit = QLineEdit()
@@ -441,6 +457,16 @@ class AIProviderSettingsDialog(QDialog):
         self.test_button = QPushButton("Test Connection")
         self.remove_button = QPushButton("Remove Key")
         self.close_button = QPushButton("Close")
+        self.gemini_status_label = QLabel("")
+        self.gemini_key_edit = QLineEdit()
+        self.gemini_key_edit.setEchoMode(QLineEdit.Password)
+        self.gemini_show_key_checkbox = QCheckBox("Show key while editing")
+        self.gemini_model_combo = QComboBox()
+        self.gemini_reasoning_combo = QComboBox()
+        self.gemini_reasoning_combo.addItems(["low", "medium", "high"])
+        self.gemini_save_button = QPushButton("Save")
+        self.gemini_test_button = QPushButton("Test Connection")
+        self.gemini_remove_button = QPushButton("Remove Key")
 
         form = QFormLayout()
         form.addRow("Status:", self.status_label)
@@ -454,24 +480,61 @@ class AIProviderSettingsDialog(QDialog):
             button_row.addWidget(button)
         button_row.addStretch(1)
 
+        groq_tab_layout = QVBoxLayout()
+        groq_tab_layout.addLayout(form)
+        groq_tab_layout.addLayout(button_row)
+        groq_tab = QWidget()
+        groq_tab.setLayout(groq_tab_layout)
+
+        gemini_form = QFormLayout()
+        gemini_form.addRow("Status:", self.gemini_status_label)
+        gemini_form.addRow("API Key:", self.gemini_key_edit)
+        gemini_form.addRow("", self.gemini_show_key_checkbox)
+        gemini_form.addRow("Model:", self.gemini_model_combo)
+        gemini_form.addRow("Reasoning:", self.gemini_reasoning_combo)
+
+        gemini_button_row = QHBoxLayout()
+        for button in (self.gemini_save_button, self.gemini_test_button, self.gemini_remove_button):
+            gemini_button_row.addWidget(button)
+        gemini_button_row.addStretch(1)
+
+        gemini_tab_layout = QVBoxLayout()
+        gemini_tab_layout.addLayout(gemini_form)
+        gemini_tab_layout.addLayout(gemini_button_row)
+        gemini_tab = QWidget()
+        gemini_tab.setLayout(gemini_tab_layout)
+
+        self.provider_tabs = QTabWidget()
+        self.provider_tabs.addTab(groq_tab, "Groq")
+        self.provider_tabs.addTab(gemini_tab, "Gemini")
+
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("Groq"))
-        layout.addLayout(form)
-        layout.addLayout(button_row)
+        layout.addWidget(self.provider_tabs)
+        layout.addWidget(self.close_button)
         self.setLayout(layout)
 
         self.show_key_checkbox.toggled.connect(self._toggle_key_visibility)
+        self.gemini_show_key_checkbox.toggled.connect(self._toggle_gemini_key_visibility)
         self.save_button.clicked.connect(self.save_settings)
         self.test_button.clicked.connect(self.test_connection)
         self.remove_button.clicked.connect(self.remove_key)
+        self.gemini_save_button.clicked.connect(self.save_gemini_settings)
+        self.gemini_test_button.clicked.connect(self.test_gemini_connection)
+        self.gemini_remove_button.clicked.connect(self.remove_gemini_key)
         self.close_button.clicked.connect(self.accept)
 
         self._load_provider_metadata()
+        self._load_gemini_provider_metadata()
         self._load_settings()
+        self._load_gemini_settings()
         self._refresh_status()
+        self._refresh_gemini_status()
 
     def _toggle_key_visibility(self, checked: bool) -> None:
         self.key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+
+    def _toggle_gemini_key_visibility(self, checked: bool) -> None:
+        self.gemini_key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
 
     def _load_provider_metadata(self) -> None:
         self.model_combo.clear()
@@ -485,6 +548,19 @@ class AIProviderSettingsDialog(QDialog):
             return
         for model in models:
             self.model_combo.addItem(model.display_name, model.model_id)
+
+    def _load_gemini_provider_metadata(self) -> None:
+        self.gemini_model_combo.clear()
+        try:
+            self._gemini_provider = self._gemini_provider_factory(self._credential_store)
+            models = self._gemini_provider.metadata.models
+        except Exception:
+            self._gemini_provider = None
+            self.gemini_status_label.setText("Provider unavailable")
+            self.gemini_test_button.setEnabled(False)
+            return
+        for model in models:
+            self.gemini_model_combo.addItem(model.display_name, model.model_id)
 
     def _load_settings(self) -> None:
         try:
@@ -508,6 +584,21 @@ class AIProviderSettingsDialog(QDialog):
         reasoning = str(profile.options.get("reasoning_effort", "medium"))
         reasoning_index = self.reasoning_combo.findText(reasoning)
         self.reasoning_combo.setCurrentIndex(reasoning_index if reasoning_index >= 0 else 1)
+
+    def _load_gemini_settings(self) -> None:
+        if self._settings_invalid:
+            return
+        profile = _profile_by_id(self._loaded_settings, GEMINI_PROFILE_ID)
+        if profile is None:
+            profile = _profile_by_id(ai_platform.default_gemini_settings(), GEMINI_PROFILE_ID)
+        if profile is None:
+            return
+        model_index = self.gemini_model_combo.findData(profile.model_id)
+        if model_index >= 0:
+            self.gemini_model_combo.setCurrentIndex(model_index)
+        reasoning = str(profile.options.get("reasoning_effort", "medium"))
+        reasoning_index = self.gemini_reasoning_combo.findText(reasoning)
+        self.gemini_reasoning_combo.setCurrentIndex(reasoning_index if reasoning_index >= 0 else 1)
 
     def _current_settings(self) -> ai_platform.AISettings | None:
         current_model = self.model_combo.currentData()
@@ -540,6 +631,29 @@ class AIProviderSettingsDialog(QDialog):
             routing=routing,
         )
 
+    def _current_gemini_settings(self) -> ai_platform.AISettings | None:
+        current_model = self.gemini_model_combo.currentData()
+        existing_gemini = _profile_by_id(self._loaded_settings, GEMINI_PROFILE_ID)
+        if current_model is None:
+            if existing_gemini is None:
+                return None
+            model_id = existing_gemini.model_id
+        else:
+            model_id = str(current_model)
+        reasoning = self.gemini_reasoning_combo.currentText() or "medium"
+        profile = ai_platform.AIProfile(
+            profile_id=GEMINI_PROFILE_ID,
+            provider_id=GEMINI_PROVIDER_ID,
+            model_id=str(model_id),
+            credential_ref=GEMINI_CREDENTIAL_REF,
+            options={"reasoning_effort": reasoning},
+        )
+        preserved_profiles = tuple(item for item in self._loaded_settings.profiles if item.profile_id != GEMINI_PROFILE_ID)
+        return ai_platform.AISettings(
+            profiles=preserved_profiles + (profile,),
+            routing=self._loaded_settings.routing,
+        )
+
     def _refresh_status(self) -> None:
         if self._settings_invalid:
             self.status_label.setText("AI settings are invalid.")
@@ -553,6 +667,20 @@ class AIProviderSettingsDialog(QDialog):
         else:
             self.key_edit.setPlaceholderText("Paste Groq API key")
             self.status_label.setText("Not configured")
+
+    def _refresh_gemini_status(self) -> None:
+        if self._settings_invalid:
+            self.gemini_status_label.setText("AI settings are invalid.")
+            return
+        if self._gemini_provider is None:
+            self.gemini_status_label.setText("Provider unavailable")
+            return
+        if self._credential_store.exists(GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF):
+            self.gemini_key_edit.setPlaceholderText("Key saved locally — leave blank to keep it")
+            self.gemini_status_label.setText("Configured — key saved locally")
+        else:
+            self.gemini_key_edit.setPlaceholderText("Paste Gemini API key")
+            self.gemini_status_label.setText("Not configured")
 
     def save_settings(self) -> None:
         if self._settings_invalid:
@@ -572,6 +700,24 @@ class AIProviderSettingsDialog(QDialog):
         self.key_edit.clear()
         self._refresh_status()
 
+    def save_gemini_settings(self) -> None:
+        if self._settings_invalid:
+            self.gemini_status_label.setText("AI settings are invalid.")
+            return
+        entered_key = self.gemini_key_edit.text()
+        try:
+            if entered_key.strip():
+                self._credential_store.write_secret(GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF, entered_key.strip())
+            settings = self._current_gemini_settings()
+            if settings is not None:
+                self._settings_store.save(settings)
+                self._loaded_settings = settings
+        except Exception:
+            self.gemini_status_label.setText("Save failed")
+            return
+        self.gemini_key_edit.clear()
+        self._refresh_gemini_status()
+
     def remove_key(self) -> None:
         answer = QMessageBox.question(
             self,
@@ -590,8 +736,26 @@ class AIProviderSettingsDialog(QDialog):
         self.key_edit.clear()
         self._refresh_status()
 
+    def remove_gemini_key(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Remove Gemini key?",
+            "Remove the locally saved Gemini API key?",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Ok:
+            return
+        try:
+            self._credential_store.delete_secret(GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF)
+        except Exception:
+            self.gemini_status_label.setText("Remove failed")
+            return
+        self.gemini_key_edit.clear()
+        self._refresh_gemini_status()
+
     def test_connection(self) -> None:
-        if self._test_in_progress:
+        if self._test_in_progress or self._gemini_test_in_progress:
             return
         if self._provider is None:
             self.status_label.setText("Provider unavailable")
@@ -609,6 +773,26 @@ class AIProviderSettingsDialog(QDialog):
             return asyncio.run(provider.test_connection(GROQ_CREDENTIAL_REF))
 
         self._start_worker(run_action, self._finish_test_connection)
+
+    def test_gemini_connection(self) -> None:
+        if self._gemini_test_in_progress or self._test_in_progress:
+            return
+        if self._gemini_provider is None:
+            self.gemini_status_label.setText("Provider unavailable")
+            return
+        if not self._credential_store.exists(GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF):
+            self.gemini_status_label.setText("No key saved")
+            return
+        self._set_gemini_testing_controls(True)
+        self.gemini_status_label.setText("Testing Gemini...")
+
+        def run_action() -> ai_platform.Availability:
+            provider = self._gemini_provider_factory(self._credential_store)
+            import asyncio
+
+            return asyncio.run(provider.test_connection(GEMINI_CREDENTIAL_REF))
+
+        self._start_worker(run_action, self._finish_gemini_test_connection)
 
     def _finish_test_connection(self, result: ActionResult) -> None:
         self._set_testing_controls(False)
@@ -631,35 +815,72 @@ class AIProviderSettingsDialog(QDialog):
         else:
             self.status_label.setText("Network unavailable")
 
+    def _finish_gemini_test_connection(self, result: ActionResult) -> None:
+        self._set_gemini_testing_controls(False)
+        self._set_availability_status(self.gemini_status_label, result)
+
+    def _set_availability_status(self, label: QLabel, result: ActionResult) -> None:
+        if not result.ok or not isinstance(result.value, ai_platform.Availability):
+            label.setText("Network unavailable")
+            return
+        availability = result.value
+        if availability.state == ai_platform.AvailabilityState.AVAILABLE:
+            label.setText("Connected")
+        elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_INVALID:
+            label.setText("Invalid API key")
+        elif availability.state == ai_platform.AvailabilityState.ACCESS_FORBIDDEN:
+            label.setText("Access forbidden")
+        elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_MISSING:
+            label.setText("No key saved")
+        elif "rate" in availability.message.lower() or "quota" in availability.message.lower():
+            label.setText("Rate limit / quota reached")
+        elif "unexpected" in availability.message.lower():
+            label.setText("Unexpected provider response")
+        else:
+            label.setText("Network unavailable")
+
     def _set_testing_controls(self, testing: bool) -> None:
         self._test_in_progress = testing
         self.test_button.setEnabled(not testing)
-        self.close_button.setEnabled(not testing)
+        self.gemini_test_button.setEnabled(not testing and not self._gemini_test_in_progress)
+        self.close_button.setEnabled(not testing and not self._gemini_test_in_progress)
         self.save_button.setEnabled(not testing and not self._settings_invalid)
         self.remove_button.setEnabled(not testing)
 
+    def _set_gemini_testing_controls(self, testing: bool) -> None:
+        self._gemini_test_in_progress = testing
+        self.gemini_test_button.setEnabled(not testing)
+        self.test_button.setEnabled(not testing and not self._test_in_progress)
+        self.close_button.setEnabled(not testing and not self._test_in_progress)
+        self.gemini_save_button.setEnabled(not testing and not self._settings_invalid)
+        self.gemini_remove_button.setEnabled(not testing)
+
     def closeEvent(self, event) -> None:
-        if self._test_in_progress:
+        if self._test_in_progress or self._gemini_test_in_progress:
             self.status_label.setText("Test connection is still in progress")
+            self.gemini_status_label.setText("Test connection is still in progress")
             event.ignore()
             return
         event.accept()
 
     def reject(self) -> None:
-        if self._test_in_progress:
+        if self._test_in_progress or self._gemini_test_in_progress:
             self.status_label.setText("Test connection is still in progress")
+            self.gemini_status_label.setText("Test connection is still in progress")
             return
         super().reject()
 
     def accept(self) -> None:
-        if self._test_in_progress:
+        if self._test_in_progress or self._gemini_test_in_progress:
             self.status_label.setText("Test connection is still in progress")
+            self.gemini_status_label.setText("Test connection is still in progress")
             return
         super().accept()
 
     def done(self, result: int) -> None:
-        if self._test_in_progress:
+        if self._test_in_progress or self._gemini_test_in_progress:
             self.status_label.setText("Test connection is still in progress")
+            self.gemini_status_label.setText("Test connection is still in progress")
             return
         super().done(result)
 

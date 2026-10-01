@@ -124,7 +124,7 @@ class AIMessage:
         if not _is_json_compatible(self.metadata):
             raise ValueError("metadata must be JSON-compatible.")
         object.__setattr__(self, "tool_calls", tool_calls)
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, "metadata", _json_freeze(_json_copy(dict(self.metadata))))
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -133,7 +133,7 @@ class AIMessage:
             "name": self.name,
             "tool_calls": [tool_call.public_dict() for tool_call in self.tool_calls],
             "tool_call_id": self.tool_call_id,
-            "metadata": dict(self.metadata),
+            "metadata": _json_thaw(self.metadata),
         }
 
 
@@ -142,6 +142,7 @@ class AIToolCall:
     tool_name: str
     arguments: Mapping[str, Any]
     call_id: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         _validate_identifier(self.tool_name, "tool_name")
@@ -149,13 +150,17 @@ class AIToolCall:
             _validate_identifier(self.call_id, "call_id")
         if not _is_json_compatible(self.arguments):
             raise ValueError("tool-call arguments must be JSON-compatible.")
+        if not _is_json_compatible(self.metadata):
+            raise ValueError("tool-call metadata must be JSON-compatible.")
         object.__setattr__(self, "arguments", MappingProxyType(dict(self.arguments)))
+        object.__setattr__(self, "metadata", _json_freeze(_json_copy(dict(self.metadata))))
 
     def public_dict(self) -> dict[str, Any]:
         return {
             "id": self.call_id,
             "tool_name": self.tool_name,
             "arguments": dict(self.arguments),
+            "metadata": _json_thaw(self.metadata),
         }
 
 
@@ -210,14 +215,14 @@ class AIResponse:
         if not _is_json_compatible(self.metadata):
             raise ValueError("metadata must be JSON-compatible.")
         object.__setattr__(self, "tool_calls", tool_calls)
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, "metadata", _json_freeze(_json_copy(dict(self.metadata))))
 
     def public_dict(self) -> dict[str, Any]:
         return {
             "content": self.content,
             "tool_calls": [tool_call.public_dict() for tool_call in self.tool_calls],
             "finish_reason": self.finish_reason,
-            "metadata": dict(self.metadata),
+            "metadata": _json_thaw(self.metadata),
         }
 
 
@@ -420,6 +425,17 @@ def default_groq_settings() -> AISettings:
             creative_profile_id="groq-default",
         ),
     )
+
+
+def default_gemini_settings() -> AISettings:
+    profile = AIProfile(
+        profile_id="gemini-default",
+        provider_id="gemini",
+        model_id="gemini-3.8-flash",
+        credential_ref="gemini-default",
+        options={"reasoning_effort": "medium"},
+    )
+    return AISettings(profiles=(profile,), routing=RoutingConfig())
 
 
 @dataclass(frozen=True)
@@ -730,3 +746,23 @@ def _is_json_compatible(value: Any) -> bool:
     if isinstance(value, Mapping):
         return all(isinstance(key, str) and _is_json_compatible(item) for key, item in value.items())
     return False
+
+
+def _json_copy(value: Any) -> Any:
+    return json.loads(json.dumps(_json_thaw(value)))
+
+
+def _json_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _json_freeze(item) for key, item in value.items()})
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(_json_freeze(item) for item in value)
+    return value
+
+
+def _json_thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_thaw(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_json_thaw(item) for item in value]
+    return value

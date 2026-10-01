@@ -30,6 +30,7 @@ def load_gui_module(data_root: Path):
         "admin_instance",
         "ai_platform",
         "ai_groq",
+        "ai_gemini",
     ):
         sys.modules.pop(module_name, None)
     return importlib.import_module("manager_gui")
@@ -42,6 +43,10 @@ def get_qapplication():
     if app is None:
         app = QApplication([])
     return app
+
+
+def _profile_by_id_for_test(settings, profile_id):
+    return next(profile for profile in settings.profiles if profile.profile_id == profile_id)
 
 
 @dataclass(frozen=True)
@@ -802,15 +807,17 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertIn("Config path:", details)
         self.assertNotIn("token", details.lower())
 
-    def make_ai_dialog(self, provider_factory=None):
+    def make_ai_dialog(self, provider_factory=None, gemini_provider_factory=None):
         ai_platform = self.manager_gui.ai_platform
         settings_store = ai_platform.AISettingsStore(Path(self.temp_dir.name) / "config" / "ai.json")
         credential_store = ai_platform.CredentialStore(Path(self.temp_dir.name) / "secrets" / "ai")
         provider_factory = provider_factory or self.fake_groq_provider_factory()
+        gemini_provider_factory = gemini_provider_factory or self.fake_gemini_provider_factory()
         dialog = self.manager_gui.AIProviderSettingsDialog(
             settings_store=settings_store,
             credential_store=credential_store,
             provider_factory=provider_factory,
+            gemini_provider_factory=gemini_provider_factory,
         )
         self.addCleanup(dialog.close)
         return dialog, settings_store, credential_store
@@ -835,6 +842,30 @@ class ManagerGuiTests(unittest.TestCase):
 
         return lambda credential_store: FakeProvider()
 
+    def fake_gemini_provider_factory(self, state=None):
+        ai_platform = self.manager_gui.ai_platform
+
+        class FakeProvider:
+            metadata = ai_platform.ProviderMetadata(
+                provider_id="gemini",
+                display_name="Google Gemini",
+                models=(
+                    ai_platform.ProviderModel(
+                        model_id="gemini-3.8-flash",
+                        display_name="Gemini 3.8 Flash",
+                    ),
+                    ai_platform.ProviderModel(
+                        model_id="gemini-3.5-flash-lite",
+                        display_name="Gemini 3.5 Flash Lite",
+                    ),
+                ),
+            )
+
+            async def test_connection(self, credential_ref):
+                return ai_platform.Availability(state or ai_platform.AvailabilityState.AVAILABLE, "SECRET must not show")
+
+        return lambda credential_store: FakeProvider()
+
     def test_ai_providers_button_exists_and_does_not_require_selection(self):
         window = self.make_window()
         self.assertEqual(window.ai_providers_button.text(), "AI Providers...")
@@ -845,6 +876,17 @@ class ManagerGuiTests(unittest.TestCase):
             window.open_ai_providers()
         dialog_class.assert_called_once()
         fake_dialog.exec.assert_called_once()
+
+    def test_ai_provider_dialog_has_groq_and_gemini_tabs(self):
+        dialog, _, _ = self.make_ai_dialog()
+
+        labels = [dialog.provider_tabs.tabText(index) for index in range(dialog.provider_tabs.count())]
+
+        self.assertIn("Groq", labels)
+        self.assertIn("Gemini", labels)
+        self.assertEqual(dialog.gemini_model_combo.currentData(), "gemini-3.8-flash")
+        self.assertEqual(dialog.gemini_key_edit.text(), "")
+        self.assertEqual(dialog.gemini_key_edit.placeholderText(), "Paste Gemini API key")
 
     def test_ai_provider_dialog_secret_save_preserve_remove_and_settings(self):
         dialog, settings_store, credential_store = self.make_ai_dialog()
@@ -864,6 +906,8 @@ class ManagerGuiTests(unittest.TestCase):
 
         reopened, _, same_store = self.make_ai_dialog()
         self.assertEqual(reopened.key_edit.text(), "")
+        self.assertEqual(reopened.status_label.text(), "Configured — key saved locally")
+        self.assertEqual(reopened.key_edit.placeholderText(), "Key saved locally — leave blank to keep it")
         self.assertIn("Configured", reopened.status_label.text())
         self.assertIn("key saved locally", reopened.status_label.text())
         self.assertIn("leave blank to keep it", reopened.key_edit.placeholderText())
@@ -911,6 +955,79 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertEqual(loaded.routing.planner_profile_id, "openrouter-test")
         self.assertEqual(loaded.routing.creative_profile_id, "gemini-default")
 
+    def test_gemini_secret_save_preserve_remove_and_settings(self):
+        dialog, settings_store, credential_store = self.make_ai_dialog()
+        self.assertEqual(dialog.gemini_key_edit.echoMode(), self.manager_gui.QLineEdit.Password)
+        self.assertEqual(dialog.gemini_key_edit.text(), "")
+        self.assertEqual(dialog.gemini_model_combo.currentData(), "gemini-3.8-flash")
+
+        dialog.gemini_key_edit.setText("  GEMINI_SECRET\n")
+        dialog.gemini_reasoning_combo.setCurrentText("high")
+        dialog.save_gemini_settings()
+        self.assertEqual(dialog.gemini_key_edit.text(), "")
+        self.assertEqual(credential_store.read_secret("gemini", "gemini-default"), "GEMINI_SECRET")
+        settings_text = settings_store.path.read_text(encoding="utf-8")
+        self.assertIn("gemini-default", settings_text)
+        self.assertIn("gemini-3.8-flash", settings_text)
+        self.assertIn('"reasoning_effort": "high"', settings_text)
+        self.assertNotIn("GEMINI_SECRET", settings_text)
+
+        reopened, _, same_store = self.make_ai_dialog()
+        self.assertEqual(reopened.gemini_key_edit.text(), "")
+        self.assertEqual(reopened.gemini_status_label.text(), "Configured — key saved locally")
+        self.assertEqual(reopened.gemini_key_edit.placeholderText(), "Key saved locally — leave blank to keep it")
+        self.assertIn("Configured", reopened.gemini_status_label.text())
+        self.assertIn("leave blank to keep it", reopened.gemini_key_edit.placeholderText())
+        reopened.save_gemini_settings()
+        self.assertEqual(same_store.read_secret("gemini", "gemini-default"), "GEMINI_SECRET")
+        self.assertNotIn("GEMINI_SECRET", reopened.gemini_status_label.text())
+        self.assertNotIn("GEMINI_SECRET", reopened.gemini_key_edit.placeholderText())
+
+        reopened.gemini_show_key_checkbox.setChecked(True)
+        self.assertEqual(reopened.gemini_key_edit.echoMode(), self.manager_gui.QLineEdit.Normal)
+        reopened.gemini_show_key_checkbox.setChecked(False)
+        self.assertEqual(reopened.gemini_key_edit.echoMode(), self.manager_gui.QLineEdit.Password)
+
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok):
+            reopened.remove_gemini_key()
+        self.assertFalse(same_store.exists("gemini", "gemini-default"))
+        self.assertEqual(reopened.gemini_key_edit.placeholderText(), "Paste Gemini API key")
+
+    def test_gemini_save_preserves_groq_profiles_and_existing_routing(self):
+        dialog, settings_store, credential_store = self.make_ai_dialog()
+        ai_platform = self.manager_gui.ai_platform
+        existing = ai_platform.AISettings(
+            profiles=(
+                ai_platform.AIProfile("groq-default", "groq", "openai/gpt-oss-120b", "groq-default"),
+                ai_platform.AIProfile("openrouter-test", "openrouter", "openrouter-model"),
+            ),
+            routing=ai_platform.RoutingConfig(
+                routine_profile_id="groq-default",
+                planner_profile_id="openrouter-test",
+                creative_profile_id="groq-default",
+            ),
+        )
+        settings_store.save(existing)
+
+        dialog.close()
+        dialog = self.manager_gui.AIProviderSettingsDialog(
+            settings_store=settings_store,
+            credential_store=credential_store,
+            provider_factory=self.fake_groq_provider_factory(),
+            gemini_provider_factory=self.fake_gemini_provider_factory(),
+        )
+        self.addCleanup(dialog.close)
+        dialog.gemini_reasoning_combo.setCurrentText("low")
+        dialog.save_gemini_settings()
+
+        loaded = settings_store.load()
+        profile_ids = {profile.profile_id for profile in loaded.profiles}
+        self.assertEqual(profile_ids, {"groq-default", "openrouter-test", "gemini-default"})
+        self.assertEqual(loaded.routing.routine_profile_id, "groq-default")
+        self.assertEqual(loaded.routing.planner_profile_id, "openrouter-test")
+        self.assertEqual(loaded.routing.creative_profile_id, "groq-default")
+        self.assertEqual(_profile_by_id_for_test(loaded, "gemini-default").options["reasoning_effort"], "low")
+
     def test_ai_provider_malformed_settings_not_overwritten_by_save(self):
         dialog, settings_store, _credential_store = self.make_ai_dialog()
         dialog.close()
@@ -935,6 +1052,13 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertIn("Provider unavailable", dialog.status_label.text())
         self.assertFalse(dialog.test_button.isEnabled())
 
+    def test_gemini_provider_unavailable_is_contained(self):
+        dialog, _, _ = self.make_ai_dialog(
+            gemini_provider_factory=lambda _store: (_ for _ in ()).throw(RuntimeError("boom SECRET"))
+        )
+        self.assertIn("Provider unavailable", dialog.gemini_status_label.text())
+        self.assertFalse(dialog.gemini_test_button.isEnabled())
+
     def test_ai_provider_test_connection_uses_worker_and_sanitized_status(self):
         dialog, _, credential_store = self.make_ai_dialog()
         credential_store.write_secret("groq", "groq-default", "SECRET_KEY")
@@ -944,6 +1068,16 @@ class ManagerGuiTests(unittest.TestCase):
         self.wait_until(lambda: dialog.status_label.text() == "Connected")
         self.assertTrue(dialog.test_button.isEnabled())
         self.assertNotIn("SECRET_KEY", dialog.status_label.text())
+
+    def test_gemini_test_connection_uses_worker_and_sanitized_status(self):
+        dialog, _, credential_store = self.make_ai_dialog()
+        credential_store.write_secret("gemini", "gemini-default", "GEMINI_SECRET")
+        dialog.test_gemini_connection()
+        self.assertFalse(dialog.gemini_test_button.isEnabled())
+        self.assertEqual(dialog.gemini_status_label.text(), "Testing Gemini...")
+        self.wait_until(lambda: dialog.gemini_status_label.text() == "Connected")
+        self.assertTrue(dialog.gemini_test_button.isEnabled())
+        self.assertNotIn("GEMINI_SECRET", dialog.gemini_status_label.text())
 
     def test_ai_provider_status_mapping_is_sanitized(self):
         ai_platform = self.manager_gui.ai_platform
@@ -966,6 +1100,28 @@ class ManagerGuiTests(unittest.TestCase):
                 )
                 self.assertEqual(dialog.status_label.text(), expected)
                 self.assertNotIn("SECRET", dialog.status_label.text())
+
+    def test_gemini_provider_status_mapping_is_sanitized(self):
+        ai_platform = self.manager_gui.ai_platform
+        cases = [
+            (ai_platform.AvailabilityState.CREDENTIAL_INVALID, "Invalid API key"),
+            (ai_platform.AvailabilityState.ACCESS_FORBIDDEN, "Access forbidden"),
+            (ai_platform.AvailabilityState.CREDENTIAL_MISSING, "No key saved"),
+            (ai_platform.AvailabilityState.UNAVAILABLE, "Rate limit / quota reached", "quota"),
+            (ai_platform.AvailabilityState.UNAVAILABLE, "Unexpected provider response", "unexpected"),
+            (ai_platform.AvailabilityState.UNAVAILABLE, "Network unavailable", "plain unavailable"),
+        ]
+        for case in cases:
+            state = case[0]
+            expected = case[1]
+            message = case[2] if len(case) > 2 else "SECRET must not show"
+            with self.subTest(expected=expected):
+                dialog, _, _ = self.make_ai_dialog()
+                dialog._finish_gemini_test_connection(
+                    self.manager_gui.ActionResult(True, "OK", ai_platform.Availability(state, message))
+                )
+                self.assertEqual(dialog.gemini_status_label.text(), expected)
+                self.assertNotIn("SECRET", dialog.gemini_status_label.text())
 
     def test_ai_provider_close_rejected_while_test_in_progress(self):
         dialog, _, _ = self.make_ai_dialog()
@@ -1003,6 +1159,33 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertTrue(event.accepted)
         dialog.reject()
         self.assertEqual(dialog.result(), self.manager_gui.QDialog.Rejected)
+
+    def test_gemini_close_rejected_while_test_in_progress(self):
+        dialog, _, _ = self.make_ai_dialog()
+
+        class FakeEvent:
+            def __init__(self):
+                self.accepted = False
+                self.ignored = False
+
+            def accept(self):
+                self.accepted = True
+
+            def ignore(self):
+                self.ignored = True
+
+        dialog._set_gemini_testing_controls(True)
+        event = FakeEvent()
+        dialog.closeEvent(event)
+        self.assertTrue(event.ignored)
+        self.assertFalse(event.accepted)
+        self.assertIn("still in progress", dialog.gemini_status_label.text())
+        dialog.reject()
+        self.assertEqual(dialog.result(), 0)
+        dialog._set_gemini_testing_controls(False)
+        event = FakeEvent()
+        dialog.closeEvent(event)
+        self.assertTrue(event.accepted)
 
 
 if __name__ == "__main__":
