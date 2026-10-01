@@ -188,7 +188,7 @@ No Groq request occurs on import, provider construction, registry construction, 
 
 Groq tool calls are data until a later orchestrator phase validates, plans, confirms, and executes them. AI-2B does not execute Admin Tools, mutate Discord, decide confirmation policy, write bot config, or route task classes. Groq built-in browser search, code execution, remote MCP, and provider-hosted tool execution are not enabled.
 
-For `openai/gpt-oss-120b`, DarkAbyss uses `reasoning_effort` (`low`, `medium`, `high`) and requests `include_reasoning = false` when sending local function tool schemas. DarkAbyss must not expose model chain-of-thought/reasoning in responses, Manager UI, Discord, logs, or audit output.
+For `openai/gpt-oss-120b`, DarkAbyss uses `reasoning_effort` (`low`, `medium`, `high`) and requests `include_reasoning = false` when sending local function tool schemas. DarkAbyss must not expose model chain-of-thought/reasoning in responses, Manager UI, Discord, logs, or audit output. AI-2B also applies a conservative local `max_completion_tokens <= 8192` safety/resource ceiling; this is a DarkAbyss limit, not a statement about the model's full provider-side maximum.
 
 The Manager `AI Providers...` dialog is device-local and global. It is not tied to the selected Discord Bot Instance and can be opened even when no bot is selected.
 

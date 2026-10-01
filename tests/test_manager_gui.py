@@ -959,11 +959,22 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertTrue(event.ignored)
         self.assertFalse(event.accepted)
         self.assertIn("still in progress", dialog.status_label.text())
+        self.assertTrue(dialog.isVisible() or dialog.result() == 0)
+
+        dialog.reject()
+        self.assertEqual(dialog.result(), 0)
+        self.assertIn("still in progress", dialog.status_label.text())
+
+        dialog.done(self.manager_gui.QDialog.Rejected)
+        self.assertEqual(dialog.result(), 0)
+        self.assertIn("still in progress", dialog.status_label.text())
 
         dialog._set_testing_controls(False)
         event = FakeEvent()
         dialog.closeEvent(event)
         self.assertTrue(event.accepted)
+        dialog.reject()
+        self.assertEqual(dialog.result(), self.manager_gui.QDialog.Rejected)
 
 
 if __name__ == "__main__":

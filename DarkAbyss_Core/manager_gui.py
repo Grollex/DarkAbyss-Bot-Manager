@@ -641,6 +641,24 @@ class AIProviderSettingsDialog(QDialog):
             return
         event.accept()
 
+    def reject(self) -> None:
+        if self._test_in_progress:
+            self.status_label.setText("Test connection is still in progress")
+            return
+        super().reject()
+
+    def accept(self) -> None:
+        if self._test_in_progress:
+            self.status_label.setText("Test connection is still in progress")
+            return
+        super().accept()
+
+    def done(self, result: int) -> None:
+        if self._test_in_progress:
+            self.status_label.setText("Test connection is still in progress")
+            return
+        super().done(result)
+
     def _start_worker(self, action: Callable[[], object], finished: Callable[[ActionResult], None]) -> None:
         thread = QThread(self)
         worker = _ActionWorker(action)

@@ -112,7 +112,7 @@ class AIMessage:
             _validate_identifier(self.tool_call_id, "tool_call_id")
         if self.role is MessageRole.TOOL and not self.tool_call_id:
             raise ValueError("tool message requires tool_call_id.")
-        if self.role in {MessageRole.USER, MessageRole.SYSTEM} and self.tool_call_id is not None:
+        if self.role is not MessageRole.TOOL and self.tool_call_id is not None:
             raise ValueError("tool_call_id is only valid for tool messages.")
         if self.role is not MessageRole.ASSISTANT and tool_calls:
             raise ValueError("tool_calls are only valid for assistant messages.")

@@ -378,6 +378,10 @@ class AIPlatformFoundationTests(unittest.TestCase):
             ai_platform.AIMessage(role="tool", content="{}")
         with self.assertRaisesRegex(ValueError, "tool_call_id"):
             ai_platform.AIMessage(role="user", content="hello", tool_call_id="call-1")
+        with self.assertRaisesRegex(ValueError, "tool_call_id"):
+            ai_platform.AIMessage(role="system", content="hello", tool_call_id="call-1")
+        with self.assertRaisesRegex(ValueError, "tool_call_id"):
+            ai_platform.AIMessage(role="assistant", content="hello", tool_call_id="call-1")
         with self.assertRaisesRegex(ValueError, "tool_calls"):
             ai_platform.AIMessage(
                 role="user",
