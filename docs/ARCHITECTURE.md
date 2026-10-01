@@ -100,6 +100,127 @@ Startup resolves an immutable Admin runtime context:
 
 The lock file is instance-specific, so `admin-main` and `admin-second` do not block each other. Two processes using the same instance are still prevented from running simultaneously.
 
+## AI Administration Tool Layer
+
+AI-1 introduces a transport-neutral Admin Tool Layer in:
+
+```text
+DarkAbyss_Core/admin_tools.py
+```
+
+The intended future flow is:
+
+```text
+User request
+    -> Manager GUI or Discord transport
+    -> future AI Orchestrator
+    -> Admin Tool Layer
+    -> Discord API
+```
+
+AI provider integration is not implemented in AI-1. There is no Gemini, Groq, OpenRouter, `/ai` command, dedicated AI control channel, Manager AI chat, API key storage, or cross-device locking in this phase.
+
+The Admin Tool Layer is the safe capability boundary:
+
+- AI will only be able to request registered tools.
+- Provider-facing tool arguments are JSON-safe primitives and objects validated against provider-neutral JSON Schema. Discord snowflakes are represented as decimal strings to avoid JSON integer precision ambiguity.
+- Program code owns tool names, argument validation, and risk classification.
+- Program code determines whether a tool is read-only, normal write, or destructive.
+- `discord.py` objects such as members, roles, text channels, and voice channels are resolved internally by the tool layer from validated IDs. They never come from a model/provider request.
+- Destructive confirmations will live above this layer in a later orchestrator/transport phase.
+- Discord message content, usernames, channel names, role names, and other server-provided content are untrusted data. They are not system instructions, authorization, tool definitions, confirmation, or permission to execute follow-up actions.
+- The AI tool path has no shell/system execution and no arbitrary Python/code execution. It only calls explicit Discord admin capabilities registered in `admin_tools.py`.
+- The schemas are intended for future Groq, Gemini, and OpenRouter tool-calling integration without provider-specific code inside `admin_tools.py`. Those providers are not implemented yet.
+
+`Admin.py` still owns Discord bot startup, slash-command wiring, Discord-specific responses, and audit routing. Existing `/execute` behavior delegates to the Admin Tool Layer but keeps its current access policy and presentation.
+
+Future transports may include:
+
+- `/ai` in any Discord channel for explicitly whitelisted actors.
+- A dedicated configured AI control channel.
+- Manager GUI AI chat.
+
+These transports do not exist yet.
+
+## Optional AI Platform Principle
+
+AI is optional. DarkAbyss Core must function with:
+
+- zero AI providers configured
+- zero AI API keys
+- no available AI network service
+
+Without AI configuration:
+
+- Manager must still work.
+- Bot lifecycle must still work.
+- `/execute` must still work.
+- Admin Tool Layer must still work.
+- Updates, config, and logs must still work.
+
+AI features should report a clear unavailable/not-configured state instead of crashing the application. Future provider failures must be isolated to AI requests. No provider is a startup dependency, and the application must not perform provider network checks automatically at startup. Provider-specific modules and dependencies should be isolated and lazy where practical.
+
+Conceptual future architecture:
+
+```text
+CORE
+    Manager
+    Admin Bot
+    Admin Tool Layer
+
+OPTIONAL AI ACCESSORY BUS
+    Provider Registry
+    Credential Profiles
+    AI Profiles
+    Task Router
+    Orchestrator
+    Compare/Fallback
+```
+
+Provider choice and task class are independent. The task complexity classes are:
+
+- `DIRECT`
+- `ROUTINE`
+- `PLANNER`
+- `CREATIVE`
+
+Tool risk remains separate:
+
+- `READ`
+- `NORMAL`
+- `DESTRUCTIVE`
+
+Routing should eventually allow:
+
+- `ROUTINE` -> selected AI profile
+- `PLANNER` -> selected AI profile
+- `CREATIVE` -> selected AI profile
+
+The system must not hardcode provider roles such as "Gemini = routine" or "Groq = planner". Those assignments are user-selectable.
+
+Future user controls should allow:
+
+- automatic routing
+- manual provider/profile override per request
+- comparing multiple profiles on one request
+- selecting one generated plan
+
+Compare mode is plan-only until the user chooses a plan. A fallback-generated destructive plan requires fresh review/confirmation if it differs from the original plan or comes from another provider.
+
+Current AI roadmap:
+
+- AI-2A: provider-neutral AI platform foundation: provider interface/registry, credential references, AI profiles, routing configuration, and availability states. Zero configured providers is a valid normal state.
+- AI-2B: Groq adapter.
+- AI-2C: Gemini adapter.
+- Later optional: OpenRouter adapter.
+- AI-3: Orchestrator, routing, manual override, fallback, compare mode, and confirmation policy.
+- AI-4: `/ai` explicit-whitelist Discord command.
+- AI-5: dedicated AI control channel.
+- AI-6: Manager GUI AI chat.
+- AI-7: richer admin/design capabilities.
+
+Local inference is not part of the current core roadmap. It may only be added much later as another optional adapter.
+
 ## Phase 1 Migration
 
 Legacy Phase 1 sources:

@@ -1,7 +1,7 @@
 import argparse
 import msvcrt
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import admin_instance
+import admin_tools
 import app_paths
 import bot_registry
 import config_store
@@ -85,25 +86,11 @@ def load_token(runtime: AdminRuntime | None = None) -> str:
 
 
 def parse_snowflake(value: object, field_name: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f'"{field_name}" must be a numeric Discord ID.')
-
-    if isinstance(value, int):
-        snowflake = value
-    elif isinstance(value, str) and value.isdigit():
-        snowflake = int(value)
-    else:
-        raise ValueError(f'"{field_name}" must be a numeric Discord ID.')
-
-    if snowflake <= 0:
-        raise ValueError(f'"{field_name}" must be a positive Discord ID.')
-    return snowflake
+    return admin_tools.parse_snowflake(value, field_name)
 
 
 def parse_snowflake_list(value: object, field_name: str) -> list[int]:
-    if not isinstance(value, list):
-        raise ValueError(f'"{field_name}" must be a JSON array.')
-    return [parse_snowflake(item, field_name) for item in value]
+    return admin_tools.parse_snowflake_list(value, field_name)
 
 
 def validate_config(config: dict) -> dict:
@@ -163,16 +150,72 @@ def clip_discord_message(text: str, limit: int = 1900) -> str:
 def actor_has_access(interaction: discord.Interaction, config: dict) -> bool:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
+    return admin_tools.actor_has_access(interaction.user, config)
 
-    if config.get("allow_server_administrators") and interaction.user.guild_permissions.administrator:
-        return True
 
-    allowed_users = set(config.get("allowed_user_ids", []))
-    if interaction.user.id in allowed_users:
-        return True
+def _snowflake_argument(value: object | None) -> str | None:
+    if value is None:
+        return None
+    object_id = getattr(value, "id", None)
+    return str(object_id) if object_id is not None else None
 
-    allowed_roles = set(config.get("allowed_role_ids", []))
-    return any(role.id in allowed_roles for role in interaction.user.roles)
+
+def build_execute_tool_arguments(
+    *,
+    action_name: str,
+    member: Optional[discord.Member],
+    user_id: Optional[str],
+    role: Optional[discord.Role],
+    channel: Optional[discord.TextChannel],
+    voice_channel: Optional[discord.VoiceChannel],
+    name: Optional[str],
+    reason: str,
+    count: Optional[int],
+    duration_minutes: Optional[int],
+    content: Optional[str],
+) -> dict[str, object]:
+    arguments: dict[str, object] = {"reason": reason}
+
+    if action_name in {"send_message", "purge_messages", "lock_channel", "unlock_channel"}:
+        selected_channel = voice_channel if action_name in {"lock_channel", "unlock_channel"} and voice_channel else channel
+        channel_id = _snowflake_argument(selected_channel)
+        if channel_id is not None:
+            arguments["channel_id"] = channel_id
+
+    if action_name in {"rename_channel", "delete_channel"}:
+        if channel is not None and voice_channel is not None:
+            raise ValueError(f"{action_name} requires only one of channel or voice_channel.")
+        selected_channel = channel or voice_channel
+        channel_id = _snowflake_argument(selected_channel)
+        if channel_id is not None:
+            arguments["channel_id"] = channel_id
+
+    if action_name in {"timeout_member", "clear_timeout", "kick_member", "ban_member", "add_role", "remove_role"}:
+        member_id = _snowflake_argument(member)
+        if member_id is not None:
+            arguments["member_id"] = member_id
+
+    if action_name in {"add_role", "remove_role", "delete_role"}:
+        role_id = _snowflake_argument(role)
+        if role_id is not None:
+            arguments["role_id"] = role_id
+
+    if action_name == "unban_user" and user_id is not None:
+        arguments["user_id"] = user_id
+
+    if action_name in {"create_text_channel", "create_voice_channel", "rename_channel", "create_role"} and name is not None:
+        arguments["name"] = name
+
+    if action_name == "send_message" and content is not None:
+        arguments["content"] = content
+
+    if action_name == "purge_messages" and count is not None:
+        arguments["count"] = count
+
+    if action_name == "timeout_member" and duration_minutes is not None:
+        arguments["duration_minutes"] = duration_minutes
+
+    return arguments
 
 
 async def send_audit(
@@ -226,23 +269,8 @@ bot = AdminBot()
 
 
 ACTION_CHOICES = [
-    app_commands.Choice(name="send_message", value="send_message"),
-    app_commands.Choice(name="purge_messages", value="purge_messages"),
-    app_commands.Choice(name="timeout_member", value="timeout_member"),
-    app_commands.Choice(name="clear_timeout", value="clear_timeout"),
-    app_commands.Choice(name="kick_member", value="kick_member"),
-    app_commands.Choice(name="ban_member", value="ban_member"),
-    app_commands.Choice(name="unban_user", value="unban_user"),
-    app_commands.Choice(name="add_role", value="add_role"),
-    app_commands.Choice(name="remove_role", value="remove_role"),
-    app_commands.Choice(name="create_text_channel", value="create_text_channel"),
-    app_commands.Choice(name="create_voice_channel", value="create_voice_channel"),
-    app_commands.Choice(name="rename_channel", value="rename_channel"),
-    app_commands.Choice(name="delete_channel", value="delete_channel"),
-    app_commands.Choice(name="create_role", value="create_role"),
-    app_commands.Choice(name="delete_role", value="delete_role"),
-    app_commands.Choice(name="lock_channel", value="lock_channel"),
-    app_commands.Choice(name="unlock_channel", value="unlock_channel"),
+    app_commands.Choice(name=name, value=name)
+    for name in admin_tools.EXECUTE_TOOL_NAMES
 ]
 
 
@@ -292,12 +320,16 @@ async def execute(
     await interaction.response.defer(ephemeral=True)
     action_name = action.value
     reason_text = reason or f"Requested by {interaction.user} via /execute"
-    action_succeeded = False
-
+    context = admin_tools.AdminToolContext(
+        guild=interaction.guild,
+        fetch_user=bot.fetch_user,
+        source="/execute",
+        requesting_user_id=interaction.user.id,
+        requesting_user_name=str(interaction.user),
+    )
     try:
-        result = await run_discord_action(
-            interaction=interaction,
-            action=action_name,
+        arguments = build_execute_tool_arguments(
+            action_name=action_name,
             member=member,
             user_id=user_id,
             role=role,
@@ -309,171 +341,17 @@ async def execute(
             duration_minutes=duration_minutes,
             content=content,
         )
-        action_succeeded = True
-    except discord.Forbidden:
-        result = "Discord refused the action. Check the bot role position and permissions."
-    except discord.HTTPException as exc:
-        result = f"Discord API error: {exc}"
     except ValueError as exc:
-        result = str(exc)
-    except Exception as exc:
-        result = f"Unexpected error: {type(exc).__name__}: {exc}"
+        tool_result = admin_tools.ToolResult(False, action_name, str(exc))
+    else:
+        tool_result = await admin_tools.execute_tool(context, action_name, arguments)
+    result = tool_result.message
 
     audit_failure = await send_audit(interaction, config, action_name, result)
-    if action_succeeded and audit_failure:
+    if tool_result.ok and audit_failure:
         result = f"{result}\n\nAction completed, but audit logging failed."
 
     await interaction.followup.send(clip_discord_message(result), ephemeral=True)
-
-
-async def run_discord_action(
-    *,
-    interaction: discord.Interaction,
-    action: str,
-    member: Optional[discord.Member],
-    user_id: Optional[str],
-    role: Optional[discord.Role],
-    channel: Optional[discord.TextChannel],
-    voice_channel: Optional[discord.VoiceChannel],
-    name: Optional[str],
-    reason: str,
-    count: Optional[int],
-    duration_minutes: Optional[int],
-    content: Optional[str],
-) -> str:
-    guild = interaction.guild
-    if guild is None:
-        raise ValueError("Guild is required.")
-
-    if action == "send_message":
-        if channel is None or not content:
-            raise ValueError("send_message requires channel and content.")
-        await channel.send(content)
-        return f"Message sent to #{channel.name}."
-
-    if action == "purge_messages":
-        if channel is None:
-            raise ValueError("purge_messages requires channel.")
-        deleted = await channel.purge(limit=count or 10, reason=reason)
-        return f"Deleted {len(deleted)} messages from #{channel.name}."
-
-    if action == "timeout_member":
-        if member is None:
-            raise ValueError("timeout_member requires member.")
-        until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes or 10)
-        await member.timeout(until, reason=reason)
-        return f"Timed out {member} for {duration_minutes or 10} minutes."
-
-    if action == "clear_timeout":
-        if member is None:
-            raise ValueError("clear_timeout requires member.")
-        await member.timeout(None, reason=reason)
-        return f"Cleared timeout for {member}."
-
-    if action == "kick_member":
-        if member is None:
-            raise ValueError("kick_member requires member.")
-        await member.kick(reason=reason)
-        return f"Kicked {member}."
-
-    if action == "ban_member":
-        if member is None:
-            raise ValueError("ban_member requires member.")
-        await member.ban(reason=reason, delete_message_seconds=0)
-        return f"Banned {member}."
-
-    if action == "unban_user":
-        target_id = parse_snowflake(user_id, "user_id")
-        user = await bot.fetch_user(target_id)
-        await guild.unban(user, reason=reason)
-        return f"Unbanned {user}."
-
-    if action == "add_role":
-        if member is None or role is None:
-            raise ValueError("add_role requires member and role.")
-        await member.add_roles(role, reason=reason)
-        return f"Added role {role.name} to {member}."
-
-    if action == "remove_role":
-        if member is None or role is None:
-            raise ValueError("remove_role requires member and role.")
-        await member.remove_roles(role, reason=reason)
-        return f"Removed role {role.name} from {member}."
-
-    if action == "create_text_channel":
-        if not name:
-            raise ValueError("create_text_channel requires name.")
-        created = await guild.create_text_channel(name=name, reason=reason)
-        return f"Created text channel #{created.name}."
-
-    if action == "create_voice_channel":
-        if not name:
-            raise ValueError("create_voice_channel requires name.")
-        created = await guild.create_voice_channel(name=name, reason=reason)
-        return f"Created voice channel {created.name}."
-
-    if action == "rename_channel":
-        target_channel = select_channel(channel, voice_channel, "rename_channel")
-        if not name:
-            raise ValueError("rename_channel requires name.")
-        old_name = target_channel.name
-        await target_channel.edit(name=name, reason=reason)
-        return f"Renamed #{old_name} to #{name}."
-
-    if action == "delete_channel":
-        target_channel = select_channel(channel, voice_channel, "delete_channel")
-        channel_name = target_channel.name
-        await target_channel.delete(reason=reason)
-        return f"Deleted channel #{channel_name}."
-
-    if action == "create_role":
-        if not name:
-            raise ValueError("create_role requires name.")
-        created = await guild.create_role(name=name, reason=reason)
-        return f"Created role {created.name}."
-
-    if action == "delete_role":
-        if role is None:
-            raise ValueError("delete_role requires role.")
-        role_name = role.name
-        await role.delete(reason=reason)
-        return f"Deleted role {role_name}."
-
-    if action == "lock_channel":
-        if voice_channel is not None:
-            raise ValueError("lock_channel works only with text channel.")
-        if channel is None:
-            raise ValueError("lock_channel requires channel.")
-        overwrite = channel.overwrites_for(guild.default_role)
-        overwrite.send_messages = False
-        await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=reason)
-        return f"Locked #{channel.name} for @everyone."
-
-    if action == "unlock_channel":
-        if voice_channel is not None:
-            raise ValueError("unlock_channel works only with text channel.")
-        if channel is None:
-            raise ValueError("unlock_channel requires channel.")
-        overwrite = channel.overwrites_for(guild.default_role)
-        overwrite.send_messages = None
-        await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=reason)
-        return f"Unlocked #{channel.name} for @everyone."
-
-    raise ValueError(f"Unsupported action: {action}")
-
-
-def select_channel(
-    text_channel: Optional[discord.TextChannel],
-    voice_channel: Optional[discord.VoiceChannel],
-    action: str,
-) -> discord.TextChannel | discord.VoiceChannel:
-    if text_channel and voice_channel:
-        raise ValueError(f"{action} requires only one of channel or voice_channel.")
-    if text_channel:
-        return text_channel
-    if voice_channel:
-        return voice_channel
-    raise ValueError(f"{action} requires channel or voice_channel.")
 
 
 def main(argv: list[str] | None = None) -> int:
