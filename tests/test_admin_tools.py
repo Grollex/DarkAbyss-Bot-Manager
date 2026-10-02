@@ -220,6 +220,35 @@ class AdminToolRegistryTests(unittest.TestCase):
                 schema_text = json.dumps(definition.arguments)
                 self.assertFalse(any(token in schema_text for token in forbidden))
 
+    def test_provider_schema_and_validation_helpers_are_data_only(self):
+        admin_tools = load_admin_tools()
+        schema = admin_tools.get_provider_tool_schema("send_message")
+        self.assertEqual(schema["name"], "send_message")
+        self.assertIn("content", schema["arguments"]["properties"])
+        schema["arguments"]["properties"]["content"]["description"] = "mutated"
+        self.assertNotEqual(
+            admin_tools.get_provider_tool_schema("send_message")["arguments"]["properties"]["content"]["description"],
+            "mutated",
+        )
+
+        schemas = admin_tools.list_provider_tool_schemas(("list_channels", "send_message"))
+        self.assertEqual([item["name"] for item in schemas], ["list_channels", "send_message"])
+        json.dumps(schemas)
+
+        validated = admin_tools.validate_tool_arguments(
+            "send_message",
+            {"channel_id": "123", "content": "hello", "reason": None},
+        )
+        self.assertEqual(validated["channel_id"], "123")
+        with self.assertRaises(admin_tools.AdminToolError):
+            admin_tools.validate_tool_arguments("send_message", {"channel_id": "123", "content": "hello", "extra": "no"})
+        with self.assertRaises(admin_tools.AdminToolError):
+            admin_tools.validate_tool_arguments("send_message", {"content": "hello"})
+        with self.assertRaises(ValueError):
+            admin_tools.validate_tool_arguments("send_message", {"channel_id": "abc", "content": "hello"})
+        with self.assertRaises(admin_tools.AdminToolError):
+            admin_tools.get_provider_tool_schema("not_registered")
+
     def test_registry_and_handler_keys_match_exactly(self):
         admin_tools = load_admin_tools()
         self.assertEqual(set(admin_tools.TOOL_DEFINITIONS), set(admin_tools._TOOL_HANDLERS))

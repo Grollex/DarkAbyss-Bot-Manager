@@ -248,6 +248,54 @@ Current AI provider settings behavior:
 
 AI-3 will add the orchestrator loop that can interpret model plans/tool-call data, apply confirmation policy, and call the Admin Tool Layer when authorized. AI-2B/AI-2C only store settings, call providers explicitly, and parse model output into data.
 
+AI-3A adds the provider-neutral backend orchestrator core in `ai_orchestrator.py`. It is still an optional accessory: Manager, bot lifecycle, Kairo/Admin, `/execute`, config, logs, and updates remain operational with zero providers, missing credentials, invalid AI settings, provider import failures, offline networks, rejected keys, or exhausted quotas. The orchestrator performs no provider network calls during import, construction, registry construction, settings loading, routing, Manager startup, or bot startup. Network access is limited to explicit orchestration requests.
+
+The AI-3A orchestrator flow is:
+
+```text
+caller
+  -> OrchestratorRequest
+  -> TaskClass routing or configured-profile manual override
+  -> selected AIProfile
+  -> provider.generate(...)
+  -> final visible response OR validated Admin Tool plan
+  -> risk evaluation
+  -> optional confirmation
+  -> injected tool executor
+  -> provider-neutral TOOL results
+  -> same provider/profile continuation
+```
+
+Routing remains provider-neutral. `TaskClass` values (`DIRECT`, `ROUTINE`, `PLANNER`, `CREATIVE`) select configured profile IDs from `RoutingConfig`; `DIRECT` bypasses providers. Manual override selects a configured profile ID and does not accept raw provider/model/credential injection. Manual override does not fallback unless the caller explicitly opts in.
+
+`RoutingConfig` schema version 1 is backward-compatible and now supports explicit ordered fallback lists:
+
+- `routine_fallback_profile_ids`
+- `planner_fallback_profile_ids`
+- `creative_fallback_profile_ids`
+
+Missing fallback fields load as empty tuples. Fallbacks are never auto-populated and never hardcode provider roles such as "Groq = hard" or "Gemini = easy". Fallback happens only before any Admin Tool has executed. After any side effect, provider failure terminates the run safely with no provider switch.
+
+Admin Tool exposure uses data-only provider schemas from the authoritative Admin Tool Layer. Each schema contains only `name`, `description`, and JSON Schema `arguments`; no Discord objects, handlers, callables, contexts, secrets, or execution handles are exposed. Provider-returned tool calls are validated locally before confirmation or execution: unknown tools, disallowed tools, missing/unknown arguments, invalid snowflakes, duplicate/missing call IDs, and non-JSON-safe arguments are rejected without execution.
+
+Tool risk is derived only from `ToolDefinition.risk` and maps to provider-neutral `ToolRisk` (`READ`, `NORMAL`, `DESTRUCTIVE`). `TaskClass` never changes tool risk. A multi-tool batch uses the maximum risk in the batch, so `READ + DESTRUCTIVE` is gated as `DESTRUCTIVE` and no read call executes early.
+
+The default confirmation policy allows `READ` and `NORMAL` by default, can optionally confirm `NORMAL`, and always requires confirmation for `DESTRUCTIVE`. AI-3A has no option to disable destructive confirmation. Confirmation IDs are opaque, random, single-use, held only in memory, and tied to the exact stored profile/provider/model/tool order/arguments. Approval executes the stored immutable plan; callers cannot resubmit or edit tools or arguments. Rejection executes zero tools and invalidates the ID.
+
+Tool execution is injected through an async executor callback. The orchestrator does not construct Discord contexts, does not import Qt widgets, and does not call Discord interaction/message APIs. AI-4 will adapt Discord authorization and Admin Tool execution to this interface. Batches execute in exact model order and fail fast; already executed calls are reported, remaining calls are skipped, and no rollback or fallback is attempted after partial execution.
+
+Tool results are serialized into bounded JSON-safe provider `TOOL` messages with exact provider call IDs. Oversized or non-serializable results are replaced with safe bounded failure payloads. After successful tool execution, continuation uses the same selected provider/profile/model and appends the assistant response plus tool messages to history, preserving provider-neutral response metadata needed for Gemini/Groq continuation while never exposing hidden reasoning or opaque `thoughtSignature` values in public results.
+
+AI-3A also adds provider-neutral compare mode. Compare mode requires at least two distinct configured profile IDs, performs one generate call per selected profile with the same messages and tool schema set, uses no fallback, and executes zero Admin Tools before candidate selection. Candidates contain safe visible content, validated tool plan data, batch risk, or sanitized failure state. Selecting a candidate uses the exact stored candidate, does not re-query all providers, and then follows the normal execution/confirmation/tool-loop rules on the same selected provider/profile.
+
+AI-3A continuation state is explicit and bounded. Each orchestration fixes its tool allowlist from the original request (or compare request): `allowed_tool_names=None` keeps every registered Admin Tool available, `()` exposes zero tools, and an explicit list stays exactly that list across every tool round, confirmation resume, and selected compare continuation; provider schemas and local validation always use the same allowlist. The orchestrator SYSTEM instruction is inserted exactly once when raw caller messages become provider history; tool-loop continuation, confirmation resume, and compare-candidate continuation reuse that already-initialized history. `MAX_TOOL_ROUNDS` is a hard total cap for the selected-provider orchestration: every assistant response that yields a tool batch consumes one round, the counter is carried through confirmation pauses and compare selection, and at the cap the result is `LIMIT_REACHED` with no further execution or confirmation. The `ConfirmationPolicy` is also fixed run state: it is captured when `orchestrate()` or `select_compare_candidate()` starts and reused for every later round and confirmation resume. `approve_confirmation()` accepts only the confirmation ID, the approve/reject decision, and the executor; it cannot replace the policy, profile, provider, model, plan, arguments, order, or allowlist. `DESTRUCTIVE` gating is enforced independently of the policy object. Injected dependencies are honored by explicit `None` checks, so an explicitly supplied empty `ProviderRegistry()` stays empty and the default Groq/Gemini registry is created only when no registry is passed.
+
+Pre-AI-4 hardening fixes the remaining AI-3A safety contract. `approve_confirmation()` requires `approved` to be exactly `True` or `False`; any other value (strings, integers, `None`, containers), a non-string confirmation ID, or approval without a callable executor raises `ValueError` before pending state is touched, so invalid input neither authorizes, rejects, nor consumes the stored plan. `ConfirmationPolicy` is a fixed-semantics value object: only the exact type is accepted, `confirm_normal` must be a real `bool`, and the orchestrator evaluates risk without calling any overridable method (`READ` never, `NORMAL` iff `confirm_normal`, `DESTRUCTIVE` always). `ValidatedToolCall.arguments` are recursively copied and frozen (mappings become read-only mappings, lists/tuples become tuples, non-JSON values and non-finite numbers are rejected); `public_dict()` and every executor invocation receive fresh ordinary `dict`/`list` copies, so neither callers, providers, nor executors can alter a stored confirmation plan. Pending confirmations and compare results are in-memory only, bounded in count (`MAX_PENDING_CONFIRMATIONS`, `MAX_PENDING_COMPARES`), and expire after a TTL measured on a monotonic, injectable clock (`CONFIRMATION_TTL_SECONDS`, `COMPARE_TTL_SECONDS`). Expired entries are purged lazily on every create and lookup without background threads; an expired ID behaves like an unknown one and executes nothing. When a bound is reached new state is refused with a safe result (compare refuses before spending any provider request) rather than evicting other users' pending state. A single compare request is also bounded: `ComparePlanRequest` stores an immutable copy of 2 to `MAX_COMPARE_PROFILES` (4) distinct, valid profile IDs and a validated `ToolRisk`, and `compare_plans()` re-checks that bound on a snapshot of the IDs before any provider request, so even a tampered request cannot fan out into more provider calls. Malformed provider output (a non-`AIResponse` object, unexpected validation exceptions, over-long call IDs) and broken local registry/credential lookups are contained as provider-unavailable or `INVALID_TOOL_PLAN` results. Public diagnostic messages are length-bounded; transport-specific rendering such as Discord mention escaping and per-user confirmation ownership belongs to the AI-4 transport.
+
+Attempt history accumulates in routing order across the whole request: locally unavailable/skipped profiles (`UNAVAILABLE`), selections (`SELECTED`), and provider failures (`FAILED`) are all retained, so a fallback success still records why fallback happened. Attempt messages contain only safe text and exception type names, never raw exception strings, credentials, headers, or HTTP bodies. Unexpected exceptions raised by the injected tool executor are contained: the batch stops immediately, already-completed tool summaries are kept, the failing call is recorded as not successful, remaining calls are skipped, the result is `TOOL_EXECUTION_FAILED` with a safe message, and no fallback occurs.
+
+AI-3A deliberately adds no Discord AI surface. There is no `/ai`, no natural-message listener, no Message Content Intent, no Manager AI chat, and no AI access-policy reuse of `/execute` admin settings. AI-4 will add an explicit-whitelist Discord `/ai` transport around this backend.
+
 AI credentials are device-local and stored outside program versions, bot instance config, release artifacts, and the source tree:
 
 ```text

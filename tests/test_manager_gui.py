@@ -934,6 +934,9 @@ class ManagerGuiTests(unittest.TestCase):
                 routine_profile_id="gemini-default",
                 planner_profile_id="openrouter-test",
                 creative_profile_id="gemini-default",
+                routine_fallback_profile_ids=("openrouter-test",),
+                planner_fallback_profile_ids=("gemini-default",),
+                creative_fallback_profile_ids=("openrouter-test", "gemini-default"),
             ),
         )
         settings_store.save(existing)
@@ -954,6 +957,9 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertEqual(loaded.routing.routine_profile_id, "gemini-default")
         self.assertEqual(loaded.routing.planner_profile_id, "openrouter-test")
         self.assertEqual(loaded.routing.creative_profile_id, "gemini-default")
+        self.assertEqual(loaded.routing.routine_fallback_profile_ids, ("openrouter-test",))
+        self.assertEqual(loaded.routing.planner_fallback_profile_ids, ("gemini-default",))
+        self.assertEqual(loaded.routing.creative_fallback_profile_ids, ("openrouter-test", "gemini-default"))
 
     def test_gemini_secret_save_preserve_remove_and_settings(self):
         dialog, settings_store, credential_store = self.make_ai_dialog()
@@ -1005,6 +1011,9 @@ class ManagerGuiTests(unittest.TestCase):
                 routine_profile_id="groq-default",
                 planner_profile_id="openrouter-test",
                 creative_profile_id="groq-default",
+                routine_fallback_profile_ids=("openrouter-test",),
+                planner_fallback_profile_ids=("groq-default",),
+                creative_fallback_profile_ids=("openrouter-test", "groq-default"),
             ),
         )
         settings_store.save(existing)
@@ -1026,6 +1035,9 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertEqual(loaded.routing.routine_profile_id, "groq-default")
         self.assertEqual(loaded.routing.planner_profile_id, "openrouter-test")
         self.assertEqual(loaded.routing.creative_profile_id, "groq-default")
+        self.assertEqual(loaded.routing.routine_fallback_profile_ids, ("openrouter-test",))
+        self.assertEqual(loaded.routing.planner_fallback_profile_ids, ("groq-default",))
+        self.assertEqual(loaded.routing.creative_fallback_profile_ids, ("openrouter-test", "groq-default"))
         self.assertEqual(_profile_by_id_for_test(loaded, "gemini-default").options["reasoning_effort"], "low")
 
     def test_ai_provider_malformed_settings_not_overwritten_by_save(self):

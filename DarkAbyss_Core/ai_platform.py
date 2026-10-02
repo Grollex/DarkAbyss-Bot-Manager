@@ -13,6 +13,9 @@ from typing import Any, Mapping, Protocol, Sequence
 import app_paths
 
 
+# Hard DarkAbyss cost/resource limit: one compare request may query at most
+# this many profiles (one provider request each).
+MAX_COMPARE_PROFILES = 4
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 DEFAULT_CREDENTIALS_ROOT = app_paths.DATA_ROOT / "secrets" / "ai"
 
@@ -361,6 +364,9 @@ class AISettings:
                 "routine_profile_id": self.routing.routine_profile_id,
                 "planner_profile_id": self.routing.planner_profile_id,
                 "creative_profile_id": self.routing.creative_profile_id,
+                "routine_fallback_profile_ids": list(self.routing.routine_fallback_profile_ids),
+                "planner_fallback_profile_ids": list(self.routing.planner_fallback_profile_ids),
+                "creative_fallback_profile_ids": list(self.routing.creative_fallback_profile_ids),
             },
         }
 
@@ -386,6 +392,18 @@ class AISettingsStore:
                 routine_profile_id=_optional_identifier(routing_raw.get("routine_profile_id"), "routine_profile_id"),
                 planner_profile_id=_optional_identifier(routing_raw.get("planner_profile_id"), "planner_profile_id"),
                 creative_profile_id=_optional_identifier(routing_raw.get("creative_profile_id"), "creative_profile_id"),
+                routine_fallback_profile_ids=_identifier_tuple(
+                    routing_raw.get("routine_fallback_profile_ids", ()),
+                    "routine_fallback_profile_ids",
+                ),
+                planner_fallback_profile_ids=_identifier_tuple(
+                    routing_raw.get("planner_fallback_profile_ids", ()),
+                    "planner_fallback_profile_ids",
+                ),
+                creative_fallback_profile_ids=_identifier_tuple(
+                    routing_raw.get("creative_fallback_profile_ids", ()),
+                    "creative_fallback_profile_ids",
+                ),
             )
             return AISettings(schema_version=1, profiles=profiles, routing=routing)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -443,6 +461,26 @@ class RoutingConfig:
     routine_profile_id: str | None = None
     planner_profile_id: str | None = None
     creative_profile_id: str | None = None
+    routine_fallback_profile_ids: tuple[str, ...] = ()
+    planner_fallback_profile_ids: tuple[str, ...] = ()
+    creative_fallback_profile_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "routine_fallback_profile_ids",
+            _coerce_identifier_tuple(self.routine_fallback_profile_ids, "routine_fallback_profile_ids"),
+        )
+        object.__setattr__(
+            self,
+            "planner_fallback_profile_ids",
+            _coerce_identifier_tuple(self.planner_fallback_profile_ids, "planner_fallback_profile_ids"),
+        )
+        object.__setattr__(
+            self,
+            "creative_fallback_profile_ids",
+            _coerce_identifier_tuple(self.creative_fallback_profile_ids, "creative_fallback_profile_ids"),
+        )
 
     def profile_for(self, task_class: TaskClass) -> str | None:
         selected = _coerce_task_class(task_class)
@@ -454,6 +492,18 @@ class RoutingConfig:
             return self.planner_profile_id
         if selected is TaskClass.CREATIVE:
             return self.creative_profile_id
+        raise AIPlatformError(f"Unsupported task class: {task_class}")
+
+    def fallback_profiles_for(self, task_class: TaskClass) -> tuple[str, ...]:
+        selected = _coerce_task_class(task_class)
+        if selected is TaskClass.DIRECT:
+            return ()
+        if selected is TaskClass.ROUTINE:
+            return self.routine_fallback_profile_ids
+        if selected is TaskClass.PLANNER:
+            return self.planner_fallback_profile_ids
+        if selected is TaskClass.CREATIVE:
+            return self.creative_fallback_profile_ids
         raise AIPlatformError(f"Unsupported task class: {task_class}")
 
 
@@ -476,12 +526,21 @@ class ComparePlanRequest:
     tool_risk: ToolRisk
 
     def __post_init__(self) -> None:
-        if len(self.profile_ids) < 2:
+        raw_ids = self.profile_ids
+        if isinstance(raw_ids, (str, bytes, bytearray)) or not isinstance(raw_ids, Sequence):
+            raise ValueError("profile_ids must be a sequence of profile IDs.")
+        # Store a NEW tuple so later mutation of a caller-owned list has no effect.
+        profile_ids = tuple(raw_ids)
+        object.__setattr__(self, "profile_ids", profile_ids)
+        if len(profile_ids) < 2:
             raise ValueError("profile_ids must contain at least two profiles.")
-        if len(set(self.profile_ids)) != len(self.profile_ids):
-            raise ValueError("profile_ids must be distinct.")
-        for profile_id in self.profile_ids:
+        if len(profile_ids) > MAX_COMPARE_PROFILES:
+            raise ValueError(f"profile_ids must contain at most {MAX_COMPARE_PROFILES} profiles.")
+        for profile_id in profile_ids:
             _validate_identifier(profile_id, "profile_id")
+        if len(set(profile_ids)) != len(profile_ids):
+            raise ValueError("profile_ids must be distinct.")
+        object.__setattr__(self, "tool_risk", _coerce_tool_risk(self.tool_risk))
 
 
 class ProviderRegistry:
@@ -679,6 +738,17 @@ def _coerce_task_class(task_class: TaskClass | str) -> TaskClass:
         raise AIPlatformError(f"Unsupported task class: {task_class}") from exc
 
 
+def _coerce_tool_risk(risk: ToolRisk | str) -> ToolRisk:
+    if isinstance(risk, ToolRisk):
+        return risk
+    if not isinstance(risk, str):
+        raise ValueError("tool_risk must be a ToolRisk.")
+    try:
+        return ToolRisk(risk)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported tool risk: {risk[:40]}") from exc
+
+
 def _coerce_message_role(role: MessageRole | str) -> MessageRole:
     if isinstance(role, MessageRole):
         return role
@@ -715,6 +785,21 @@ def _optional_identifier(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
     return _required_identifier(value, field_name)
+
+
+def _identifier_tuple(value: Any, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        raise ValueError(f"{field_name} must be an array.")
+    return _coerce_identifier_tuple(tuple(value), field_name)
+
+
+def _coerce_identifier_tuple(value: Any, field_name: str) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        raise ValueError(f"{field_name} must be an array.")
+    items = tuple(_required_identifier(item, field_name) for item in value)
+    if len(set(items)) != len(items):
+        raise ValueError(f"{field_name} must not contain duplicates.")
+    return items
 
 
 def _required_string(value: Any, field_name: str) -> str:

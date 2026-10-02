@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Literal
@@ -389,6 +390,24 @@ def get_tool_definition(name: str) -> ToolDefinition:
 
 def list_tool_definitions() -> tuple[ToolDefinition, ...]:
     return tuple(TOOL_DEFINITIONS[name] for name in sorted(TOOL_DEFINITIONS))
+
+
+def get_provider_tool_schema(name: str) -> dict[str, Any]:
+    definition = get_tool_definition(name)
+    return {
+        "name": definition.name,
+        "description": definition.description,
+        "arguments": json.loads(json.dumps(definition.arguments)),
+    }
+
+
+def list_provider_tool_schemas(tool_names: tuple[str, ...] | None = None) -> tuple[dict[str, Any], ...]:
+    names = tuple(sorted(TOOL_DEFINITIONS)) if tool_names is None else tuple(tool_names)
+    return tuple(get_provider_tool_schema(name) for name in names)
+
+
+def validate_tool_arguments(tool_name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    return _validate_tool_arguments(get_tool_definition(tool_name), arguments)
 
 
 async def execute_tool(

@@ -470,6 +470,109 @@ class AIPlatformFoundationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ai_platform.ComparePlanRequest(profile_ids=("a", "a"), tool_risk=ai_platform.ToolRisk.READ)
 
+    def test_compare_contract_is_bounded_immutable_and_typed(self):
+        ai_platform = load_ai_platform()
+        maximum = ai_platform.MAX_COMPARE_PROFILES
+        self.assertEqual(maximum, 4)
+
+        source_ids = ["pa", "pb"]
+        request = ai_platform.ComparePlanRequest(source_ids, ai_platform.ToolRisk.READ)
+        source_ids.append("pc")
+        source_ids[0] = "zz"
+        self.assertEqual(request.profile_ids, ("pa", "pb"))
+        self.assertIs(type(request.profile_ids), tuple)
+
+        at_max = ai_platform.ComparePlanRequest(tuple(f"p{i}" for i in range(maximum)), ai_platform.ToolRisk.NORMAL)
+        self.assertEqual(len(at_max.profile_ids), maximum)
+        with self.assertRaises(ValueError):
+            ai_platform.ComparePlanRequest(tuple(f"p{i}" for i in range(maximum + 1)), ai_platform.ToolRisk.READ)
+        with self.assertRaises(ValueError):
+            ai_platform.ComparePlanRequest(["a", "b", "a"], ai_platform.ToolRisk.READ)
+        for invalid_ids in ("ab", ("a", ""), ("a", "b c"), ("a", 5), None, 7):
+            with self.subTest(profile_ids=invalid_ids), self.assertRaises(ValueError):
+                ai_platform.ComparePlanRequest(invalid_ids, ai_platform.ToolRisk.READ)
+
+        self.assertIs(ai_platform.ComparePlanRequest(("a", "b"), "DESTRUCTIVE").tool_risk, ai_platform.ToolRisk.DESTRUCTIVE)
+        for invalid_risk in ("destructive-ish", "", None, 1, object()):
+            with self.subTest(tool_risk=invalid_risk), self.assertRaises(ValueError):
+                ai_platform.ComparePlanRequest(("a", "b"), invalid_risk)
+
+        first = ai_platform.ComparePlanRequest(["a", "b"], "READ")
+        second = ai_platform.ComparePlanRequest(("a", "b"), ai_platform.ToolRisk.READ)
+        self.assertEqual(first, second)
+        self.assertEqual(hash(first), hash(second))
+
+    def test_routing_config_fallback_fields_are_validated_and_json_safe(self):
+        ai_platform = load_ai_platform()
+        routing = ai_platform.RoutingConfig(
+            routine_profile_id="routine",
+            routine_fallback_profile_ids=("fallback-1", "fallback-2"),
+            planner_fallback_profile_ids=("planner-fallback",),
+        )
+        self.assertEqual(routing.fallback_profiles_for(ai_platform.TaskClass.ROUTINE), ("fallback-1", "fallback-2"))
+        self.assertEqual(routing.fallback_profiles_for(ai_platform.TaskClass.PLANNER), ("planner-fallback",))
+        self.assertEqual(routing.fallback_profiles_for(ai_platform.TaskClass.CREATIVE), ())
+        self.assertEqual(routing.fallback_profiles_for(ai_platform.TaskClass.DIRECT), ())
+
+        public = ai_platform.AISettings(routing=routing).public_dict()
+        json.dumps(public)
+        self.assertEqual(public["routing"]["routine_fallback_profile_ids"], ["fallback-1", "fallback-2"])
+
+        with self.assertRaises(ValueError):
+            ai_platform.RoutingConfig(routine_fallback_profile_ids=("dup", "dup"))
+        with self.assertRaises(ValueError):
+            ai_platform.RoutingConfig(routine_fallback_profile_ids=("bad id",))
+        with self.assertRaises(ValueError):
+            ai_platform.RoutingConfig(routine_fallback_profile_ids="not-array")
+
+    def test_ai_settings_store_loads_old_schema_and_round_trips_fallback_fields(self):
+        ai_platform = load_ai_platform()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "ai.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "profiles": [
+                            {
+                                "profile_id": "routine",
+                                "provider_id": "fake",
+                                "model_id": "fake-model",
+                                "credential_ref": None,
+                                "options": {},
+                                "enabled": True,
+                            }
+                        ],
+                        "routing": {"routine_profile_id": "routine"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = ai_platform.AISettingsStore(settings_path)
+            loaded = store.load()
+            self.assertEqual(loaded.routing.routine_fallback_profile_ids, ())
+
+            updated = ai_platform.AISettings(
+                profiles=loaded.profiles,
+                routing=ai_platform.RoutingConfig(
+                    routine_profile_id="routine",
+                    routine_fallback_profile_ids=("fallback",),
+                    planner_fallback_profile_ids=("planner",),
+                    creative_fallback_profile_ids=("creative",),
+                ),
+            )
+            store.save(updated)
+            reloaded = store.load()
+            self.assertEqual(reloaded.routing.routine_fallback_profile_ids, ("fallback",))
+            self.assertEqual(reloaded.routing.planner_fallback_profile_ids, ("planner",))
+            self.assertEqual(reloaded.routing.creative_fallback_profile_ids, ("creative",))
+
+            raw = json.loads(settings_path.read_text(encoding="utf-8"))
+            raw["routing"]["routine_fallback_profile_ids"] = "bad"
+            settings_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaises(ai_platform.AIPlatformError):
+                store.load()
+
 
 if __name__ == "__main__":
     unittest.main()
