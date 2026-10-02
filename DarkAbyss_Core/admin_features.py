@@ -147,6 +147,13 @@ async def handle_component_interaction(interaction: Any, store: FeatureStore | N
     custom_id = data.get("custom_id") if isinstance(data, dict) else None
     if not isinstance(custom_id, str) or not custom_id.startswith(CUSTOM_ID_PREFIX):
         return False
+    # Acknowledge first: role changes are Discord API calls and Discord shows
+    # "This interaction failed" if a click is not acknowledged within 3 seconds.
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
     guild = getattr(interaction, "guild", None)
     member = getattr(interaction, "user", None)
     if store is None or guild is None or not isinstance(member, MEMBER_TYPES):

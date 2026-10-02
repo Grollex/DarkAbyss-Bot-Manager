@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 from urllib.parse import urlencode
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -497,6 +497,20 @@ def _profile_by_id(settings: ai_platform.AISettings, profile_id: str) -> ai_plat
     return next((profile for profile in settings.profiles if profile.profile_id == profile_id), None)
 
 
+def _routing_with_default(routing: ai_platform.RoutingConfig, profile_id: str) -> ai_platform.RoutingConfig:
+    """Fill only UNSET routing slots with ``profile_id``; assigned slots are kept.
+
+    Without this, saving only a Gemini key (or saving Gemini before Groq) left
+    every task class unrouted and /ai answered "No usable AI profile".
+    """
+    return replace(
+        routing,
+        routine_profile_id=routing.routine_profile_id or profile_id,
+        planner_profile_id=routing.planner_profile_id or profile_id,
+        creative_profile_id=routing.creative_profile_id or profile_id,
+    )
+
+
 class AIProviderSettingsDialog(QDialog):
     def __init__(
         self,
@@ -792,17 +806,9 @@ class AIProviderSettingsDialog(QDialog):
             options={"reasoning_effort": reasoning},
         )
         preserved_profiles = tuple(item for item in self._loaded_settings.profiles if item.profile_id != GROQ_PROFILE_ID)
-        if not self._loaded_settings.profiles and self._loaded_settings.routing == ai_platform.RoutingConfig():
-            routing = ai_platform.RoutingConfig(
-                routine_profile_id=GROQ_PROFILE_ID,
-                planner_profile_id=GROQ_PROFILE_ID,
-                creative_profile_id=GROQ_PROFILE_ID,
-            )
-        else:
-            routing = self._loaded_settings.routing
         return ai_platform.AISettings(
             profiles=preserved_profiles + (profile,),
-            routing=routing,
+            routing=_routing_with_default(self._loaded_settings.routing, GROQ_PROFILE_ID),
         )
 
     def _current_gemini_settings(self) -> ai_platform.AISettings | None:
@@ -825,7 +831,7 @@ class AIProviderSettingsDialog(QDialog):
         preserved_profiles = tuple(item for item in self._loaded_settings.profiles if item.profile_id != GEMINI_PROFILE_ID)
         return ai_platform.AISettings(
             profiles=preserved_profiles + (profile,),
-            routing=self._loaded_settings.routing,
+            routing=_routing_with_default(self._loaded_settings.routing, GEMINI_PROFILE_ID),
         )
 
     def _refresh_status(self) -> None:

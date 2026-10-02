@@ -438,6 +438,77 @@ class GroqAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("SECRET", availability.message)
 
 
+class GroqRetryTests(unittest.IsolatedAsyncioTestCase):
+    def make_provider(self, transport, retry_delays=(3.0, 8.0)):
+        ai_platform, ai_groq = load_modules()
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = ai_platform.CredentialStore(Path(temp_dir.name) / "secrets" / "ai")
+        store.write_secret("groq", "groq-default", "GROQ_SECRET")
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        provider = ai_groq.GroqProvider(store, transport=transport, retry_delays=retry_delays, sleep=fake_sleep)
+        request = ai_platform.AIRequest(
+            model_id="openai/gpt-oss-120b",
+            messages=(ai_platform.AIMessage(role="user", content="hello"),),
+        )
+        return ai_groq, provider, request, sleeps
+
+    @staticmethod
+    def ok_payload():
+        return {"model": "openai/gpt-oss-120b", "choices": [{"message": {"role": "assistant", "content": "done"}}]}
+
+    async def test_rate_limit_hint_is_honoured_then_request_succeeds(self):
+        hint = {"error": {"message": "Rate limit reached on tokens per minute (TPM). Please try again in 7.5s."}}
+        transport = FakeTransport([(429, hint), (200, self.ok_payload())])
+        _, provider, request, sleeps = self.make_provider(transport)
+
+        response = await provider.generate(request, "groq-default")
+
+        self.assertEqual(response.content, "done")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(sleeps, [8.0])
+
+    async def test_server_errors_use_configured_delays_and_give_up(self):
+        transport = FakeTransport([(503, {}), (502, {}), (500, {})])
+        ai_groq, provider, request, sleeps = self.make_provider(transport)
+
+        with self.assertRaisesRegex(ai_groq.GroqProviderError, "unavailable"):
+            await provider.generate(request, "groq-default")
+        self.assertEqual(len(transport.calls), 3)
+        self.assertEqual(sleeps, [3.0, 8.0])
+
+    async def test_long_waits_and_client_errors_are_not_retried(self):
+        daily = {"error": {"message": "Rate limit reached on requests per day. Please try again in 12m30s."}}
+        for status, payload in ((429, daily), (401, {}), (400, {})):
+            transport = FakeTransport([(status, payload)])
+            ai_groq, provider, request, sleeps = self.make_provider(transport)
+            with self.subTest(status=status):
+                with self.assertRaises(ai_groq.GroqProviderError):
+                    await provider.generate(request, "groq-default")
+                self.assertEqual(len(transport.calls), 1)
+                self.assertEqual(sleeps, [])
+
+    async def test_network_errors_are_retried_only_when_enabled(self):
+        transport = FakeTransport()
+        ai_groq, provider, request, sleeps = self.make_provider(transport)
+        # Raise the class of the freshly loaded module (load_modules re-imports it).
+        transport.error = ai_groq.GroqNetworkError("Groq network request failed.")
+        with self.assertRaisesRegex(ai_groq.GroqProviderError, "network"):
+            await provider.generate(request, "groq-default")
+        self.assertEqual(len(transport.calls), 3)
+
+        no_retry_transport = FakeTransport([(429, {})])
+        ai_groq, no_retry, request, no_sleeps = self.make_provider(no_retry_transport, retry_delays=())
+        with self.assertRaises(ai_groq.GroqProviderError):
+            await no_retry.generate(request, "groq-default")
+        self.assertEqual(len(no_retry_transport.calls), 1)
+        self.assertEqual(no_sleeps, [])
+
+
 class DependencyTests(unittest.TestCase):
     def test_no_provider_sdk_dependency_added(self):
         requirements = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8").lower()

@@ -162,8 +162,13 @@ def acquire_single_instance_lock(runtime: AdminRuntime | None = None) -> bool:
     selected_runtime = runtime or get_runtime()
     bot_lock_handle = selected_runtime.lock_path.open("a+b")
     try:
+        # "a+b" opens at end of file; msvcrt.locking locks from the CURRENT
+        # position, so always lock byte 0 or two processes lock different bytes.
+        bot_lock_handle.seek(0)
         msvcrt.locking(bot_lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
+        bot_lock_handle.close()
+        bot_lock_handle = None
         print("Another Admin Bot instance is already running. Exiting.")
         return False
     bot_lock_handle.seek(0)

@@ -1118,6 +1118,23 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertFalse(same_store.exists("gemini", "gemini-default"))
         self.assertEqual(reopened.gemini_key_edit.placeholderText(), "Paste Gemini API key")
 
+    def test_gemini_only_save_routes_unset_task_classes_to_gemini(self):
+        # Regression: saving only Gemini left routing empty ("No usable AI profile").
+        dialog, settings_store, _ = self.make_ai_dialog()
+        dialog.gemini_key_edit.setText("GEMINI_SECRET")
+        dialog.save_gemini_settings()
+
+        routing = settings_store.load().routing
+        self.assertEqual(routing.routine_profile_id, "gemini-default")
+        self.assertEqual(routing.planner_profile_id, "gemini-default")
+        self.assertEqual(routing.creative_profile_id, "gemini-default")
+
+        # A later Groq save fills nothing: every slot is already assigned.
+        reopened, same_store, _ = self.make_ai_dialog()
+        reopened.key_edit.setText("GROQ_SECRET")
+        reopened.save_settings()
+        self.assertEqual(same_store.load().routing.planner_profile_id, "gemini-default")
+
     def test_gemini_save_preserves_groq_profiles_and_existing_routing(self):
         dialog, settings_store, credential_store = self.make_ai_dialog()
         ai_platform = self.manager_gui.ai_platform

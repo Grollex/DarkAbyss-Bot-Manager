@@ -18,15 +18,24 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
 GEMINI_LITE_MODEL = "gemini-3.5-flash-lite"
 GEMINI_USER_AGENT = "DarkAbyssBotManager/AI-2C"
-DEFAULT_TIMEOUT_SECONDS = 20.0
+DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_OUTPUT_TOKENS_LIMIT = 8192
 ALLOWED_REASONING_EFFORT = {"low", "medium", "high"}
 ALLOWED_OPTIONS = {"reasoning_effort", "max_output_tokens"}
+# Same retry contract as the Groq adapter: off by default, enabled by the bot's
+# provider registry; a RetryInfo.retryDelay hint is honoured up to the cap.
+DEFAULT_RETRY_DELAYS = (3.0, 8.0)
+MAX_RETRY_WAIT_SECONDS = 30.0
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
 class GeminiProviderError(ai_platform.AIPlatformError):
     """Contained Gemini adapter failure."""
+
+
+class GeminiNetworkError(GeminiProviderError):
+    """Network/timeout failure before any HTTP status was received (retryable)."""
 
 
 class GeminiHTTPTransport(Protocol):
@@ -63,7 +72,7 @@ class UrllibGeminiHTTPTransport:
             data = _read_limited(exc, max_response_bytes)
             return int(exc.code), data
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            raise GeminiProviderError("Gemini network request failed.") from exc
+            raise GeminiNetworkError("Gemini network request failed.") from exc
 
 
 class GeminiProvider:
@@ -74,6 +83,8 @@ class GeminiProvider:
         transport: GeminiHTTPTransport | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        retry_delays: tuple[float, ...] = (),
+        sleep: Any = None,
     ) -> None:
         parsed = urlparse(GEMINI_API_BASE)
         if parsed.scheme != "https":
@@ -83,6 +94,8 @@ class GeminiProvider:
         self._transport = transport or UrllibGeminiHTTPTransport()
         self._timeout_seconds = float(timeout_seconds)
         self._max_response_bytes = int(max_response_bytes)
+        self._retry_delays = tuple(float(delay) for delay in retry_delays)
+        self._sleep = sleep or asyncio.sleep
         self._metadata = ai_platform.ProviderMetadata(
             provider_id=GEMINI_PROVIDER_ID,
             display_name=GEMINI_DISPLAY_NAME,
@@ -159,17 +172,33 @@ class GeminiProvider:
             "Accept": "application/json",
             "User-Agent": GEMINI_USER_AGENT,
         }
-        try:
-            status, response_bytes = await asyncio.to_thread(
-                self._transport.post_json,
-                url=url,
-                headers=headers,
-                body=body,
-                timeout_seconds=self._timeout_seconds,
-                max_response_bytes=self._max_response_bytes,
-            )
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            raise GeminiProviderError("Gemini network request failed.") from exc
+        attempt = 0
+        while True:
+            try:
+                try:
+                    status, response_bytes = await asyncio.to_thread(
+                        self._transport.post_json,
+                        url=url,
+                        headers=headers,
+                        body=body,
+                        timeout_seconds=self._timeout_seconds,
+                        max_response_bytes=self._max_response_bytes,
+                    )
+                except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+                    raise GeminiNetworkError("Gemini network request failed.") from exc
+            except GeminiNetworkError:
+                if attempt >= len(self._retry_delays):
+                    raise
+                await self._sleep(self._retry_delays[attempt])
+                attempt += 1
+                continue
+            if status in RETRYABLE_STATUSES and attempt < len(self._retry_delays):
+                wait = _retry_wait_seconds(response_bytes, self._retry_delays[attempt])
+                if wait is not None:
+                    await self._sleep(wait)
+                    attempt += 1
+                    continue
+            break
         if status < 200 or status >= 300:
             raise _error_for_status(status, response_bytes)
         return _parse_response(response_bytes, model_id=request.model_id)
@@ -490,6 +519,28 @@ def _parse_error_body(response_bytes: bytes) -> dict[str, Any]:
         return {}
     error = payload.get("error") if isinstance(payload, dict) else None
     return error if isinstance(error, dict) else {}
+
+
+def _retry_wait_seconds(response_bytes: bytes, default: float) -> float | None:
+    """Wait before retrying: google.rpc.RetryInfo.retryDelay ("17s") or ``default``.
+
+    None means "do not retry" (the provider asks for a longer wait than we accept).
+    """
+    error = _parse_error_body(response_bytes)
+    for detail in error.get("details") or []:
+        if not isinstance(detail, dict) or not str(detail.get("@type", "")).endswith("RetryInfo"):
+            continue
+        raw = str(detail.get("retryDelay", "")).strip()
+        if not raw.endswith("s"):
+            continue
+        try:
+            seconds = float(raw[:-1])
+        except ValueError:
+            continue
+        if seconds > MAX_RETRY_WAIT_SECONDS:
+            return None
+        return max(seconds + 0.5, 0.5)
+    return default
 
 
 def _availability_state_from_error(error: GeminiProviderError) -> ai_platform.AvailabilityState:

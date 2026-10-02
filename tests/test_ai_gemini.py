@@ -748,6 +748,72 @@ class GeminiAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("SECRET", availability.message)
 
 
+class GeminiRetryTests(unittest.IsolatedAsyncioTestCase):
+    def make_provider(self, transport, retry_delays=(3.0, 8.0)):
+        ai_platform, ai_gemini = load_modules()
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = ai_platform.CredentialStore(Path(temp_dir.name) / "secrets" / "ai")
+        store.write_secret("gemini", "gemini-default", "GEMINI_SECRET")
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        provider = ai_gemini.GeminiProvider(store, transport=transport, retry_delays=retry_delays, sleep=fake_sleep)
+        request = ai_platform.AIRequest(
+            model_id="gemini-3.5-flash-lite",
+            messages=(ai_platform.AIMessage(role="user", content="hello"),),
+        )
+        return ai_gemini, provider, request, sleeps
+
+    @staticmethod
+    def ok_payload():
+        return {"candidates": [{"content": {"parts": [{"text": "done"}]}, "finishReason": "STOP"}]}
+
+    @staticmethod
+    def quota(delay):
+        return {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay}],
+            }
+        }
+
+    async def test_retry_info_delay_is_honoured_then_request_succeeds(self):
+        transport = FakeTransport([(429, self.quota("4s")), (200, self.ok_payload())])
+        _, provider, request, sleeps = self.make_provider(transport)
+
+        response = await provider.generate(request, "gemini-default")
+
+        self.assertEqual(response.content, "done")
+        self.assertEqual(sleeps, [4.5])
+
+    async def test_long_retry_delay_and_client_errors_are_not_retried(self):
+        for status, payload in ((429, self.quota("3600s")), (400, {"error": {"status": "INVALID_ARGUMENT"}})):
+            transport = FakeTransport([(status, payload)])
+            ai_gemini, provider, request, sleeps = self.make_provider(transport)
+            with self.subTest(status=status):
+                with self.assertRaises(ai_gemini.GeminiProviderError):
+                    await provider.generate(request, "gemini-default")
+                self.assertEqual(len(transport.calls), 1)
+                self.assertEqual(sleeps, [])
+
+    async def test_server_and_network_errors_retry_with_configured_delays(self):
+        transport = FakeTransport([(503, {}), (500, {}), (200, self.ok_payload())])
+        _, provider, request, sleeps = self.make_provider(transport)
+        response = await provider.generate(request, "gemini-default")
+        self.assertEqual(response.content, "done")
+        self.assertEqual(sleeps, [3.0, 8.0])
+
+        network = FakeTransport(error=socket.timeout())
+        ai_gemini, provider, request, sleeps = self.make_provider(network)
+        with self.assertRaisesRegex(ai_gemini.GeminiProviderError, "network"):
+            await provider.generate(request, "gemini-default")
+        self.assertEqual(len(network.calls), 3)
+
+
 class DependencyTests(unittest.TestCase):
     def test_no_provider_sdk_dependency_added(self):
         requirements = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8").lower()

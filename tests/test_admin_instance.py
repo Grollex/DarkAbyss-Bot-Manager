@@ -381,6 +381,24 @@ class AdminRuntimeSelectionTests(unittest.TestCase):
             self.assertIn("admin-main", str(main_runtime.lock_path))
             self.assertIn("admin-second", str(second_runtime.lock_path))
 
+    def test_second_lock_on_same_instance_is_refused_cleanly(self):
+        # Regression: "a+b" opens at EOF and msvcrt locks from the current
+        # position, so a second process used to lock a different byte and then
+        # crash with PermissionError instead of exiting cleanly.
+        with tempfile.TemporaryDirectory() as data_dir:
+            Admin, instance_store = load_modules(Path(data_dir), "Admin", "instance_store")
+            instance_store.create_instance("admin", "admin-main")
+            runtime = Admin.resolve_runtime("admin-main")
+
+            self.assertTrue(Admin.acquire_single_instance_lock(runtime))
+            first_handle = Admin.bot_lock_handle
+            try:
+                with mock.patch("builtins.print"):
+                    self.assertFalse(Admin.acquire_single_instance_lock(runtime))
+                self.assertIsNone(Admin.bot_lock_handle)
+            finally:
+                first_handle.close()
+
     def test_fresh_bootstrap_does_not_generate_phase1_runtime_files(self):
         with tempfile.TemporaryDirectory() as data_dir:
             admin_instance, app_paths = load_modules(Path(data_dir), "admin_instance", "app_paths")

@@ -326,15 +326,18 @@ def build_default_provider_registry(
     credentials = credential_store if credential_store is not None else ai_platform.CredentialStore()
     registry = ai_platform.LazyProviderRegistry()
 
+    # Bot requests retry transient provider failures (rate limit, 5xx, network);
+    # explicit Manager "Test Connection" calls build their own providers and
+    # fail fast.
     def create_groq() -> ai_platform.AIProvider:
         import ai_groq
 
-        return ai_groq.GroqProvider(credentials)
+        return ai_groq.GroqProvider(credentials, retry_delays=ai_groq.DEFAULT_RETRY_DELAYS)
 
     def create_gemini() -> ai_platform.AIProvider:
         import ai_gemini
 
-        return ai_gemini.GeminiProvider(credentials)
+        return ai_gemini.GeminiProvider(credentials, retry_delays=ai_gemini.DEFAULT_RETRY_DELAYS)
 
     registry.register_factory("groq", create_groq)
     registry.register_factory("gemini", create_gemini)

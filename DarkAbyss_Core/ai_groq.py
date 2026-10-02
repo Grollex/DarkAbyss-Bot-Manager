@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import urllib.error
 import urllib.request
@@ -18,14 +19,27 @@ GROQ_API_BASE = "https://api.groq.com/openai/v1"
 GROQ_CHAT_COMPLETIONS_PATH = "/chat/completions"
 GROQ_INITIAL_MODEL = "openai/gpt-oss-120b"
 GROQ_USER_AGENT = "DarkAbyssBotManager/AI-2B"
-DEFAULT_TIMEOUT_SECONDS = 20.0
+DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
 ALLOWED_REASONING_EFFORT = {"low", "medium", "high"}
 ALLOWED_OPTIONS = {"reasoning_effort", "max_completion_tokens", "temperature", "top_p"}
+# Retries for transient failures (rate limit, 5xx, network). Off by default so
+# explicit calls such as Test Connection fail fast; the bot's provider registry
+# passes DEFAULT_RETRY_DELAYS. A provider-suggested wait ("try again in 7.5s")
+# is honoured when it is at most MAX_RETRY_WAIT_SECONDS; longer waits (daily
+# quota) are not retried.
+DEFAULT_RETRY_DELAYS = (3.0, 8.0)
+MAX_RETRY_WAIT_SECONDS = 30.0
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_RETRY_AFTER_RE = re.compile(r"try again in (?:(\d+)m)?(\d+(?:\.\d+)?)(ms|s)\b", re.IGNORECASE)
 
 
 class GroqProviderError(ai_platform.AIPlatformError):
     """Contained Groq adapter failure."""
+
+
+class GroqNetworkError(GroqProviderError):
+    """Network/timeout failure before any HTTP status was received (retryable)."""
 
 
 class GroqHTTPTransport(Protocol):
@@ -67,7 +81,7 @@ class UrllibGroqHTTPTransport:
             data = _read_limited(exc, max_response_bytes)
             return int(exc.code), data
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            raise GroqProviderError("Groq network request failed.") from exc
+            raise GroqNetworkError("Groq network request failed.") from exc
 
 
 class GroqProvider:
@@ -78,6 +92,8 @@ class GroqProvider:
         transport: GroqHTTPTransport | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        retry_delays: tuple[float, ...] = (),
+        sleep: Any = None,
     ) -> None:
         parsed = urlparse(GROQ_API_BASE)
         if parsed.scheme != "https":
@@ -87,6 +103,8 @@ class GroqProvider:
         self._transport = transport or UrllibGroqHTTPTransport()
         self._timeout_seconds = float(timeout_seconds)
         self._max_response_bytes = int(max_response_bytes)
+        self._retry_delays = tuple(float(delay) for delay in retry_delays)
+        self._sleep = sleep or asyncio.sleep
         self._metadata = ai_platform.ProviderMetadata(
             provider_id=GROQ_PROVIDER_ID,
             display_name=GROQ_DISPLAY_NAME,
@@ -162,14 +180,30 @@ class GroqProvider:
             "Accept": "application/json",
             "User-Agent": GROQ_USER_AGENT,
         }
-        status, response_bytes = await asyncio.to_thread(
-            self._transport.post_json,
-            url=url,
-            headers=headers,
-            body=body,
-            timeout_seconds=self._timeout_seconds,
-            max_response_bytes=self._max_response_bytes,
-        )
+        attempt = 0
+        while True:
+            try:
+                status, response_bytes = await asyncio.to_thread(
+                    self._transport.post_json,
+                    url=url,
+                    headers=headers,
+                    body=body,
+                    timeout_seconds=self._timeout_seconds,
+                    max_response_bytes=self._max_response_bytes,
+                )
+            except GroqNetworkError:
+                if attempt >= len(self._retry_delays):
+                    raise
+                await self._sleep(self._retry_delays[attempt])
+                attempt += 1
+                continue
+            if status in RETRYABLE_STATUSES and attempt < len(self._retry_delays):
+                wait = _retry_wait_seconds(response_bytes, self._retry_delays[attempt])
+                if wait is not None:
+                    await self._sleep(wait)
+                    attempt += 1
+                    continue
+            break
         if status < 200 or status >= 300:
             raise _error_for_status(status, response_bytes)
         return _parse_response(response_bytes)
@@ -344,6 +378,26 @@ def _error_for_status(status: int, response_bytes: bytes = b"") -> GroqProviderE
     if status >= 500:
         return GroqProviderError("Groq service is unavailable.")
     return GroqProviderError("Groq request failed.")
+
+
+def _retry_wait_seconds(response_bytes: bytes, default: float) -> float | None:
+    """Wait before retrying: the provider's "try again in Xs" hint or ``default``.
+
+    None means "do not retry" (the provider asks for a longer wait than we accept).
+    """
+    try:
+        text = response_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        text = ""
+    match = _RETRY_AFTER_RE.search(text)
+    if match is None:
+        return default
+    minutes, value, unit = match.groups()
+    seconds = float(value) / 1000.0 if unit.lower() == "ms" else float(value)
+    seconds += 60.0 * int(minutes or 0)
+    if seconds > MAX_RETRY_WAIT_SECONDS:
+        return None
+    return max(seconds + 0.5, 0.5)
 
 
 def _availability_state_from_error(error: GroqProviderError) -> ai_platform.AvailabilityState:

@@ -692,12 +692,24 @@ class BlueprintTests(unittest.TestCase):
 class FakeInteractionResponse:
     def __init__(self):
         self.sent = []
+        self.deferred = False
 
     def is_done(self):
-        return bool(self.sent)
+        return self.deferred or bool(self.sent)
+
+    async def defer(self, **kwargs):
+        self.deferred = True
 
     async def send_message(self, content, **kwargs):
         self.sent.append((content, kwargs))
+
+
+class FakeFollowup:
+    def __init__(self, response):
+        self.response = response
+
+    async def send(self, content, **kwargs):
+        self.response.sent.append((content, kwargs))
 
 
 class FeatureTests(unittest.TestCase):
@@ -715,9 +727,14 @@ class FeatureTests(unittest.TestCase):
         return run(admin_tools.execute_tool(context(self.guild, requester, store=self.store), tool, arguments))
 
     def click(self, custom_id, member):
-        interaction = SimpleNamespace(data={"custom_id": custom_id}, guild=self.guild, user=member, response=FakeInteractionResponse())
+        response = FakeInteractionResponse()
+        interaction = SimpleNamespace(
+            data={"custom_id": custom_id}, guild=self.guild, user=member, response=response, followup=FakeFollowup(response)
+        )
         handled = run(admin_features.handle_component_interaction(interaction, self.store))
-        return handled, interaction.response.sent
+        # Every handled click is acknowledged before any slow role change.
+        self.assertTrue(response.deferred)
+        return handled, response.sent
 
     def test_store_is_atomic_json_and_survives_reload(self):
         self.store.set(self.guild.id, "welcome", {"enabled": True})
@@ -747,6 +764,8 @@ class FeatureTests(unittest.TestCase):
         handled, replies = self.click(custom_ids[0], member)
         self.assertTrue(handled)
         self.assertIn(self.guild.r_member, member.roles)
+        self.assertIn("Added role", replies[-1][0])
+        self.assertTrue(replies[-1][1]["ephemeral"])
         self.click(custom_ids[0], member)
         self.assertNotIn(self.guild.r_member, member.roles)
         # Forged button for a role that is not in the menu.
