@@ -141,7 +141,25 @@ SETUP_HELP_TEXT: dict[str, tuple[str, str]] = {
         "Если включено, пользователи с Discord permission Administrator смогут использовать admin-команды.\n\n"
         "Если хочешь более жёсткий доступ, выключи этот пункт и укажи конкретные user IDs или role IDs.",
     ),
+    "ai_users": (
+        "AI allowed user IDs",
+        "Discord user IDs, которым разрешена команда /ai.\n\n"
+        "AI-доступ выдаётся только явно: Discord Administrator и списки доступа для /execute его НЕ дают.\n"
+        "Если оба AI-списка пустые, /ai не может использовать никто.\n\n"
+        "Рекомендуется выдавать AI-доступ через роль (AI allowed role IDs), а не через отдельных пользователей.",
+    ),
+    "ai_roles": (
+        "AI allowed role IDs",
+        "Discord role IDs, участникам которых разрешена команда /ai.\n\n"
+        "Это рекомендуемый способ выдачи AI-доступа. Discord Administrator сам по себе доступ к /ai не даёт.\n"
+        "Как получить role ID: Developer Mode → Server Settings → Roles → правый клик → Copy Role ID.",
+    ),
 }
+
+AI_ACCESS_EXPLANATION = (
+    "AI access requires an explicit user or role. Discord Administrator alone does not grant /ai access, "
+    "and the /execute lists above do not grant it either. Prefer an AI role. Leave both empty to disable /ai."
+)
 
 
 @dataclass(frozen=True)
@@ -997,6 +1015,14 @@ class BotSetupDialog(QDialog):
         self.roles_help_button = self._create_help_button("roles")
         self.audit_help_button = self._create_help_button("audit")
         self.administrators_help_button = self._create_help_button("administrators")
+        self.ai_allowed_users_edit = QLineEdit()
+        self.ai_allowed_users_edit.setPlaceholderText("Optional. Explicit /ai user IDs")
+        self.ai_allowed_roles_edit = QLineEdit()
+        self.ai_allowed_roles_edit.setPlaceholderText("Recommended. Explicit /ai role IDs")
+        self.ai_users_help_button = self._create_help_button("ai_users")
+        self.ai_roles_help_button = self._create_help_button("ai_roles")
+        self.ai_access_label = QLabel(AI_ACCESS_EXPLANATION)
+        self.ai_access_label.setWordWrap(True)
 
         self.invite_link_edit = QLineEdit()
         self.invite_link_edit.setReadOnly(True)
@@ -1123,9 +1149,14 @@ class BotSetupDialog(QDialog):
         form.addRow(self._help_label("Allowed user IDs", self.users_help_button), self.allowed_users_edit)
         form.addRow(self._help_label("Allowed role IDs", self.roles_help_button), self.allowed_roles_edit)
         form.addRow(self._help_label("Audit channel ID", self.audit_help_button), self.audit_channel_edit)
+        ai_form = QFormLayout()
+        ai_form.addRow(self._help_label("AI allowed user IDs", self.ai_users_help_button), self.ai_allowed_users_edit)
+        ai_form.addRow(self._help_label("AI allowed role IDs", self.ai_roles_help_button), self.ai_allowed_roles_edit)
         layout = QVBoxLayout()
         layout.addWidget(description)
         layout.addLayout(form)
+        layout.addWidget(self.ai_access_label)
+        layout.addLayout(ai_form)
         layout.addStretch(1)
         page.setLayout(layout)
         return page
@@ -1182,6 +1213,8 @@ class BotSetupDialog(QDialog):
         self.allowed_roles_edit.setText(", ".join(str(value) for value in effective.get("allowed_role_ids", [])))
         audit_channel_id = effective.get("audit_channel_id")
         self.audit_channel_edit.setText("" if audit_channel_id is None else str(audit_channel_id))
+        self.ai_allowed_users_edit.setText(", ".join(str(value) for value in effective.get("ai_allowed_user_ids", [])))
+        self.ai_allowed_roles_edit.setText(", ".join(str(value) for value in effective.get("ai_allowed_role_ids", [])))
         self._update_invite_preview()
         self._update_ready_summary()
         self._set_status("Loaded setup.")
@@ -1200,6 +1233,15 @@ class BotSetupDialog(QDialog):
                     "audit_channel_id": parse_optional_id(self.audit_channel_edit.text()),
                 }
             )
+            # Explicit AI whitelist fields: written when the user set a value or an
+            # override already exists (so clearing works), never auto-populated.
+            for key, edit_widget in (
+                ("ai_allowed_user_ids", self.ai_allowed_users_edit),
+                ("ai_allowed_role_ids", self.ai_allowed_roles_edit),
+            ):
+                ai_ids = parse_id_list(edit_widget.text())
+                if ai_ids or key in overrides:
+                    overrides[key] = ai_ids
             self._instance_api.update_instance_display_name(self._instance_id, display_name)
             self._config_api.save_config_overrides(self._instance_id, overrides)
             if token:

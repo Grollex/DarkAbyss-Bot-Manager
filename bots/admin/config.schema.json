@@ -40,6 +40,34 @@
         ]
       }
     },
+    "ai_allowed_user_ids": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        ]
+      }
+    },
+    "ai_allowed_role_ids": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        ]
+      }
+    },
     "audit_channel_id": {
       "anyOf": [
         {

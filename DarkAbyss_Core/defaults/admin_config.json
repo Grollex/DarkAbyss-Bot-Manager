@@ -2,5 +2,7 @@
   "allow_server_administrators": true,
   "allowed_user_ids": [],
   "allowed_role_ids": [],
-  "audit_channel_id": null
+  "audit_channel_id": null,
+  "ai_allowed_user_ids": [],
+  "ai_allowed_role_ids": []
 }

@@ -5,7 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from pathlib import Path
@@ -435,6 +435,57 @@ class ManagerGuiTests(unittest.TestCase):
                 },
             ),
         )
+
+    def test_setup_dialog_ai_whitelist_fields_load_save_and_explain(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        config_api = FakeConfigApi()
+        config_api.snapshot = replace(
+            config_api.snapshot,
+            overrides={"allowed_user_ids": ["123"], "ai_allowed_role_ids": ["900"], "unrelated": {"keep": True}},
+            effective={
+                "allow_server_administrators": True,
+                "allowed_user_ids": ["123"],
+                "ai_allowed_user_ids": [],
+                "ai_allowed_role_ids": ["900"],
+            },
+        )
+        dialog = self.manager_gui.BotSetupDialog("admin-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(dialog.ai_allowed_users_edit.text(), "")
+        self.assertEqual(dialog.ai_allowed_roles_edit.text(), "900")
+        explanation = dialog.ai_access_label.text()
+        self.assertIn("explicit user or role", explanation)
+        self.assertIn("Discord Administrator alone does not grant /ai access", explanation)
+        self.assertIn("role", explanation.lower())
+        self.assertIn("ai_users", self.manager_gui.SETUP_HELP_TEXT)
+        self.assertIn("ai_roles", self.manager_gui.SETUP_HELP_TEXT)
+
+        dialog.ai_allowed_users_edit.setText("111 222")
+        dialog.ai_allowed_roles_edit.setText("")
+        self.assertTrue(dialog.save_setup())
+        saved = config_api.saved[-1][1]
+        self.assertEqual(saved["ai_allowed_user_ids"], ["111", "222"])
+        self.assertEqual(saved["ai_allowed_role_ids"], [])
+        self.assertEqual(saved["allowed_user_ids"], ["123"])
+        self.assertTrue(saved["allow_server_administrators"])
+        self.assertEqual(saved["unrelated"], {"keep": True})
+
+        dialog.ai_allowed_roles_edit.setText("not-an-id")
+        self.assertFalse(dialog.save_setup())
+        self.assertIn("digits", dialog.last_error)
+
+    def test_setup_dialog_does_not_add_empty_ai_fields_to_overrides(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        config_api = FakeConfigApi()
+        dialog = self.manager_gui.BotSetupDialog("admin-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+
+        self.assertTrue(dialog.save_setup())
+
+        saved = config_api.saved[-1][1]
+        self.assertNotIn("ai_allowed_user_ids", saved)
+        self.assertNotIn("ai_allowed_role_ids", saved)
 
     def test_setup_dialog_rejects_invalid_discord_ids(self):
         instance_api = FakeInstanceApi(self.temp_dir.name)

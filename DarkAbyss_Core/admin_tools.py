@@ -45,6 +45,9 @@ class AdminToolContext:
     source: str = "unknown"
     requesting_user_id: int | None = None
     requesting_user_name: str | None = None
+    # Transport option: True for AI-originated execution (/ai) so model-written
+    # text can never ping @everyone/@here/users/roles. /execute keeps False.
+    suppress_mentions: bool = False
 
 
 def parse_snowflake(value: object, field_name: str) -> int:
@@ -828,7 +831,10 @@ async def _get_recent_messages(context: AdminToolContext, arguments: dict[str, A
 async def _send_message(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
     channel = _resolve_text_channel(context, arguments.get("channel_id"), "send_message")
     content = _require_content(arguments.get("content"))
-    await channel.send(content)
+    if context.suppress_mentions is True:
+        await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        await channel.send(content)
     return ToolResult(True, "send_message", f"Message sent to #{channel.name}.")
 
 

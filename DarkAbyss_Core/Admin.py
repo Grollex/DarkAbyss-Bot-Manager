@@ -16,6 +16,14 @@ import bot_registry
 import config_store
 import instance_store
 
+try:
+    # /ai transport. It imports no AI/provider module at import time; even if
+    # it cannot be imported, /execute and the rest of the bot keep working.
+    import admin_ai
+except Exception as _admin_ai_exc:  # pragma: no cover - defensive isolation
+    print(f"AI transport unavailable: {type(_admin_ai_exc).__name__}")
+    admin_ai = None
+
 bot_lock_handle = None
 
 
@@ -109,6 +117,17 @@ def validate_config(config: dict) -> dict:
     audit_channel_id = config.get("audit_channel_id")
     if audit_channel_id is not None:
         config["audit_channel_id"] = parse_snowflake(audit_channel_id, "audit_channel_id")
+
+    # Explicit /ai whitelist, separate from the /execute fields above. Missing
+    # fields (older effective configs) mean an empty whitelist: nobody may use /ai.
+    config["ai_allowed_user_ids"] = parse_snowflake_list(
+        config.get("ai_allowed_user_ids", []),
+        "ai_allowed_user_ids",
+    )
+    config["ai_allowed_role_ids"] = parse_snowflake_list(
+        config.get("ai_allowed_role_ids", []),
+        "ai_allowed_role_ids",
+    )
 
     return config
 
@@ -352,6 +371,45 @@ async def execute(
         result = f"{result}\n\nAction completed, but audit logging failed."
 
     await interaction.followup.send(clip_discord_message(result), ephemeral=True)
+
+
+AI_MODE_CHOICES = [
+    app_commands.Choice(name="routine", value="routine"),
+    app_commands.Choice(name="planner", value="planner"),
+    app_commands.Choice(name="creative", value="creative"),
+]
+
+ai_transport = (
+    admin_ai.AITransport(
+        load_config=lambda: load_config(),
+        fetch_user=lambda user_id: bot.fetch_user(user_id),
+        audit=send_audit,
+    )
+    if admin_ai is not None
+    else None
+)
+
+
+@bot.tree.command(name="ai", description="Ask the AI assistant (explicit AI whitelist only)")
+@app_commands.guild_only()
+@app_commands.choices(mode=AI_MODE_CHOICES)
+@app_commands.describe(
+    prompt="What you want the AI to do (max 2000 characters)",
+    mode="Task mode: routine (default), planner, or creative",
+)
+async def ai(
+    interaction: discord.Interaction,
+    prompt: app_commands.Range[str, 1, 2000],
+    mode: Optional[app_commands.Choice[str]] = None,
+) -> None:
+    if ai_transport is None:
+        await interaction.response.send_message(
+            "AI is currently unavailable.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    await ai_transport.handle_ai_command(interaction, prompt, mode.value if mode else None)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -17,6 +17,12 @@ VALID_ADMIN_CONFIG = {
     "allowed_role_ids": [],
     "audit_channel_id": None,
 }
+# AI-4: explicit /ai whitelist fields come from program defaults; older
+# instance overrides inherit them as empty lists without any migration.
+AI_WHITELIST_DEFAULTS = {
+    "ai_allowed_user_ids": [],
+    "ai_allowed_role_ids": [],
+}
 
 
 def load_modules(data_root: Path, *names: str):
@@ -205,7 +211,8 @@ class ConfigStoreTests(unittest.TestCase):
 
             effective = config_store.load_effective_config(instance.id)
 
-            self.assertEqual(effective, full_config)
+            self.assertEqual(effective, {**full_config, **AI_WHITELIST_DEFAULTS})
+            self.assertEqual(json.loads(instance.paths.config.read_text(encoding="utf-8")), full_config)
 
     def test_new_instance_has_current_metadata_and_override_semantics(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -708,7 +715,7 @@ class ConfigStoreTests(unittest.TestCase):
             instance = admin_instance.ensure_admin_instance()
 
             self.assertEqual(json.loads(instance.paths.config.read_text(encoding="utf-8")), legacy_config)
-            self.assertEqual(config_store.load_effective_config(instance.id), legacy_config)
+            self.assertEqual(config_store.load_effective_config(instance.id), {**legacy_config, **AI_WHITELIST_DEFAULTS})
 
 
 if __name__ == "__main__":
