@@ -293,11 +293,13 @@ def configure_message_content_intent(client: discord.Client, enabled: bool) -> N
     client._connection._intents.message_content = bool(enabled)
 
 
-MESSAGE_CONTENT_INTENT_HELP = (
-    "Discord rejected the privileged Message Content Intent requested for the AI control channel. "
-    "Either enable 'Message Content Intent' in Discord Developer Portal -> Application -> Bot -> "
-    "Privileged Gateway Intents, or clear 'AI control channel ID' in Manager Setup Bot to disable "
-    "natural-message AI. /execute and /ai do not need this intent."
+PRIVILEGED_INTENTS_HELP = (
+    "Discord refused a privileged gateway intent. With the AI control channel enabled this bot "
+    "requires BOTH privileged intents: 'Server Members Intent' (always required by the Admin bot) and "
+    "'Message Content Intent' (required only for the AI control channel). Enable the missing one(s) in "
+    "Discord Developer Portal -> Application -> Bot -> Privileged Gateway Intents. To run without "
+    "Message Content Intent, clear 'AI control channel ID' in Manager Setup Bot (Server Members Intent "
+    "is still required). /execute and /ai do not need Message Content Intent."
 )
 
 
@@ -477,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
         except discord.PrivilegedIntentsRequired:
             if not natural_ai:
                 raise  # unchanged pre-AI-5 behaviour (e.g. Server Members Intent missing)
-            print(MESSAGE_CONTENT_INTENT_HELP)
+            print(PRIVILEGED_INTENTS_HELP)
             return 1
     return 0
 

@@ -1399,8 +1399,14 @@ class MessageContentIntentTests(unittest.TestCase):
                 run_side_effect=discord.PrivilegedIntentsRequired(None),
             )
         self.assertEqual(code, 1)
-        self.assertIn("Message Content Intent", captured.getvalue())
-        self.assertIn("AI control channel ID", captured.getvalue())
+        output = captured.getvalue()
+        # Discord does not say WHICH privileged intent was refused, so the
+        # message must cover both intents this configuration requires.
+        self.assertIn("Server Members Intent", output)
+        self.assertIn("Message Content Intent", output)
+        self.assertIn("BOTH", output)
+        self.assertIn("AI control channel ID", output)
+        self.assertNotIn("Traceback", output)
         with self.assertRaises(discord.PrivilegedIntentsRequired):
             self.run_main(admin, self.base_config(), run_side_effect=discord.PrivilegedIntentsRequired(None))
 
