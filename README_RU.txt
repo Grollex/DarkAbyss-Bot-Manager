@@ -41,6 +41,13 @@ python DarkAbyss_Core\manager_gui.py
 
 GUI управляет Bot Instances через Manager Core: показывает экземпляры, запускает/останавливает/перезапускает их, создаёт дополнительные Admin-экземпляры и редактирует JSON overrides через ConfigStore.
 
+Интерфейс (тёмная тема, боковое меню):
+- Dashboard — статус бота (Online определяется по логу подключения к Discord), карточки Discord / AI Providers / Commands / AI Routing, панель бота (Start/Stop, логи, настройки), AI-провайдеры с Test Connection, лента последних событий и быстрые действия.
+- Bots — таблица экземпляров и все прежние кнопки (Start, Stop, Restart, Setup Bot, Advanced JSON, Add Bot).
+- AI Providers — какая модель планирует, какая выполняет, состояние ключей; полная настройка через «AI Providers...».
+- Commands & Tools — slash-команды и все инструменты ИИ по категориям с уровнем риска.
+- Logs — хвост логов выбранного бота и кнопка открытия папки логов.
+
 Кнопка `Setup Bot` открывает понятный мастер настройки выбранного экземпляра: можно вставить Discord bot token, указать allowed user IDs, allowed role IDs, audit channel ID и режим доступа для server administrators. Рядом с каждым важным полем есть кнопка `ⓘ`: она показывает, где взять bot token, user ID, role ID или channel ID и что означает настройка.
 
 Существующий токен не показывается обратно; если поле token оставить пустым, сохранённый токен не меняется. Токены остаются в `instances\<instance_id>\secrets\token.txt` и не записываются в файлы программы.

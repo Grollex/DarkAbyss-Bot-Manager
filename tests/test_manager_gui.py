@@ -22,6 +22,7 @@ def load_gui_module(data_root: Path):
     sys.path.insert(0, str(CORE_ROOT))
     for module_name in (
         "manager_gui",
+        "manager_dashboard",
         "manager_core",
         "config_store",
         "instance_store",
@@ -286,6 +287,90 @@ class ManagerGuiTests(unittest.TestCase):
         window.start_selected()
 
         self.assertIn(("start", "admin-second"), manager.calls)
+
+    def test_dashboard_navigation_cards_and_toggle(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        window = self.make_window(manager=manager)
+        self.finish_workers_immediately(window)
+
+        for page in ("dashboard", "bots", "ai", "commands", "logs"):
+            window.show_page(page)
+            self.assertTrue(window.nav_buttons[page].isChecked())
+            self.assertEqual(window.pages.currentIndex(), window._page_index[page])
+        self.assertIn("1 of 2 bot(s) running", window.discord_card.detail_label.text())
+        self.assertIn("slash commands", window.commands_card.value_label.text())
+        self.assertGreater(window.tools_tree.topLevelItemCount(), 5)
+        self.assertEqual(window.ai_providers_button.text(), "AI Providers...")
+
+        self.select_instance(window, "admin-main")  # running -> the toggle stops it
+        self.assertIn("Stop", window.quick_toggle_button.text())
+        window.toggle_selected_bot()
+        self.assertIn(("stop", "admin-main"), manager.calls)
+        self.select_instance(window, "admin-second")  # stopped -> the toggle starts it
+        window.toggle_selected_bot()
+        self.assertIn(("start", "admin-second"), manager.calls)
+
+    def test_dashboard_records_state_changes_and_logs_page_reads_tails(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        window = self.make_window(manager=manager)
+        core = self.manager_gui.manager_core
+        manager.infos = [manager.info("admin-second", "Second", core.STATE_RUNNING, 99), manager.infos[1]]
+        window.refresh_instances()
+        self.assertIn("Second started", window.activity.entries[0][2])
+
+        logs = Path(self.temp_dir.name) / "logs"
+        logs.mkdir()
+        (logs / "process.stderr.log").write_text("line one\nshard has connected to Gateway\n", encoding="utf-8")
+        info = replace(
+            manager.infos[0],
+            logs_dir=logs,
+            stderr_log_path=logs / "process.stderr.log",
+            stdout_log_path=logs / "process.stdout.log",
+        )
+        manager.infos = [info, manager.infos[1]]
+        window.refresh_instances()
+        window.show_page("logs")
+        window.log_instance_combo.setCurrentIndex(window.log_instance_combo.findData("admin-second"))
+        window.refresh_logs()
+        self.assertIn("connected to Gateway", window.log_view.toPlainText())
+        self.assertIn("(empty)", window.log_view.toPlainText())
+
+    def test_dashboard_provider_test_requires_a_saved_key(self):
+        window = self.make_window()
+        started = []
+        window._start_worker = lambda action, finished: started.append(action)
+        window.test_provider("groq")
+        self.assertEqual(started, [])
+        self.assertIn("no API key saved", window.last_error)
+        self.assertEqual(window.provider_rows[0].status_label.text(), "Not configured")
+        self.assertFalse(window.provider_rows[0].test_button.isEnabled())
+
+    def test_bot_connection_state_and_log_tail_helpers(self):
+        dash = self.manager_gui.dash
+        core = self.manager_gui.manager_core
+        manager = FakeManager(core)
+        log = Path(self.temp_dir.name) / "stderr.log"
+
+        def state(text, running=True, exit_code=None):
+            log.write_text(text, encoding="utf-8")
+            info = replace(
+                manager.infos[1],
+                state=core.STATE_RUNNING if running else core.STATE_EXITED,
+                exit_code=exit_code,
+                stderr_log_path=log,
+            )
+            return dash.bot_connection_state(info)
+
+        login = "logging in using static token\n"
+        self.assertEqual(state(login + "Shard ID None has connected to Gateway\n"), ("Online", "ok"))
+        self.assertEqual(state("old has connected to Gateway\n" + login), ("Connecting...", "warn"))
+        self.assertEqual(state(login + "discord.errors.PrivilegedIntentsRequired: ...\n"), ("Login refused", "bad"))
+        self.assertEqual(state("", running=False), ("Offline", "muted"))
+        self.assertEqual(state("", running=False, exit_code=1), ("Stopped (error)", "bad"))
+
+        log.write_bytes(b"x" * 100 + b"\nlast line\n")
+        self.assertEqual(dash.read_log_tail(log, 20), "last line\n")
+        self.assertEqual(dash.read_log_tail(Path(self.temp_dir.name) / "missing.log"), "")
 
     def test_stop_and_restart_use_worker_path(self):
         manager = FakeManager(self.manager_gui.manager_core)

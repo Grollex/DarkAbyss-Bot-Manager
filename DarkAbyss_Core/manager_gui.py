@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -19,18 +19,24 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QStackedWidget,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +44,8 @@ from PySide6.QtWidgets import (
 import admin_instance
 import ai_platform
 import app_paths
+import manager_dashboard as dash
+import runtime_layout
 import bot_registry
 import config_store
 import instance_store
@@ -1633,16 +1641,24 @@ class ManagerMainWindow(QMainWindow):
         self._allow_close = False
         self._shutdown_in_progress = False
 
+        self._provider_tests: dict[str, tuple[bool, str]] = {}
+        self._provider_tests_running: set[str] = set()
+        self._previous_states: dict[str, str] = {}
+        self._version_text = dash.app_version_text(runtime_layout)
+
         self.setWindowTitle("DarkAbyss Bot Manager")
         self.instance_table = QTableWidget(0, 5)
         self.instance_table.setHorizontalHeaderLabels(["Instance ID", "Display Name", "Bot Type", "Status", "PID"])
         self.instance_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.instance_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.instance_table.verticalHeader().setVisible(False)
+        self.instance_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.instance_table.itemSelectionChanged.connect(self._update_selected_details)
 
         self.details_view = QPlainTextEdit()
         self.details_view.setReadOnly(True)
         self.status_label = QLabel("")
+        self.status_label.setObjectName("muted")
 
         self.refresh_button = QPushButton("Refresh")
         self.start_button = QPushButton("Start")
@@ -1663,6 +1679,270 @@ class ManagerMainWindow(QMainWindow):
         self.create_admin_button.clicked.connect(self.create_admin_instance)
         self.ai_providers_button.clicked.connect(self.open_ai_providers)
 
+        self.pages = QStackedWidget()
+        self.nav_buttons: dict[str, QPushButton] = {}
+        self._page_index: dict[str, int] = {}
+        for name, builder in (
+            ("dashboard", self._build_dashboard_page),
+            ("bots", self._build_bots_page),
+            ("ai", self._build_ai_page),
+            ("commands", self._build_commands_page),
+            ("logs", self._build_logs_page),
+        ):
+            self._page_index[name] = self.pages.addWidget(builder())
+
+        root_layout = QHBoxLayout()
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._build_sidebar())
+        content = QVBoxLayout()
+        content.setContentsMargins(22, 18, 22, 10)
+        content.addWidget(self.pages, 1)
+        content.addWidget(self.status_label)
+        root_layout.addLayout(content, 1)
+        root = QWidget()
+        root.setObjectName("root")
+        root.setLayout(root_layout)
+        self.setCentralWidget(root)
+        self.show_page("dashboard")
+        self.activity.add("Manager", "Manager started.")
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setInterval(REFRESH_INTERVAL_MS)
+        self.refresh_timer.timeout.connect(self.refresh_instances)
+        if auto_refresh:
+            self.refresh_timer.start()
+
+        self.refresh_instances()
+        self.refresh_ai_overview()
+
+    # -- layout ------------------------------------------------------------
+
+    def _build_sidebar(self) -> QFrame:
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(232)
+        logo = QLabel(dash.LOGO_GLYPH)
+        logo.setObjectName("brandLogo")
+        title = QLabel("DarkAbyss")
+        title.setObjectName("brandTitle")
+        subtitle = dash.muted(f"Bot Manager · {self._version_text}")
+        brand_text = QVBoxLayout()
+        brand_text.setSpacing(0)
+        brand_text.addWidget(title)
+        brand_text.addWidget(subtitle)
+        brand = QHBoxLayout()
+        brand.addWidget(logo)
+        brand.addLayout(brand_text, 1)
+
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(14, 18, 14, 16)
+        layout.setSpacing(6)
+        layout.addLayout(brand)
+        layout.addSpacing(18)
+        for name, label in (
+            ("dashboard", "\U0001f3e0   Dashboard"),
+            ("bots", "\U0001f916   Bots"),
+            ("ai", "\U0001f9e0   AI Providers"),
+            ("commands", "∕   Commands && Tools"),
+            ("logs", "\U0001f4c4   Logs"),
+        ):
+            button = dash.nav_button(label, lambda _checked=False, page=name: self.show_page(page))
+            self.nav_buttons[name] = button
+            layout.addWidget(button)
+        settings_nav = dash.nav_button("⚙   Bot Setup", lambda _checked=False: self._open_setup_from_nav())
+        settings_nav.setCheckable(False)
+        layout.addWidget(settings_nav)
+        layout.addStretch(1)
+
+        status = QFrame()
+        status.setObjectName("sideStatus")
+        self.side_bot_dot = dash.dot("muted")
+        self.side_bot_label = QLabel("Bot status: —")
+        self.side_discord_label = dash.muted("Discord: —")
+        self.side_uptime_label = dash.muted("Uptime: —")
+        bot_row = QHBoxLayout()
+        bot_row.addWidget(self.side_bot_dot)
+        bot_row.addWidget(self.side_bot_label, 1)
+        status_layout = QVBoxLayout(status)
+        status_layout.setContentsMargins(14, 12, 14, 12)
+        status_layout.addLayout(bot_row)
+        status_layout.addWidget(self.side_discord_label)
+        status_layout.addWidget(self.side_uptime_label)
+        layout.addWidget(status)
+        return sidebar
+
+    @staticmethod
+    def _scroll_page(inner: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _build_dashboard_page(self) -> QWidget:
+        hero = QFrame()
+        hero.setObjectName("hero")
+        hero.setMinimumHeight(250)
+        hero_title = QLabel("DarkAbyss")
+        hero_title.setObjectName("heroTitle")
+        hero_subtitle = QLabel("Bot Manager")
+        hero_subtitle.setObjectName("heroSubtitle")
+        tagline = QLabel(dash.APP_TAGLINE)
+        tagline.setObjectName("heroTagline")
+        chips = QHBoxLayout()
+        chips.setSpacing(10)
+        for text in dash.FEATURE_CHIPS:
+            chip = QLabel(text)
+            chip.setObjectName("chip")
+            chips.addWidget(chip)
+        chips.addStretch(1)
+        quote = QLabel(dash.HERO_QUOTE)
+        quote.setObjectName("heroQuote")
+        quote.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        hero_left = QVBoxLayout()
+        hero_left.setSpacing(2)
+        hero_left.addWidget(hero_title)
+        hero_left.addWidget(hero_subtitle)
+        hero_left.addSpacing(10)
+        hero_left.addWidget(tagline)
+        hero_left.addStretch(1)
+        hero_left.addLayout(chips)
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(34, 26, 30, 22)
+        hero_layout.addLayout(hero_left, 1)
+        hero_layout.addWidget(quote, 0, Qt.AlignTop)
+
+        self.discord_card = dash.StatCard("\U0001f3ae", "Discord")
+        self.ai_card = dash.StatCard("\U0001f9e0", "AI Providers")
+        self.commands_card = dash.StatCard("∕", "Commands")
+        self.routing_card = dash.StatCard("\U0001f500", "AI Routing")
+        self.discord_card.clicked.connect(lambda: self.show_page("bots"))
+        self.ai_card.clicked.connect(lambda: self.show_page("ai"))
+        self.commands_card.clicked.connect(lambda: self.show_page("commands"))
+        self.routing_card.clicked.connect(lambda: self.open_ai_providers("Routing"))
+        cards = QHBoxLayout()
+        cards.setSpacing(14)
+        for card in (self.discord_card, self.ai_card, self.commands_card, self.routing_card):
+            cards.addWidget(card, 1)
+
+        bots_panel = dash.Panel("\U0001f916", "Bots")
+        manage_bots = bots_panel.add_header_button("Manage Bots")
+        manage_bots.clicked.connect(lambda: self.show_page("bots"))
+        avatar = QLabel(dash.LOGO_GLYPH)
+        avatar.setObjectName("avatar")
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setFixedSize(84, 84)
+        self.bot_name_label = QLabel("No bot selected")
+        self.bot_name_label.setObjectName("cardTitle")
+        self.bot_state_dot = dash.dot("muted")
+        self.bot_state_label = QLabel("Offline")
+        state_row = QHBoxLayout()
+        state_row.addWidget(self.bot_state_dot)
+        state_row.addWidget(self.bot_state_label)
+        state_row.addStretch(1)
+        self.bot_facts_label = dash.muted("")
+        self.bot_facts_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bot_text = QVBoxLayout()
+        bot_text.setSpacing(4)
+        bot_text.addWidget(self.bot_name_label)
+        bot_text.addLayout(state_row)
+        bot_text.addWidget(self.bot_facts_label)
+        bot_text.addStretch(1)
+        self.dashboard_toggle_button = QPushButton("▶  Start")
+        self.dashboard_toggle_button.clicked.connect(self.toggle_selected_bot)
+        dashboard_logs_button = QPushButton("\U0001f4c4  View Logs")
+        dashboard_logs_button.clicked.connect(lambda: self.show_page("logs"))
+        dashboard_setup_button = QPushButton("⚙  Settings")
+        dashboard_setup_button.clicked.connect(self._open_setup_from_nav)
+        bot_buttons = QVBoxLayout()
+        for button in (self.dashboard_toggle_button, dashboard_logs_button, dashboard_setup_button):
+            bot_buttons.addWidget(button)
+        bot_buttons.addStretch(1)
+        bot_row = QFrame()
+        bot_row.setObjectName("row")
+        bot_row_layout = QHBoxLayout(bot_row)
+        bot_row_layout.setContentsMargins(14, 14, 14, 14)
+        bot_row_layout.setSpacing(16)
+        bot_row_layout.addWidget(avatar, 0, Qt.AlignTop)
+        bot_row_layout.addLayout(bot_text, 1)
+        bot_row_layout.addLayout(bot_buttons)
+        bots_panel.body.addWidget(bot_row)
+
+        activity_panel = dash.Panel("\U0001f4c3", "Recent Activity")
+        view_all = activity_panel.add_header_button("View All Logs")
+        view_all.clicked.connect(lambda: self.show_page("logs"))
+        self.activity = dash.ActivityFeed(visible_rows=6)
+        activity_panel.body.addWidget(self.activity)
+
+        providers_panel = dash.Panel("\U0001f9e0", "AI Providers")
+        configure = providers_panel.add_header_button("Configure")
+        configure.clicked.connect(lambda: self.open_ai_providers())
+        self.provider_rows: list[dash.ProviderRow] = []
+        for row in self._make_provider_rows():
+            providers_panel.body.addWidget(row)
+
+        quick_panel = dash.Panel("⚡", "Quick Actions")
+        self.quick_toggle_button = dash.styled_button("▶  Start Bot", "primary")
+        self.quick_toggle_button.clicked.connect(self.toggle_selected_bot)
+        quick_test_button = dash.styled_button("\U0001f9e0  Test AI Providers", "secondary")
+        quick_test_button.clicked.connect(self.test_all_providers)
+        quick_logs_button = dash.styled_button("\U0001f4c4  View Logs", "quick")
+        quick_logs_button.clicked.connect(lambda: self.show_page("logs"))
+        quick_setup_button = dash.styled_button("⚙  Bot Setup", "quick")
+        quick_setup_button.clicked.connect(self._open_setup_from_nav)
+        quick_grid = QGridLayout()
+        quick_grid.setSpacing(12)
+        quick_grid.addWidget(self.quick_toggle_button, 0, 0)
+        quick_grid.addWidget(quick_test_button, 0, 1)
+        quick_grid.addWidget(quick_logs_button, 1, 0)
+        quick_grid.addWidget(quick_setup_button, 1, 1)
+        quick_panel.body.addLayout(quick_grid)
+
+        left = QVBoxLayout()
+        left.setSpacing(16)
+        left.addWidget(bots_panel)
+        left.addWidget(activity_panel, 1)
+        right = QVBoxLayout()
+        right.setSpacing(16)
+        right.addWidget(providers_panel)
+        right.addWidget(quick_panel)
+        right.addStretch(1)
+        columns = QHBoxLayout()
+        columns.setSpacing(16)
+        columns.addLayout(left, 11)
+        columns.addLayout(right, 9)
+
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(16)
+        layout.addWidget(hero)
+        layout.addLayout(cards)
+        layout.addLayout(columns)
+        layout.addStretch(1)
+        return self._scroll_page(inner)
+
+    def _make_provider_rows(self) -> list[dash.ProviderRow]:
+        rows = []
+        for provider_id, name, logo, tab in (
+            (GROQ_PROVIDER_ID, "Groq", "groq", "Groq"),
+            (GEMINI_PROVIDER_ID, "Gemini", "✦", "Gemini"),
+        ):
+            row = dash.ProviderRow(provider_id, name, logo)
+            row.test_button.clicked.connect(lambda _checked=False, pid=provider_id: self.test_provider(pid))
+            row.settings_button.clicked.connect(lambda _checked=False, tab_name=tab: self.open_ai_providers(tab_name))
+            self.provider_rows.append(row)
+            rows.append(row)
+        return rows
+
+    def _build_bots_page(self) -> QWidget:
+        title = QLabel("Bots")
+        title.setObjectName("heroSubtitle")
+        description = dash.muted(
+            "Every bot instance has its own token, config, logs and data. Select one to start, stop or set it up."
+        )
         button_row = QHBoxLayout()
         for button in (
             self.refresh_button,
@@ -1672,29 +1952,351 @@ class ManagerMainWindow(QMainWindow):
             self.setup_button,
             self.edit_config_button,
             self.create_admin_button,
-            self.ai_providers_button,
         ):
             button_row.addWidget(button)
         button_row.addStretch(1)
+        details_title = QLabel("Selected instance")
+        details_title.setObjectName("cardTitle")
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(18, 16, 18, 16)
+        panel_layout.setSpacing(12)
+        panel_layout.addWidget(self.instance_table, 2)
+        panel_layout.addLayout(button_row)
+        panel_layout.addWidget(details_title)
+        panel_layout.addWidget(self.details_view, 1)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addWidget(panel, 1)
+        return page
 
-        layout = QVBoxLayout()
-        layout.addWidget(self.instance_table)
-        layout.addLayout(button_row)
-        layout.addWidget(QLabel("Selected instance"))
-        layout.addWidget(self.details_view)
-        layout.addWidget(self.status_label)
+    def _build_ai_page(self) -> QWidget:
+        title = QLabel("AI Providers")
+        title.setObjectName("heroSubtitle")
+        description = dash.muted(
+            "Keys stay on this PC. The planning engine reads a short tool catalog and writes the plan; "
+            "the execution engine runs it with only the planned tools."
+        )
+        description.setWordWrap(True)
+        routing_panel = dash.Panel("\U0001f500", "Routing")
+        routing_button = routing_panel.add_header_button("Change Routing")
+        routing_button.clicked.connect(lambda: self.open_ai_providers("Routing"))
+        self.ai_routing_label = QLabel("")
+        self.ai_routing_label.setWordWrap(True)
+        routing_panel.body.addWidget(self.ai_routing_label)
+        providers_panel = dash.Panel("\U0001f9e0", "Providers")
+        providers_panel.header.addWidget(self.ai_providers_button)
+        for row in self._make_provider_rows():
+            providers_panel.body.addWidget(row)
+        safety_panel = dash.Panel("\U0001f6e1", "How the AI acts on your server")
+        safety = QLabel(
+            "• Only Discord actions through the bot's tools: no Windows commands, files or browser.\n"
+            "• Access: AI allowed user/role IDs in Bot Setup (Discord admins do not get AI automatically).\n"
+            "• Confirmations: 'plan once' (default) or 'every change' in Bot Setup; deletions, bans, kicks "
+            "and permission changes always ask with exact data.\n"
+            "• Nobody can use the bot to act on roles or members at or above their own highest role, "
+            "and Administrator is never granted."
+        )
+        safety.setWordWrap(True)
+        safety_panel.body.addWidget(safety)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(14)
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addWidget(routing_panel)
+        layout.addWidget(providers_panel)
+        layout.addWidget(safety_panel)
+        layout.addStretch(1)
+        return self._scroll_page(inner)
 
-        root = QWidget()
-        root.setLayout(layout)
-        self.setCentralWidget(root)
+    def _build_commands_page(self) -> QWidget:
+        title = QLabel("Commands & Tools")
+        title.setObjectName("heroSubtitle")
+        self.tool_count, tool_groups = dash.ai_tool_summary()
+        description = dash.muted(
+            f"Slash commands: {', '.join(dash.SLASH_COMMANDS)}. The AI assistant can use {self.tool_count} "
+            "Discord tools; destructive ones always ask for confirmation."
+        )
+        description.setWordWrap(True)
+        self.tools_tree = QTreeWidget()
+        self.tools_tree.setHeaderLabels(["Tool", "Risk", "What it does"])
+        self.tools_tree.setRootIsDecorated(True)
+        self.tools_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.tools_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        risk_colors = {"read": dash.COLORS["info"], "normal": dash.COLORS["ok"], "destructive": dash.COLORS["bad"]}
+        for category, tools in tool_groups.items():
+            parent = QTreeWidgetItem([f"{category} ({len(tools)})", "", ""])
+            for name, risk, text in tools:
+                child = QTreeWidgetItem([name, risk, text])
+                child.setForeground(1, QColor(risk_colors.get(risk, dash.COLORS["muted"])))
+                parent.addChild(child)
+            self.tools_tree.addTopLevelItem(parent)
+        self.tools_tree.expandAll()
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addWidget(self.tools_tree, 1)
+        return page
 
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.setInterval(REFRESH_INTERVAL_MS)
-        self.refresh_timer.timeout.connect(self.refresh_instances)
-        if auto_refresh:
-            self.refresh_timer.start()
+    def _build_logs_page(self) -> QWidget:
+        title = QLabel("Logs")
+        title.setObjectName("heroSubtitle")
+        self.log_instance_combo = QComboBox()
+        self.log_instance_combo.currentIndexChanged.connect(lambda _index: self.refresh_logs())
+        refresh = QPushButton("⟳  Refresh")
+        refresh.clicked.connect(self.refresh_logs)
+        open_folder = QPushButton("\U0001f4c2  Open Folder")
+        open_folder.clicked.connect(self.open_log_folder)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Bot:"))
+        controls.addWidget(self.log_instance_combo, 1)
+        controls.addWidget(refresh)
+        controls.addWidget(open_folder)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.log_view.setStyleSheet("font-family: Consolas, 'Cascadia Mono', monospace; font-size: 9pt;")
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        layout.addWidget(title)
+        layout.addLayout(controls)
+        layout.addWidget(self.log_view, 1)
+        return page
 
-        self.refresh_instances()
+    # -- navigation and dashboard state ------------------------------------
+
+    def show_page(self, name: str) -> None:
+        index = self._page_index.get(name)
+        if index is None:
+            return
+        self.pages.setCurrentIndex(index)
+        for page_name, button in self.nav_buttons.items():
+            button.setChecked(page_name == name)
+        if name == "logs":
+            self.refresh_logs()
+
+    def _open_setup_from_nav(self) -> None:
+        if self.selected_instance_id() is None and self.instance_table.rowCount() > 0:
+            self.instance_table.selectRow(0)
+        self.setup_selected_bot()
+
+    def _selected_info(self) -> manager_core.InstanceInfo | None:
+        instance_id = self.selected_instance_id()
+        info = next((item for item in self._last_infos if item.instance_id == instance_id), None)
+        return info or (self._last_infos[0] if self._last_infos else None)
+
+    def toggle_selected_bot(self) -> None:
+        info = self._selected_info()
+        if info is None:
+            self._show_error("Add a bot first.")
+            return
+        self._select_instance_by_id(info.instance_id)
+        if info.state == manager_core.STATE_RUNNING:
+            self.stop_selected()
+        else:
+            self.start_selected()
+
+    def _record_state_changes(self, infos: list[manager_core.InstanceInfo]) -> None:
+        for info in infos:
+            previous = self._previous_states.get(info.instance_id)
+            if previous is not None and previous != info.state:
+                if info.state == manager_core.STATE_RUNNING:
+                    self.activity.add("Bot", f"{info.display_name} started (PID {info.pid}).")
+                elif info.exit_code not in (None, 0):
+                    self.activity.add("Error", f"{info.display_name} stopped with exit code {info.exit_code}. See Logs.")
+                else:
+                    self.activity.add("Bot", f"{info.display_name} stopped.")
+            self._previous_states[info.instance_id] = info.state
+
+    def _refresh_dashboard(self) -> None:
+        infos = self._last_infos
+        running = [info for info in infos if info.state == manager_core.STATE_RUNNING]
+        info = self._selected_info()
+        if info is None:
+            connection, color = "No bot", "muted"
+        else:
+            connection, color = dash.bot_connection_state(info)
+        self.discord_card.update_card(
+            connection if info is not None else "No bot yet",
+            color,
+            f"{len(running)} of {len(infos)} bot(s) running",
+        )
+        tool_text = f"{self.tool_count} AI tools" if self.tool_count else "AI tools unavailable"
+        self.commands_card.update_card(f"{len(dash.SLASH_COMMANDS)} slash commands", "accent", tool_text)
+
+        is_running = info is not None and info.state == manager_core.STATE_RUNNING
+        toggle_text = "■  Stop Bot" if is_running else "▶  Start Bot"
+        self.quick_toggle_button.setText(toggle_text)
+        self.dashboard_toggle_button.setText("■  Stop" if is_running else "▶  Start")
+        busy = info is not None and info.instance_id in self._busy_instances
+        self.quick_toggle_button.setEnabled(info is not None and not busy)
+        self.dashboard_toggle_button.setEnabled(info is not None and not busy)
+        if info is None:
+            self.bot_name_label.setText("No bot yet")
+            self.bot_state_label.setText("Use Bots → Add Bot")
+            dash.set_dot_color(self.bot_state_dot, "muted")
+            self.bot_facts_label.setText("")
+        else:
+            self.bot_name_label.setText(info.display_name)
+            self.bot_state_label.setText(connection)
+            dash.colored(self.bot_state_label, color)
+            dash.set_dot_color(self.bot_state_dot, color)
+            facts = [
+                f"ID: {info.instance_id}",
+                f"Type: {info.bot_type_display_name} {info.bot_version}",
+                f"Commands: {len(dash.SLASH_COMMANDS)} slash · {self.tool_count} AI tools",
+            ]
+            if info.pid is not None:
+                facts.append(f"PID: {info.pid}")
+            if info.uptime_seconds is not None:
+                facts.append(f"Uptime: {format_uptime(info.uptime_seconds)}")
+            self.bot_facts_label.setText("\n".join(facts))
+
+        self.side_bot_label.setText(f"Bot status: {'Online' if connection == 'Online' else ('Running' if is_running else 'Offline')}")
+        dash.set_dot_color(self.side_bot_dot, color if info is not None else "muted")
+        self.side_discord_label.setText(f"Discord: {connection if is_running else 'not connected'}")
+        uptime = format_uptime(info.uptime_seconds) if info is not None and info.uptime_seconds is not None else "—"
+        self.side_uptime_label.setText(f"Uptime: {uptime}")
+        self._refresh_log_choices()
+
+    def refresh_ai_overview(self) -> None:
+        overview = dash.provider_overview(
+            ai_platform.AISettingsStore(),
+            ai_platform.CredentialStore(),
+            (
+                (GROQ_PROVIDER_ID, GROQ_PROFILE_ID, GROQ_CREDENTIAL_REF),
+                (GEMINI_PROVIDER_ID, GEMINI_PROFILE_ID, GEMINI_CREDENTIAL_REF),
+            ),
+        )
+        names = {GROQ_PROFILE_ID: "Groq", GEMINI_PROFILE_ID: "Gemini"}
+        providers = overview["providers"]
+        configured = [name for pid, name in ((GROQ_PROVIDER_ID, "Groq"), (GEMINI_PROVIDER_ID, "Gemini")) if providers[pid]["configured"]]
+        for row in self.provider_rows:
+            facts = providers[row.provider_id]
+            tested = self._provider_tests.get(row.provider_id)
+            if row.provider_id in self._provider_tests_running:
+                text, color = "Testing...", "warn"
+            elif tested is not None:
+                text, color = (tested[1], "ok") if tested[0] else (tested[1], "bad")
+            elif facts["configured"]:
+                text, color = "Configured", "info"
+            else:
+                text, color = "Not configured", "muted"
+            row.set_state(text, color, facts["model"], facts["roles"])
+            row.test_button.setEnabled(facts["configured"] and row.provider_id not in self._provider_tests_running)
+        if not overview["valid"]:
+            self.ai_card.update_card("Settings invalid", "bad", "Open AI Providers to fix")
+        else:
+            self.ai_card.update_card(
+                f"{len(configured)} configured", "ok" if configured else "muted", ", ".join(configured) or "Add a Groq or Gemini key"
+            )
+        planner = names.get(overview["planner"] or "", overview["planner"] or "not set")
+        executor = names.get(overview["executor"] or "", overview["executor"] or "not set")
+        routed = bool(overview["planner"] and overview["executor"])
+        self.routing_card.update_card(f"plan: {planner}", "accent" if routed else "muted", f"run: {executor}", "ok" if routed else "muted")
+        self.ai_routing_label.setText(
+            f"Planning (thinks): {planner}\nExecution (acts): {executor}\n"
+            "Change it in AI Providers → Routing. Using one engine for both is fine too."
+        )
+
+    # -- AI provider tests ---------------------------------------------------
+
+    def test_provider(self, provider_id: str) -> None:
+        if provider_id in self._provider_tests_running:
+            return
+        credential_ref = GROQ_CREDENTIAL_REF if provider_id == GROQ_PROVIDER_ID else GEMINI_CREDENTIAL_REF
+        factory = create_groq_provider if provider_id == GROQ_PROVIDER_ID else create_gemini_provider
+        name = "Groq" if provider_id == GROQ_PROVIDER_ID else "Gemini"
+        credential_store = ai_platform.CredentialStore()
+        if not credential_store.exists(provider_id, credential_ref):
+            self._set_light_error(f"{name}: no API key saved. Open AI Providers to add one.")
+            return
+        self._provider_tests_running.add(provider_id)
+        self.refresh_ai_overview()
+
+        def run_action() -> ai_platform.Availability:
+            import asyncio
+
+            return asyncio.run(factory(credential_store).test_connection(credential_ref))
+
+        self._start_worker(run_action, lambda result: self._finish_provider_test(provider_id, name, result))
+
+    def test_all_providers(self) -> None:
+        credential_store = ai_platform.CredentialStore()
+        started = False
+        for provider_id, credential_ref in ((GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF), (GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF)):
+            if credential_store.exists(provider_id, credential_ref):
+                self.test_provider(provider_id)
+                started = True
+        if not started:
+            self._set_light_error("No AI provider key is saved yet. Open AI Providers to add one.")
+
+    def _finish_provider_test(self, provider_id: str, name: str, result: ActionResult) -> None:
+        self._provider_tests_running.discard(provider_id)
+        availability = result.value if result.ok else None
+        if isinstance(availability, ai_platform.Availability) and availability.ok:
+            self._provider_tests[provider_id] = (True, "Connected")
+            self.activity.add("AI", f"{name} connection test successful.")
+        else:
+            state = getattr(availability, "state", None)
+            reason = {
+                ai_platform.AvailabilityState.CREDENTIAL_INVALID: "Invalid API key",
+                ai_platform.AvailabilityState.ACCESS_FORBIDDEN: "Access forbidden",
+                ai_platform.AvailabilityState.CREDENTIAL_MISSING: "No key saved",
+            }.get(state, "Unavailable")
+            self._provider_tests[provider_id] = (False, reason)
+            self.activity.add("Error", f"{name} connection test failed: {reason}.")
+        self.refresh_ai_overview()
+
+    # -- logs ------------------------------------------------------------------
+
+    def _refresh_log_choices(self) -> None:
+        current = self.log_instance_combo.currentData()
+        wanted = [(info.instance_id, info.display_name) for info in self._last_infos]
+        existing = [self.log_instance_combo.itemData(index) for index in range(self.log_instance_combo.count())]
+        if existing == [instance_id for instance_id, _name in wanted]:
+            return
+        self.log_instance_combo.blockSignals(True)
+        self.log_instance_combo.clear()
+        for instance_id, display_name in wanted:
+            self.log_instance_combo.addItem(f"{display_name} ({instance_id})", instance_id)
+        index = self.log_instance_combo.findData(current)
+        self.log_instance_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.log_instance_combo.blockSignals(False)
+
+    def _log_info(self) -> manager_core.InstanceInfo | None:
+        instance_id = self.log_instance_combo.currentData()
+        return next((info for info in self._last_infos if info.instance_id == instance_id), None)
+
+    def refresh_logs(self) -> None:
+        info = self._log_info()
+        if info is None:
+            self.log_view.setPlainText("No bot selected.")
+            return
+        stderr = dash.read_log_tail(info.stderr_log_path)
+        stdout = dash.read_log_tail(info.stdout_log_path, 16 * 1024)
+        self.log_view.setPlainText(
+            f"=== {info.stderr_log_path.name} (Discord + errors) ===\n{stderr or '(empty)'}\n\n"
+            f"=== {info.stdout_log_path.name} (bot messages) ===\n{stdout or '(empty)'}"
+        )
+        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+
+    def open_log_folder(self) -> None:
+        info = self._log_info()
+        if info is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(info.logs_dir)))
 
     @property
     def last_error(self) -> str:
@@ -1715,6 +2317,7 @@ class ManagerMainWindow(QMainWindow):
             self._set_light_error(f"Refresh failed: {exc}")
             return
         self._last_infos = infos
+        self._record_state_changes(infos)
         self.instance_table.setRowCount(len(infos))
         for row_index, info in enumerate(infos):
             for column_index, value in enumerate(instance_info_to_display_row(info)):
@@ -1724,6 +2327,7 @@ class ManagerMainWindow(QMainWindow):
         self._restore_selection(selected_id)
         self._set_status(f"Loaded {len(infos)} instance(s).")
         self._update_selected_details()
+        self._refresh_dashboard()
 
     def start_selected(self) -> None:
         self._dispatch_lifecycle_action("start", lambda instance_id: self.manager.start(instance_id))
@@ -1770,9 +2374,19 @@ class ManagerMainWindow(QMainWindow):
         self._select_instance_by_id(instance_id)
         self.setup_selected_bot()
 
-    def open_ai_providers(self) -> None:
+    def open_ai_providers(self, tab: str | None = None) -> None:
         dialog = AIProviderSettingsDialog(parent=self)
+        if tab:
+            tabs = getattr(dialog, "provider_tabs", None)
+            if isinstance(tabs, QTabWidget):
+                for index in range(tabs.count()):
+                    if tabs.tabText(index) == tab:
+                        tabs.setCurrentIndex(index)
+                        break
         dialog.exec()
+        # Keys, models or routing may have changed; earlier test results may be stale.
+        self._provider_tests.clear()
+        self.refresh_ai_overview()
 
     def closeEvent(self, event) -> None:
         if self._allow_close:
@@ -1909,6 +2523,10 @@ class ManagerMainWindow(QMainWindow):
         has_selection = instance_id is not None
         for button in (self.start_button, self.stop_button, self.restart_button, self.setup_button, self.edit_config_button):
             button.setEnabled(has_selection and not busy)
+        if hasattr(self, "quick_toggle_button") and busy:
+            # Disable the dashboard Start/Stop immediately while an action runs.
+            self.quick_toggle_button.setEnabled(False)
+            self.dashboard_toggle_button.setEnabled(False)
 
     def _set_status(self, message: str) -> None:
         self._last_error = ""
@@ -1921,6 +2539,8 @@ class ManagerMainWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         self._last_error = message
         self.status_label.setText(f"Error: {message}")
+        if hasattr(self, "activity"):
+            self.activity.add("Error", message.splitlines()[0][:160] if message else "Error")
         QMessageBox.critical(self, "DarkAbyss Bot Manager", message)
 
 
@@ -1936,8 +2556,10 @@ def main(manager: manager_core.BotProcessManager | None = None) -> int:
     except Exception as exc:
         QMessageBox.critical(None, "DarkAbyss Bot Manager", f"Startup failed: {exc}")
         return 1
+    app.setStyleSheet(dash.THEME_QSS)
     window = ManagerMainWindow(manager=manager)
-    window.resize(980, 720)
+    window.setMinimumSize(1100, 720)
+    window.resize(1400, 900)
     window.show()
     return app.exec()
 
