@@ -503,6 +503,52 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         # The fallback starts over from the original messages only.
         self.assertFalse(any(m.role.value == "tool" for m in fallback.requests[0][0].messages))
 
+    async def test_auto_fallback_false_never_switches_and_alternative_is_offered(self):
+        ai_platform, ai_orchestrator, admin_tools = load_modules()
+        primary = FakeProvider(ai_platform, "primary", error=RuntimeError("503"))
+        fallback = FakeProvider(ai_platform, "fallback", responses=[ai_platform.AIResponse(content="fallback")])
+        orchestrator = self.read_fallback_orchestrator(ai_platform, ai_orchestrator, primary, fallback)
+
+        result = await orchestrator.orchestrate(
+            ai_orchestrator.OrchestratorRequest(
+                messages=(self.user_message(ai_platform),), task_class="ROUTINE", auto_fallback=False
+            ),
+            executor=FakeExecutor(admin_tools),
+        )
+
+        self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.UNAVAILABLE)
+        self.assertEqual(result.profile_id, "primary")
+        self.assertEqual(fallback.requests, [])
+        self.assertEqual(
+            orchestrator.alternative_profile("ROUTINE", ("primary",)),
+            {"profile_id": "fallback", "provider_id": "fallback", "model_id": "fake-model"},
+        )
+        self.assertIsNone(orchestrator.alternative_profile("ROUTINE", ("primary", "fallback")))
+
+        manual = await orchestrator.orchestrate(
+            ai_orchestrator.OrchestratorRequest(
+                messages=(self.user_message(ai_platform),),
+                task_class="ROUTINE",
+                manual_profile_id="fallback",
+                auto_fallback=False,
+            ),
+            executor=FakeExecutor(admin_tools),
+        )
+        self.assertEqual(manual.content, "fallback")
+
+    async def test_provider_error_text_is_kept_only_for_sanitized_platform_errors(self):
+        ai_platform, ai_orchestrator, admin_tools = load_modules()
+        limited = FakeProvider(ai_platform, "primary", error=ai_platform.AIPlatformError("Groq rate limit or quota was reached."))
+        crashed = FakeProvider(ai_platform, "fallback", error=RuntimeError("Bearer sk-secret"))
+        orchestrator = self.read_fallback_orchestrator(ai_platform, ai_orchestrator, limited, crashed)
+        request = ai_orchestrator.OrchestratorRequest(messages=(self.user_message(ai_platform),), task_class="ROUTINE")
+
+        result = await orchestrator.orchestrate(request, executor=FakeExecutor(admin_tools))
+
+        messages = [attempt.message for attempt in result.attempts]
+        self.assertIn("Provider failed. Groq rate limit or quota was reached.", messages)
+        self.assertNotIn("sk-secret", json.dumps(result.public_dict()))
+
     def read_fallback_orchestrator(self, ai_platform, ai_orchestrator, primary, fallback):
         settings = ai_platform.AISettings(
             profiles=(self.profile(ai_platform, "primary", "primary"), self.profile(ai_platform, "fallback", "fallback")),

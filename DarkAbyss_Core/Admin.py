@@ -1,5 +1,6 @@
 import argparse
 import msvcrt
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -316,6 +317,13 @@ def configure_message_content_intent(client: discord.Client, enabled: bool) -> N
     client._connection._intents.message_content = bool(enabled)
 
 
+LOGIN_FAILURE_HELP = (
+    "LoginFailure: Discord rejected the bot token (401 Unauthorized). The token was reset or mistyped. "
+    "Developer Portal -> Application -> Bot -> Reset Token, then paste the new token in Manager -> "
+    "Bot Setup -> Discord bot token and start the bot again."
+)
+
+
 def message_content_requested(config: dict) -> bool:
     """Message Content Intent is needed by the control channel or by AI message reading."""
     return natural_ai_enabled(config) or config.get("ai_read_message_content") is True
@@ -577,6 +585,10 @@ def main(argv: list[str] | None = None) -> int:
             if not read_content:
                 raise  # unchanged pre-AI-5 behaviour (e.g. Server Members Intent missing)
             print(PRIVILEGED_INTENTS_HELP)
+            return 1
+        except discord.LoginFailure:
+            # A packaged (windowed) bot would otherwise show a raw traceback dialog.
+            print(LOGIN_FAILURE_HELP, file=sys.stderr)
             return 1
     return 0
 

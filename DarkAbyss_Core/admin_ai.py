@@ -456,6 +456,8 @@ def render_result_messages(result: Any) -> list[str]:
             text = EXPIRED_MESSAGE
     elif status == "UNAVAILABLE":
         text = "AI is currently unavailable." if executed else UNAVAILABLE_MESSAGE
+        if message.startswith("Provider failed."):
+            text += f"\nReason: {failure_reason(result)}"
     elif status == "INVALID_TOOL_PLAN":
         text = "The AI proposed an invalid action plan; nothing from that plan was executed."
         if message:

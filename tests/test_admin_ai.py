@@ -1903,6 +1903,128 @@ class PlanApprovalTests(AdminAITestBase):
         self.assertEqual(self.admin_ai.memory_text(result), "Done [actions: create_role ok, delete_role FAILED]")
 
 
+class SwitchingOrchestrator(ScriptedOrchestrator):
+    """Scripted orchestrator that also offers an alternative engine."""
+
+    def __init__(self, results, alternatives):
+        super().__init__(results)
+        self.alternatives = alternatives
+        self.alternative_calls = []
+
+    def alternative_profile(self, task_class, exclude_profile_ids=()):
+        self.alternative_calls.append((str(getattr(task_class, "value", task_class)), tuple(exclude_profile_ids)))
+        for alternative in self.alternatives:
+            if alternative["profile_id"] not in exclude_profile_ids:
+                return alternative
+        return None
+
+
+class EngineSwitchTests(PlanApprovalTests):
+    GROQ = {"profile_id": "groq-default", "provider_id": "groq", "model_id": "oss"}
+    GEMINI = {"profile_id": "gemini-default", "provider_id": "gemini", "model_id": "flash"}
+
+    def failed(self, provider, executed=()):
+        return self.ai_orchestrator.OrchestratorResult(
+            status=self.ai_orchestrator.OrchestratorStatus.UNAVAILABLE,
+            profile_id=provider["profile_id"],
+            provider_id=provider["provider_id"],
+            model_id=provider["model_id"],
+            executed_tools=executed,
+            message=f"Provider failed. {provider['provider_id'].capitalize()} rate limit or quota was reached.",
+        )
+
+    def switching_transport(self, results, alternatives):
+        orchestrator = SwitchingOrchestrator(results, alternatives)
+        transport = self.make_transport(orchestrator)
+        transport.planning = True
+        return transport, orchestrator
+
+    def offer(self, interaction):
+        content, kwargs = interaction.followup.sent[-1]
+        self.assertIsInstance(kwargs.get("view"), self.admin_ai.SwitchEngineView)
+        return content, kwargs["view"]
+
+    async def test_executor_failure_asks_then_other_engine_continues_without_repeating(self):
+        plan = {"mode": "act", "tools": ["create_role"], "steps": ["Create role Gamers"]}
+        done = self.ai_orchestrator.ExecutedToolSummary("c1", "create_role", True, "Created role Gamers.")
+        transport, orchestrator = self.switching_transport(
+            [
+                self.completed(json.dumps(plan), **self.GROQ),
+                self.failed(self.GEMINI, executed=(done,)),
+                self.completed("Finished by Groq.", **self.GROQ),
+            ],
+            [self.GROQ],
+        )
+        interaction = await self.start(transport, prompt="make roles")
+        _content, approval = self.approval(interaction)
+        click = self.interaction()
+        await transport.handle_plan_decision(click, approval.state, approved=True, view=approval)
+
+        content, view = self.offer(click)
+        self.assertIn("Gemini (flash)", content)
+        self.assertIn("rate limit", content)
+        self.assertIn("create_role", content)
+        self.assertEqual(view.continue_button.label, "Continue with Groq")
+        self.assertEqual(len(orchestrator.calls), 2)
+        self.assertEqual(orchestrator.alternative_calls[-1], ("ROUTINE", ("gemini-default",)))
+        executor_request = orchestrator.calls[1][0]
+        self.assertFalse(executor_request.auto_fallback)  # never switch silently
+
+        # Only the requester may decide.
+        stranger = self.guild.add_member(FakeMember(903, "stranger", roles=[self.ai_role]))
+        await transport.handle_switch_decision(self.interaction(user=stranger), view.state, approved=True, view=view)
+        self.assertEqual(len(orchestrator.calls), 2)
+
+        go = self.interaction()
+        await transport.handle_switch_decision(go, view.state, approved=True, view=view)
+
+        request, policy, _executor = orchestrator.calls[2]
+        self.assertEqual(request.manual_profile_id, "groq-default")
+        self.assertFalse(policy.confirm_normal)  # the approved plan stays approved
+        self.assertIn("ALREADY RAN", request.messages[0].content)
+        self.assertIn("create_role ok: Created role Gamers.", request.messages[0].content)
+        self.assertTrue(any("Finished by Groq." in text for text, _ in go.followup.sent))
+
+    async def test_planner_failure_asks_then_other_engine_plans(self):
+        transport, orchestrator = self.switching_transport(
+            [self.failed(self.GROQ), self.completed('{"mode":"answer","answer":"Hello from Gemini"}', **self.GEMINI)],
+            [self.GEMINI],
+        )
+        interaction = await self.start(transport, prompt="hi")
+        content, view = self.offer(interaction)
+        self.assertIn("during planning", content)
+        self.assertIn("Nothing has been changed yet", content)
+        self.assertEqual(len(orchestrator.calls), 1)
+
+        go = self.interaction()
+        await transport.handle_switch_decision(go, view.state, approved=True, view=view)
+
+        planner_request = orchestrator.calls[1][0]
+        self.assertEqual(planner_request.manual_profile_id, "gemini-default")
+        self.assertEqual(planner_request.task_class.value, "PLANNER")
+        self.assertTrue(any("Hello from Gemini" in text for text, _ in go.followup.sent))
+
+    async def test_cancel_stops_and_no_alternative_shows_reason(self):
+        transport, orchestrator = self.switching_transport([self.failed(self.GROQ)], [self.GEMINI])
+        interaction = await self.start(transport, prompt="hi")
+        _content, view = self.offer(interaction)
+        stop = self.interaction()
+        await transport.handle_switch_decision(stop, view.state, approved=False, view=view)
+        self.assertEqual(len(orchestrator.calls), 1)
+        self.assertIn("Stopped", stop.response.edited[-1]["content"])
+
+        # Executor fails and nothing else is usable: plain message with the reason.
+        self.config["ai_confirmation_mode"] = "strict"
+        plan = {"mode": "act", "tools": ["list_members"], "steps": ["List"]}
+        transport, orchestrator = self.switching_transport(
+            [self.completed(json.dumps(plan), **self.GROQ), self.failed(self.GEMINI)], []
+        )
+        interaction = await self.start(transport, prompt="who is here")
+        last = interaction.followup.sent[-1]
+        self.assertNotIn("view", last[1])
+        self.assertIn("Reason: Gemini rate limit or quota was reached.", last[0])
+
+
 class ConversationMemoryTests(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(CORE_ROOT))
@@ -1948,6 +2070,22 @@ class MessageContentToolTests(AdminAITestBase):
         )
         self.assertFalse(result.ok)
         self.assertIn("Message text is not available", result.message)
+
+
+class LoginFailureTests(unittest.TestCase):
+    def test_rejected_token_exits_cleanly_with_actionable_message(self):
+        import discord
+
+        admin = import_admin_module()
+        config = {"allow_server_administrators": True, "allowed_user_ids": [], "allowed_role_ids": [], "audit_channel_id": None}
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            code, _seen = MessageContentIntentTests.run_main(
+                None, admin, config, run_side_effect=discord.LoginFailure("Improper token has been passed.")
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("LoginFailure", captured.getvalue())
+        self.assertIn("Reset Token", captured.getvalue())
 
 
 class AI62AdminWiringTests(unittest.TestCase):
