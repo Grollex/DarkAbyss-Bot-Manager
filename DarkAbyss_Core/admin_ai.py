@@ -690,14 +690,71 @@ def render_plan_approval(plan: dict[str, Any]) -> str:
     return clip_text("\n".join(lines), AI_MESSAGE_CHUNK_CHARS - AI_ENGINE_FOOTER_CHARS * 2)
 
 
+MAX_PRIOR_TOOL_LINES = 20
+
+
+def engine_name(provider_id: Any, model_id: Any = None) -> str:
+    name = PROVIDER_DISPLAY_NAMES.get(str(provider_id or ""), str(provider_id or "AI"))
+    return _code_safe(_printable(f"{name} ({model_id})" if model_id else name, 80))
+
+
+def failure_reason(result: Any) -> str:
+    """Sanitized provider failure text ("Gemini rate limit or quota was reached.")."""
+    message = str(getattr(result, "message", "") or "")
+    if message.startswith("Provider failed."):
+        message = message[len("Provider failed.") :].strip()
+    return _printable(message, 200) or "unknown error"
+
+
+def render_switch_offer(stage: str, failed: Any, alternative: dict[str, str], executed: Any) -> str:
+    failed_name = engine_name(getattr(failed, "provider_id", None), getattr(failed, "model_id", None))
+    alt_name = engine_name(alternative.get("provider_id"), alternative.get("model_id"))
+    role = "planning" if stage == "plan" else "execution"
+    lines = [f"⚠️ **{failed_name}** stopped during {role}: {failure_reason(failed)}"]
+    done = render_executed_tools(executed)
+    if done:
+        lines.append(done)
+    if stage == "plan":
+        lines.append(f"Continue **planning** with **{alt_name}**? Nothing has been changed yet.")
+    else:
+        lines.append(
+            f"Continue **the task** with **{alt_name}**? It gets the same plan and the list of actions "
+            "already done, so it does not repeat them."
+        )
+    lines.append("Cancel stops here; actions that already ran are not undone.")
+    return clip_text("\n".join(lines), AI_MESSAGE_CHUNK_CHARS)
+
+
+def prior_tools_note(prior_tools: Any) -> str:
+    """Executor note: what another engine already did in this request."""
+    tools = tuple(prior_tools or ())
+    if not tools:
+        return ""
+    lines = [
+        "Another AI engine already worked on this request and stopped. These actions ALREADY RAN - do not "
+        "repeat them; read current state with read tools if needed and continue with the remaining steps:"
+    ]
+    for tool in tools[:MAX_PRIOR_TOOL_LINES]:
+        status = "ok" if getattr(tool, "ok", False) is True else "FAILED"
+        lines.append(f"- {getattr(tool, 'tool_name', '?')} {status}: {_printable(getattr(tool, 'message', ''), 160)}")
+    if len(tools) > MAX_PRIOR_TOOL_LINES:
+        lines.append(f"- ... and {len(tools) - MAX_PRIOR_TOOL_LINES} more.")
+    return "\n".join(lines)
+
+
+def memory_text_tools(tools: Any) -> str:
+    executed = [
+        f"{getattr(tool, 'tool_name', '?')} {'ok' if getattr(tool, 'ok', False) is True else 'FAILED'}"
+        for tool in tools or ()
+    ]
+    return f"[actions: {', '.join(executed[:10])}]" if executed else ""
+
+
 def memory_text(result: Any) -> str:
     """What the conversation memory keeps from one finished request."""
     status = getattr(getattr(result, "status", None), "value", None)
-    executed = [
-        f"{getattr(tool, 'tool_name', '?')} {'ok' if getattr(tool, 'ok', False) is True else 'FAILED'}"
-        for tool in getattr(result, "executed_tools", ()) or ()
-    ]
-    actions = f" [actions: {', '.join(executed[:10])}]" if executed else ""
+    tools_text = memory_text_tools(getattr(result, "executed_tools", ()))
+    actions = f" {tools_text}" if tools_text else ""
     if status == "COMPLETED":
         return f"{getattr(result, 'content', '') or ''}{actions}".strip()
     message = getattr(result, "message", "") or ""
@@ -744,11 +801,14 @@ class PendingConfirmation:
     planner_label: str = ""
     # (memory_key, prompt) recorded when the request reaches a final state.
     memory: Any = field(default=None, repr=False)
+    # Request run + plan, so an engine failure after Approve can offer a switch.
+    run: Any = field(default=None, repr=False)
+    plan: Any = field(default=None, repr=False)
 
 
 @dataclass
 class RequestRun:
-    """Everything needed to (re)start the executor stage of one request."""
+    """Everything needed to (re)start the planning or executor stage of one request."""
 
     binding: RequestBinding
     prompt: str = field(repr=False)
@@ -756,6 +816,55 @@ class RequestRun:
     task_mode: str
     attachments: dict[str, Any] = field(default_factory=dict, repr=False)
     planner_label: str = ""
+    # Policy of the executor stage (False only after an approved plan).
+    confirm_normal: bool = True
+    # Engines chosen by the user after a failure (manual profile override).
+    planner_profile_id: str | None = None
+    executor_profile_id: str | None = None
+    # Profiles that failed during this request; never offered again.
+    failed_profile_ids: list[str] = field(default_factory=list)
+    # Actions a failed executor engine already ran (told to the next engine).
+    prior_tools: tuple[Any, ...] = ()
+
+
+@dataclass
+class PendingSwitch:
+    """An engine failed; the user decides whether another engine continues."""
+
+    run: RequestRun
+    stage: str  # "plan" or "execute"
+    alternative: dict[str, str]
+    plan: Any = field(default=None, repr=False)
+    executed: tuple[Any, ...] = ()
+    delivery_mode: Any = "ephemeral"
+    summary: str = ""
+    resolved: bool = False
+
+
+class SwitchEngineView(discord.ui.View):
+    def __init__(self, transport: "AITransport", state: PendingSwitch) -> None:
+        super().__init__(timeout=CONFIRMATION_VIEW_TIMEOUT_SECONDS)
+        self.transport = transport
+        self.state = state
+        self.message: Any = None
+        name = PROVIDER_DISPLAY_NAMES.get(state.alternative.get("provider_id", ""), state.alternative.get("provider_id", "?"))
+        self.continue_button.label = clip_text(f"Continue with {name}", 80)
+
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary)
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.transport.handle_switch_decision(interaction, self.state, approved=True, view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.transport.handle_switch_decision(interaction, self.state, approved=False, view=self)
+
+    async def on_timeout(self) -> None:
+        self.state.resolved = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except Exception:
+                pass
 
 
 @dataclass
@@ -985,11 +1094,18 @@ class AITransport:
         attachments: dict[str, Any] | None = None,
         planner_label: str = "",
         memory: Any = None,
+        run: Any = None,
+        plan: Any = None,
     ) -> None:
         """Render a result. ``memory`` = (memory_key, prompt): recorded once the
-        request reaches a final state, carried along while a confirmation is pending."""
+        request reaches a final state, carried along while a confirmation is pending.
+        With ``run`` an executor engine failure offers another engine instead."""
         status = getattr(getattr(result, "status", None), "value", None)
         footer = render_engine_footer(result, planner_label)
+        if status == "UNAVAILABLE" and run is not None:
+            task_class = TASK_MODES.get(getattr(run, "task_mode", ""), "ROUTINE")
+            if await self._offer_switch(delivery, run, "execute", result, plan, task_class):
+                return
         if status != "NEEDS_CONFIRMATION" or not getattr(result, "confirmation_id", None):
             self._remember(memory, result)
         if status == "NEEDS_CONFIRMATION" and getattr(result, "confirmation_id", None):
@@ -1031,6 +1147,8 @@ class AITransport:
                 attachments=dict(attachments or {}),
                 planner_label=planner_label,
                 memory=memory,
+                run=run,
+                plan=plan,
             )
             view = self._view_factory(self, state)
             message = await delivery.send(state.summary, view=view)
@@ -1197,10 +1315,20 @@ class AITransport:
         and destructive ones are still confirmed with exact arguments.
         """
         attachments = dict(attachments or {})
-        guild = getattr(source, "guild", None)
-        memory_key = self.memory_key(binding)
         note = describe_attachments(attachments)
-        user_text = f"{prompt}\n\n{note}" if note else prompt
+        run = RequestRun(
+            binding=binding,
+            prompt=prompt,
+            user_text=f"{prompt}\n\n{note}" if note else prompt,
+            task_mode=task_mode,
+            attachments=attachments,
+        )
+        await self._planning_stage(delivery, source, run)
+
+    async def _planning_stage(self, delivery: Any, source: Any, run: "RequestRun") -> None:
+        """Plan (or answer), then plan approval or execution. Restartable with another engine."""
+        guild = getattr(source, "guild", None)
+        memory_key = self.memory_key(run.binding)
         config = self._try_load_config() or {}
         try:
             ai_platform, ai_orchestrator = _import_ai_modules()
@@ -1210,30 +1338,26 @@ class AITransport:
                 return
             policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=True)
             history = self._memory_messages(ai_platform, memory_key)
-            user_message = ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=user_text)
+            user_message = ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=run.user_text)
         except Exception as exc:
             print(f"/ai request failed: {type(exc).__name__}")
             await delivery.send(UNAVAILABLE_MESSAGE)
             return
 
-        run = RequestRun(
-            binding=binding,
-            prompt=prompt,
-            user_text=user_text,
-            task_mode=task_mode,
-            attachments=attachments,
-        )
         plan: dict[str, Any] | None = None
         if self.planning:
-            planned = await self._plan(
+            planned, failed = await self._plan(
                 orchestrator,
                 ai_platform,
                 ai_orchestrator,
                 guild,
                 (*history, user_message),
                 policy,
-                self._context_text(source, binding, include_ids=False),
+                self._context_text(source, run.binding, include_ids=False),
+                manual_profile_id=run.planner_profile_id,
             )
+            if failed is not None and await self._offer_switch(delivery, run, "plan", failed, None, "PLANNER"):
+                return
             if planned is not None:
                 plan, planner_result = planned
                 run.planner_label = engine_label(planner_result)
@@ -1244,7 +1368,7 @@ class AITransport:
                         texts[0] = with_footer(texts[0], footer)
                     for text in texts:
                         await delivery.send(text)
-                    self._remember((memory_key, prompt), text=plan["answer"])
+                    self._remember((memory_key, run.prompt), text=plan["answer"])
                     return
                 if confirmation_mode(config) == "plan" and plan_write_tools(plan):
                     await self._offer_plan(delivery, run, plan, render_engine_footer(planner_result))
@@ -1260,9 +1384,14 @@ class AITransport:
         *,
         confirm_normal: bool,
     ) -> None:
-        """Executor stage. ``confirm_normal=False`` only after the user approved ``plan``."""
+        """Executor stage. ``confirm_normal=False`` only after the user approved ``plan``.
+
+        Engines never switch silently: routing fallbacks are disabled here and
+        a provider failure offers the next engine to the user (_offer_switch).
+        """
         guild = getattr(source, "guild", None)
         memory_key = self.memory_key(run.binding)
+        run.confirm_normal = confirm_normal
         try:
             ai_platform, ai_orchestrator = _import_ai_modules()
             orchestrator = self.get_orchestrator()
@@ -1275,6 +1404,9 @@ class AITransport:
                 context_text=self._context_text(source, run.binding, include_ids=True),
                 message_content=self.message_content_enabled,
             )
+            note = prior_tools_note(run.prior_tools)
+            if note:
+                instruction += "\n" + note
             request = ai_orchestrator.OrchestratorRequest(
                 messages=(
                     ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=instruction),
@@ -1282,8 +1414,10 @@ class AITransport:
                     ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=run.user_text),
                 ),
                 task_class=ai_platform.TaskClass(TASK_MODES[run.task_mode]),
+                manual_profile_id=run.executor_profile_id,
                 allowed_tool_names=executor_tool_names(plan, run.prompt) if self.planning else None,
                 recover_errors=True,
+                auto_fallback=False,
             )
             policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=confirm_normal)
         except Exception as exc:
@@ -1303,8 +1437,111 @@ class AITransport:
             await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
             return
         await self._send_result(
-            delivery, result, run.binding, run.attachments, run.planner_label, memory=(memory_key, run.prompt)
+            delivery,
+            result,
+            run.binding,
+            run.attachments,
+            run.planner_label,
+            memory=(memory_key, run.prompt),
+            run=run,
+            plan=plan,
         )
+
+    async def _offer_switch(
+        self,
+        delivery: Any,
+        run: "RequestRun",
+        stage: str,
+        failed: Any,
+        plan: Any,
+        task_class: str,
+    ) -> bool:
+        """Offer another engine after a provider failure. False if none is usable.
+
+        Asks instead of switching silently: the user sees which engine failed,
+        why, what already ran, and which engine would continue.
+        """
+        finder = getattr(self._orchestrator, "alternative_profile", None)
+        failed_id = getattr(failed, "profile_id", None)
+        if not callable(finder) or not failed_id:
+            return False
+        if failed_id not in run.failed_profile_ids:
+            run.failed_profile_ids.append(failed_id)
+        try:
+            alternative = finder(task_class, tuple(run.failed_profile_ids))
+        except Exception as exc:
+            print(f"/ai engine switch lookup failed: {type(exc).__name__}")
+            return False
+        if not alternative:
+            return False
+        executed = tuple(getattr(failed, "executed_tools", ()) or ())
+        state = PendingSwitch(
+            run=run,
+            stage=stage,
+            alternative=dict(alternative),
+            plan=plan,
+            executed=executed,
+            delivery_mode=delivery.mode,
+        )
+        state.summary = render_switch_offer(stage, failed, state.alternative, executed)
+        view = SwitchEngineView(self, state)
+        message = await delivery.send(state.summary, view=view)
+        try:
+            view.message = message
+        except Exception:
+            pass
+        return True
+
+    async def handle_switch_decision(
+        self,
+        interaction: Any,
+        state: "PendingSwitch",
+        *,
+        approved: bool,
+        view: Any = None,
+    ) -> None:
+        """Continue with the offered engine, or stop. Same ownership checks as other buttons."""
+        if type(approved) is not bool:
+            raise ValueError("approved must be exactly True or False.")
+        if state.resolved:
+            await self._respond(interaction, INACTIVE_MESSAGE)
+            return
+        if not await self._check_button_owner(interaction, state.run.binding):
+            return
+        state.resolved = True
+        if view is not None:
+            try:
+                view.stop()
+            except Exception:
+                pass
+        alt_name = engine_name(state.alternative.get("provider_id"), state.alternative.get("model_id"))
+        decision = f"Continuing with {alt_name}..." if approved else "Stopped. Nothing else was executed."
+        try:
+            await interaction.response.edit_message(
+                content=clip_text(f"{state.summary}\n\n{decision}", AI_MESSAGE_CHUNK_CHARS),
+                view=None,
+                allowed_mentions=no_mentions(),
+            )
+        except Exception:
+            if not interaction.response.is_done():
+                await interaction.response.defer(
+                    ephemeral=DeliveryMode(state.delivery_mode) == DeliveryMode.EPHEMERAL, thinking=True
+                )
+        run = state.run
+        if not approved:
+            self._remember(
+                (self.memory_key(run.binding), run.prompt),
+                text=f"(Stopped: the AI engine failed and the user declined switching.) {memory_text_tools(state.executed)}".strip(),
+            )
+            return
+        delivery = InteractionDelivery(interaction, state.delivery_mode)
+        if state.stage == "plan":
+            run.planner_profile_id = state.alternative["profile_id"]
+            await self._planning_stage(delivery, interaction, run)
+            return
+        run.executor_profile_id = state.alternative["profile_id"]
+        run.prior_tools = (*run.prior_tools, *state.executed)
+        await self._execute(delivery, interaction, run, state.plan, confirm_normal=run.confirm_normal)
 
     async def _offer_plan(self, delivery: Any, run: "RequestRun", plan: dict[str, Any], footer: str) -> None:
         """Show the planner's plan once with Approve/Cancel (plan confirmation mode)."""
@@ -1326,12 +1563,16 @@ class AITransport:
         conversation: Any,
         policy: Any,
         context_text: str = "",
-    ) -> tuple[dict[str, Any], Any] | None:
+        *,
+        manual_profile_id: str | None = None,
+    ) -> tuple[tuple[dict[str, Any], Any] | None, Any]:
         """Tool-less planning call. PLANNER profile first, ROUTINE if no planner is configured.
 
         ``conversation`` is the memory plus the current USER message. Returns
-        (plan, result) or None when no usable plan was produced; the caller
-        then falls back to keyword tool routing. Never executes tools.
+        ((plan, result) or None, failed_result). ``failed_result`` is set when
+        a configured planning engine failed and another engine could take over
+        (the caller asks the user). ``(None, None)`` means no usable plan: the
+        caller falls back to keyword tool routing. Never executes tools.
         """
 
         async def refuse(tool_name: str, arguments: dict) -> admin_tools.ToolResult:
@@ -1343,25 +1584,34 @@ class AITransport:
             ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=planner_instruction(guild, context_text)),
             *conversation,
         )
+        switchable = callable(getattr(orchestrator, "alternative_profile", None))
         for task_class in ("PLANNER", "ROUTINE"):
             try:
                 request = ai_orchestrator.OrchestratorRequest(
                     messages=messages,
                     task_class=ai_platform.TaskClass(task_class),
+                    manual_profile_id=manual_profile_id,
                     allowed_tool_names=(),
+                    auto_fallback=False,
                 )
                 result = await orchestrator.orchestrate(request, executor=refuse, confirmation_policy=policy)
             except Exception as exc:
                 print(f"/ai planning failed: {type(exc).__name__}")
-                return None
+                return None, None
             status = getattr(getattr(result, "status", None), "value", None)
-            if status == "UNAVAILABLE" and task_class == "PLANNER":
-                continue
+            if status == "UNAVAILABLE":
+                # A configured engine that actually failed (limit, outage): ask
+                # before another engine plans. No engine configured for
+                # planning: plan with the ROUTINE engine as before.
+                if switchable and getattr(result, "profile_id", None):
+                    return None, result
+                if task_class == "PLANNER" and manual_profile_id is None:
+                    continue
             if status != "COMPLETED":
-                return None
+                return None, None
             plan = parse_plan(getattr(result, "content", None))
-            return (plan, result) if plan is not None else None
-        return None
+            return ((plan, result) if plan is not None else None), None
+        return None, None
 
     # -- /ai ---------------------------------------------------------------
 
@@ -1539,7 +1789,14 @@ class AITransport:
             await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
             return
         await self._send_result(
-            delivery, result, state.binding, state.attachments, state.planner_label, memory=state.memory
+            delivery,
+            result,
+            state.binding,
+            state.attachments,
+            state.planner_label,
+            memory=state.memory,
+            run=state.run,
+            plan=state.plan,
         )
 
     async def _check_button_owner(self, interaction: Any, binding: RequestBinding) -> bool:

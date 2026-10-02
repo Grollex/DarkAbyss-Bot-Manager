@@ -95,6 +95,9 @@ class OrchestratorRequest:
     # tool results (bounded by MAX_RECOVERED_ERRORS) so it can correct itself.
     # False keeps the strict fail-fast contract.
     recover_errors: bool = False
+    # False: never switch to a routing fallback profile automatically; the
+    # caller asks the user first (see AIOrchestrator.alternative_profile).
+    auto_fallback: bool = True
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -110,6 +113,8 @@ class OrchestratorRequest:
             raise ValueError("allow_fallback_on_manual_override must be boolean.")
         if type(self.recover_errors) is not bool:
             raise ValueError("recover_errors must be boolean.")
+        if type(self.auto_fallback) is not bool:
+            raise ValueError("auto_fallback must be boolean.")
         if self.allowed_tool_names is not None:
             object.__setattr__(self, "allowed_tool_names", _coerce_allowed_tool_names(self.allowed_tool_names))
 
@@ -452,7 +457,8 @@ class AIOrchestrator:
             request=request,
             settings=settings,
             profiles=profiles,
-            allow_fallback=not manual_override or request.allow_fallback_on_manual_override,
+            allow_fallback=request.auto_fallback
+            and (not manual_override or request.allow_fallback_on_manual_override),
         )
 
         # Ordered, accumulating attempt history across the whole routing pass:
@@ -768,6 +774,43 @@ class AIOrchestrator:
             attempt=AttemptRecord(profile.profile_id, profile.provider_id, profile.model_id, "SELECTED", fallback, availability.message),
         )
 
+    def alternative_profile(
+        self,
+        task_class: ai_platform.TaskClass | str,
+        exclude_profile_ids: Sequence[str] = (),
+    ) -> dict[str, str] | None:
+        """Another locally usable profile for ``task_class`` (no network).
+
+        Order: the task class's fallback list, then the other routed engines
+        (planner / routine / creative). Used by transports that ask the user
+        before switching engines (``OrchestratorRequest.auto_fallback=False``).
+        """
+        try:
+            task = ai_platform._coerce_task_class(task_class)
+            settings = self._settings_store.load()
+            profiles = ai_platform.AIProfileStore({profile.profile_id: profile for profile in settings.profiles})
+            routing = settings.routing
+            candidates = [
+                *routing.fallback_profiles_for(task),
+                routing.planner_profile_id,
+                routing.routine_profile_id,
+                routing.creative_profile_id,
+            ]
+        except Exception:
+            return None
+        excluded = set(exclude_profile_ids)
+        for profile_id in candidates:
+            if not profile_id or profile_id in excluded:
+                continue
+            selected = self._select_one_profile(profile_id, profiles, fallback=True)
+            if selected is not None:
+                return {
+                    "profile_id": selected.profile.profile_id,
+                    "provider_id": selected.profile.provider_id,
+                    "model_id": selected.profile.model_id,
+                }
+        return None
+
     async def _run_loop(
         self,
         *,
@@ -801,7 +844,12 @@ class AIOrchestrator:
                 if not isinstance(response, ai_platform.AIResponse):
                     raise OrchestratorError("Provider returned an invalid response.")
             except Exception as exc:
-                safe_message = _safe_exception_message("Provider failed.", exc)
+                if isinstance(exc, ai_platform.AIPlatformError) and not isinstance(exc, OrchestratorError):
+                    # Provider adapters raise fixed, sanitized texts ("Groq rate
+                    # limit or quota was reached.") - safe and useful to show.
+                    safe_message = _bounded_text(f"Provider failed. {exc}")
+                else:
+                    safe_message = _safe_exception_message("Provider failed.", exc)
                 failed = AttemptRecord(
                     context.profile.profile_id,
                     context.profile.provider_id,
