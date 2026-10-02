@@ -91,7 +91,7 @@ QTableWidget::item:selected, QTreeWidget::item:selected { background-color: #3b2
 QTabWidget::pane { border: 1px solid #2a2448; border-radius: 10px; top: -1px; }
 QTabBar::tab { background-color: #15122a; padding: 8px 18px; border-top-left-radius: 9px; border-top-right-radius: 9px; color: #bfb7e0; margin-right: 2px; }
 QTabBar::tab:selected { background-color: #2b2150; color: #ffffff; }
-QCheckBox { spacing: 8px; }
+QCheckBox { spacing: 8px; background: transparent; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #6b5ca8; border-radius: 4px; background-color: #110e20; }
 QCheckBox::indicator:hover { border-color: #a78bfa; }
 QCheckBox::indicator:checked { background-color: #8b5cf6; border-color: #c4b5fd; }

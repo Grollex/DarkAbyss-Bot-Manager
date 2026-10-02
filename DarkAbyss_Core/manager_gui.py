@@ -47,6 +47,7 @@ import admin_instance
 import ai_platform
 import app_paths
 import manager_dashboard as dash
+import manager_game_presence
 import manager_groups
 import manager_terminal
 import runtime_layout
@@ -1718,6 +1719,7 @@ class ManagerMainWindow(QMainWindow):
             ("bots", self._build_bots_page),
             ("ai", self._build_ai_page),
             ("terminal", self._build_terminal_page),
+            ("presence", self._build_presence_page),
             ("commands", self._build_commands_page),
             ("logs", self._build_logs_page),
         ):
@@ -1777,6 +1779,7 @@ class ManagerMainWindow(QMainWindow):
             ("bots", "\U0001f916   Bots"),
             ("ai", "\U0001f9e0   AI Providers"),
             ("terminal", "\U0001f4ac   AI Terminal"),
+            ("presence", "\U0001f3ae   Game Presence"),
             ("commands", "∕   Commands && Tools"),
             ("logs", "\U0001f4c4   Logs"),
         ):
@@ -1960,6 +1963,28 @@ class ManagerMainWindow(QMainWindow):
     def _build_terminal_page(self) -> QWidget:
         self.terminal_panel = manager_terminal.TerminalPanel(self._terminal_bots)
         return self.terminal_panel
+
+    def _build_presence_page(self) -> QWidget:
+        self.presence_panel = manager_game_presence.GamePresencePanel(
+            self._terminal_bots, self._config_api, self.restart_instance
+        )
+        return self.presence_panel
+
+    def _presence_enabled(self, instance_id: str) -> bool:
+        try:
+            section = self._config_api.get_config_snapshot(instance_id).effective.get("game_presence")
+        except Exception:
+            return False
+        return isinstance(section, dict) and section.get("enabled") is True
+
+    def restart_instance(self, instance_id: str) -> None:
+        """Restart one bot through the normal lifecycle path (used by module pages)."""
+        if self.current_group() is not None:
+            self._reload_group_tabs(select=None)
+            self.group_tabs.setCurrentIndex(0)
+            self.refresh_instances()
+        if self._select_instance_by_id(instance_id):
+            self.restart_selected()
 
     def _terminal_bots(self) -> list[tuple[str, str, manager_core.InstanceInfo]]:
         bots = []
@@ -2219,6 +2244,8 @@ class ManagerMainWindow(QMainWindow):
             self.refresh_logs()
         if name == "terminal":
             self.terminal_panel.refresh_targets()
+        if name == "presence":
+            self.presence_panel.refresh()
 
     def _open_setup_from_nav(self) -> None:
         if self.selected_instance_id() is None and self.instance_table.rowCount() > 0:
@@ -2291,6 +2318,7 @@ class ManagerMainWindow(QMainWindow):
                 f"Type: {info.bot_type_display_name} {info.bot_version}",
                 f"Commands: {len(dash.SLASH_COMMANDS)} slash · {self.tool_count} AI tools",
             ]
+            facts.append(f"Modules: AI assistant · Game Presence {'on' if self._presence_enabled(info.instance_id) else 'off'}")
             if info.pid is not None:
                 facts.append(f"PID: {info.pid}")
             if info.uptime_seconds is not None:

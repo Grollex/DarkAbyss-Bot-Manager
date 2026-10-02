@@ -29,6 +29,20 @@ AI_WHITELIST_DEFAULTS = {
     "ai_read_message_content": False,
     "ai_mention_enabled": False,
     "ai_mention_channel_ids": [],
+    # Game Presence: off by default for every existing installation.
+    "game_presence": {
+        "enabled": False,
+        "guild_id": None,
+        "channel_id": None,
+        "delay_minutes": 3,
+        "user_cooldown_minutes": 60,
+        "group_cooldown_minutes": 180,
+        "guild_cooldown_minutes": 15,
+        "voice_aware": True,
+        "allowlist": [],
+        "ignore_list": [],
+        "ai_rewrite": False,
+    },
 }
 
 

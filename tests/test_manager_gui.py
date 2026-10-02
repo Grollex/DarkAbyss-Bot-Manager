@@ -25,6 +25,7 @@ def load_gui_module(data_root: Path):
         "manager_dashboard",
         "manager_groups",
         "manager_terminal",
+        "manager_game_presence",
         "admin_terminal",
         "manager_core",
         "config_store",
@@ -296,7 +297,7 @@ class ManagerGuiTests(unittest.TestCase):
         window = self.make_window(manager=manager)
         self.finish_workers_immediately(window)
 
-        for page in ("dashboard", "bots", "ai", "commands", "logs"):
+        for page in ("dashboard", "bots", "ai", "terminal", "presence", "commands", "logs"):
             window.show_page(page)
             self.assertTrue(window.nav_buttons[page].isChecked())
             self.assertEqual(window.pages.currentIndex(), window._page_index[page])

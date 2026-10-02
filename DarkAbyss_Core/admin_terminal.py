@@ -175,6 +175,22 @@ def read_bot_status(runtime_dir: Path | str) -> dict[str, Any] | None:
     return status if isinstance(status, dict) else None
 
 
+def _safe_runtime_name(name: str) -> str:
+    if not isinstance(name, str) or not name.endswith(".json") or "/" in name or "\\" in name or name.startswith("."):
+        raise TerminalError("Invalid runtime file name.")
+    return name
+
+
+def write_runtime_json(runtime_dir: Path | str, name: str, payload: dict[str, Any]) -> None:
+    """Bot -> Manager status file (e.g. game_presence_status.json), written atomically."""
+    _atomic_write_json(Path(runtime_dir) / _safe_runtime_name(name), {**payload, "updated_at": time.time()})
+
+
+def read_runtime_json(runtime_dir: Path | str, name: str) -> dict[str, Any] | None:
+    value = _read_json(Path(runtime_dir) / _safe_runtime_name(name))
+    return value if isinstance(value, dict) else None
+
+
 # --------------------------------------------------------------------------
 # bot side: files
 # --------------------------------------------------------------------------
