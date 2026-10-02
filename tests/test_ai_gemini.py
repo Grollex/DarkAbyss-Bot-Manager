@@ -189,7 +189,9 @@ class GeminiAdapterTests(unittest.IsolatedAsyncioTestCase):
         declaration = transport.calls[0]["body"]["tools"][0]["functionDeclarations"][0]
         json.dumps(declaration)
         self.assertEqual(declaration["name"], "send_message")
-        self.assertIn("channel_id", declaration["parameters"]["properties"])
+        self.assertIn("channel_id", declaration["parametersJsonSchema"]["properties"])
+        self.assertNotIn("parameters", declaration)
+        self.assertIs(declaration["parametersJsonSchema"]["additionalProperties"], False)
         serialized = json.dumps(declaration)
         self.assertNotIn("TextChannel", serialized)
         self.assertNotIn("SECRET", serialized)

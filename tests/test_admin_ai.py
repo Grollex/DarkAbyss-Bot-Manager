@@ -113,6 +113,9 @@ class FakeGuild:
     def __init__(self, guild_id=10):
         self.id = guild_id
         self.name = "Guild"
+        # The default requester (OWNER_ID) owns the server, so AI-6 hierarchy
+        # guards allow its actions; non-owner cases are tested separately.
+        self.owner_id = 300
         self.member_count = 3
         self.text_channel = FakeChannel(100)
         self.channels = [self.text_channel]
@@ -483,9 +486,12 @@ class OrchestrationTests(AdminAITestBase):
                 await self.start(transport, prompt="hello there", mode=mode)
                 request, policy, executor = orchestrator.calls[-1]
                 self.assertEqual(request.task_class.value, expected)
-                self.assertEqual(len(request.messages), 1)
-                self.assertIs(request.messages[0].role, self.ai_platform.MessageRole.USER)
-                self.assertEqual(request.messages[0].content, "hello there")
+                # AI-6: agent SYSTEM instruction + exactly one USER message.
+                self.assertEqual(len(request.messages), 2)
+                self.assertIs(request.messages[0].role, self.ai_platform.MessageRole.SYSTEM)
+                self.assertIn("Kairo", request.messages[0].content)
+                self.assertIs(request.messages[1].role, self.ai_platform.MessageRole.USER)
+                self.assertEqual(request.messages[1].content, "hello there")
                 self.assertIs(type(policy), self.ai_orchestrator.ConfirmationPolicy)
                 self.assertTrue(policy.confirm_normal)
                 self.assertTrue(callable(executor))
@@ -501,7 +507,7 @@ class OrchestrationTests(AdminAITestBase):
         self.assertEqual(self.factory_calls, 0)
 
     async def test_completed_long_output_is_chunked_and_mention_safe(self):
-        long_text = "@everyone " + ("y" * 9000)
+        long_text = "@everyone " + ("y" * 20000)
         result = self.ai_orchestrator.OrchestratorResult(status=self.ai_orchestrator.OrchestratorStatus.COMPLETED, content=long_text)
         transport = self.make_transport(RecordingOrchestrator(result))
         interaction = await self.start(transport)
@@ -651,6 +657,58 @@ class ConfirmationTests(AdminAITestBase):
         self.assertLessEqual(view.timeout, self.ai_orchestrator.CONFIRMATION_TTL_SECONDS)
         for item in view.children:
             self.assertNotIn("confirm_secret_value", item.custom_id or "")
+
+
+class PlanningEndToEndTests(AdminAITestBase):
+    """AI-6 two-stage flow through the REAL orchestrator and a fake provider."""
+
+    def planning_transport(self, orchestrator):
+        transport = self.make_transport(orchestrator)
+        transport.planning = True
+        return transport
+
+    async def test_planner_gets_no_tools_and_executor_only_planned_tools(self):
+        plan = json.dumps({"mode": "act", "tools": ["send_message"], "steps": ["send hello to #general"]})
+        provider = FakeProvider(
+            self.ai_platform,
+            responses=[
+                self.ai_platform.AIResponse(content=plan),
+                self.call("c1", "send_message", channel_id="100", content="hello"),
+                self.ai_platform.AIResponse(content="sent"),
+            ],
+        )
+        transport = self.planning_transport(self.make_orchestrator(provider))
+        interaction = await self.start(transport, prompt="say hello in general")
+        planner_request, executor_request = provider.requests[0], provider.requests[1]
+        self.assertEqual(tuple(planner_request.tools), ())
+        executor_tools = {tool["name"] for tool in executor_request.tools}
+        self.assertIn("send_message", executor_tools)
+        self.assertIn("list_channels", executor_tools)
+        self.assertNotIn("ban_member", executor_tools)
+        self.assertLess(len(executor_tools), 20)
+        # The write still needs the normal confirmation.
+        views = self.views(interaction)
+        self.assertEqual(len(views), 1)
+        self.assertEqual(self.guild.text_channel.sent, [])
+        approval = await self.decide(transport, views[0].state, approved=True, view=views[0])
+        self.assertEqual(len(self.guild.text_channel.sent), 1)
+        self.assertEqual(strip_engine_footer(approval.followup.sent[0][0]), "sent")
+        self.assert_no_mentions(interaction)
+
+    async def test_planner_tool_call_is_refused_and_falls_back_safely(self):
+        provider = FakeProvider(
+            self.ai_platform,
+            responses=[
+                # A planner that ignores instructions and calls a tool: rejected (no tools offered).
+                self.call("p1", "ban_member", member_id="777"),
+                self.ai_platform.AIResponse(content="nothing to do"),
+            ],
+        )
+        transport = self.planning_transport(self.make_orchestrator(provider))
+        interaction = await self.start(transport, prompt="hello")
+        self.assertEqual(self.target.calls, [])
+        self.assertEqual(strip_engine_footer(interaction.followup.sent[-1][0]), "nothing to do")
+        self.assertEqual(self.views(interaction), [])
 
 
 # ---------------------------------------------------------------------------
@@ -1513,8 +1571,9 @@ class ControlMessageResponseTests(ControlChannelTestBase):
 
         request, policy = orchestrator.calls[0]
         self.assertEqual(request.task_class.value, "ROUTINE")
-        self.assertEqual(len(request.messages), 1)
-        self.assertEqual(request.messages[0].content, "сколько у нас каналов?")
+        self.assertEqual(len(request.messages), 2)
+        self.assertIs(request.messages[0].role, self.ai_platform.MessageRole.SYSTEM)
+        self.assertEqual(request.messages[1].content, "сколько у нас каналов?")
         self.assertTrue(policy.confirm_normal)
         self.assertEqual(len(message.replies), 1)
         content, kwargs = message.replies[0]

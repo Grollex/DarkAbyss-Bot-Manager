@@ -34,7 +34,7 @@ AI_SOURCE = "/ai"
 AI_PROMPT_MAX_CHARS = 2000
 DISCORD_MESSAGE_LIMIT = 2000
 AI_MESSAGE_CHUNK_CHARS = 1900
-AI_MAX_RESPONSE_CHUNKS = 3
+AI_MAX_RESPONSE_CHUNKS = 6
 # Confirmation preview: exact, never truncated, split across bounded pages.
 AI_PREVIEW_PAGE_CHARS = 1900
 AI_PREVIEW_HEADER_RESERVE = 80
@@ -149,7 +149,17 @@ def chunk_text(text: str, *, chunk_chars: int = AI_MESSAGE_CHUNK_CHARS, max_chun
     text = text if isinstance(text, str) else ""
     if not text:
         return []
-    chunks = [text[index : index + chunk_chars] for index in range(0, len(text), chunk_chars)]
+    chunks = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= chunk_chars:
+            chunks.append(remaining)
+            break
+        # Prefer to split at a paragraph/line boundary in the last third of the chunk.
+        cut = remaining.rfind("\n", chunk_chars * 2 // 3, chunk_chars)
+        cut = cut + 1 if cut != -1 else chunk_chars
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
     if len(chunks) > max_chunks:
         chunks = chunks[:max_chunks]
         marker = "\n... (response truncated)"
@@ -314,6 +324,51 @@ def render_tool_plan_pages(tool_plan: Any) -> list[str]:
     return pages
 
 
+def _outline_name(value: Any) -> str:
+    return _code_safe(_printable_text(value, 60))
+
+
+def _printable_text(value: Any, limit: int) -> str:
+    return "".join(char for char in str(value or "") if char.isprintable())[:limit]
+
+
+def render_plan_outline(tool_plan: Any) -> str:
+    """Readable outline of blueprint actions, shown IN ADDITION to the exact pages.
+
+    Derived only from the validated arguments; the exact JSON pages remain the
+    authoritative review. Empty when the plan has no blueprint call.
+    """
+    lines: list[str] = []
+    for call in tuple(tool_plan or ()):
+        public = call.public_dict() if hasattr(call, "public_dict") else {}
+        if public.get("tool_name") != "apply_server_blueprint":
+            continue
+        blueprint = (public.get("arguments") or {}).get("blueprint") or {}
+        lines.append("**Blueprint outline** (existing objects with the same name are reused, not changed):")
+        roles = [_outline_name(role.get("name")) for role in blueprint.get("roles") or [] if isinstance(role, dict)]
+        if roles:
+            lines.append("Roles: " + ", ".join(roles))
+        for category in blueprint.get("categories") or []:
+            if not isinstance(category, dict):
+                continue
+            private = category.get("private_to_roles") or []
+            suffix = f" (private: {', '.join(_outline_name(name) for name in private)})" if private else ""
+            channels = ", ".join(
+                f"{_outline_name(item.get('name'))} [{_outline_name(item.get('type'))}]"
+                for item in category.get("channels") or []
+                if isinstance(item, dict)
+            )
+            lines.append(f"Category {_outline_name(category.get('name'))}{suffix}: {channels or '-'}")
+        loose = [
+            f"{_outline_name(item.get('name'))} [{_outline_name(item.get('type'))}]"
+            for item in blueprint.get("channels") or []
+            if isinstance(item, dict)
+        ]
+        if loose:
+            lines.append("Without category: " + ", ".join(loose))
+    return clip_text("\n".join(lines), AI_MESSAGE_CHUNK_CHARS) if lines else ""
+
+
 def render_confirmation_control(tool_plan: Any, tool_risk: Any, page_count: int) -> str:
     risk_value = getattr(tool_risk, "value", None)
     if not isinstance(risk_value, str):
@@ -342,12 +397,23 @@ PROVIDER_DISPLAY_NAMES = {"groq": "Groq", "gemini": "Gemini"}
 AI_ENGINE_FOOTER_CHARS = 90
 
 
-def render_engine_footer(result: Any) -> str:
+def render_engine_footer(result: Any, planner_label: str = "") -> str:
     """Compact "which engine answered" line from public OrchestratorResult fields.
 
     Uses only provider_id / profile_id / model_id / fallback_used; never
     credential refs, attempts, errors or provider payloads. Empty if absent.
+    With ``planner_label`` (two-stage requests) the planning engine is shown too.
     """
+    label = engine_label(result)
+    if planner_label and label:
+        text = "".join(char for char in f"plan: {planner_label} | run: {label}" if char.isprintable())
+        return "-# " + clip_text(text, AI_ENGINE_FOOTER_CHARS * 2)
+    if not label:
+        return ""
+    return "-# " + clip_text(label, AI_ENGINE_FOOTER_CHARS)
+
+
+def engine_label(result: Any) -> str:
     provider_id = getattr(result, "provider_id", None)
     profile_id = getattr(result, "profile_id", None)
     model_id = getattr(result, "model_id", None)
@@ -362,8 +428,7 @@ def render_engine_footer(result: Any) -> str:
     if getattr(result, "fallback_used", False) is True:
         parts.append("fallback")
     text = " · ".join(_code_safe(part) for part in parts)
-    text = "".join(char for char in text if char.isprintable())
-    return "-# " + clip_text(text, AI_ENGINE_FOOTER_CHARS)
+    return "".join(char for char in text if char.isprintable())
 
 
 def with_footer(text: str, footer: str) -> str:
@@ -410,6 +475,160 @@ def render_result_messages(result: Any) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# AI-6: agent instructions, two-stage planning, tool routing, attachments
+# --------------------------------------------------------------------------
+
+MAX_REQUEST_ATTACHMENTS = 5
+MAX_EXECUTOR_TOOLS = 30
+MAX_PLAN_STEPS = 20
+MAX_PLAN_TEXT_CHARS = 2400
+
+# Fallback routing when no plan is available: lowercase substrings (ru/en).
+KEYWORD_ROUTES: dict[str, tuple[str, ...]] = {
+    "channels": ("канал", "категор", "войс", "голосов", "трибун", "форум", "channel", "category", "voice", "stage", "forum", "приват", "private"),
+    "roles": ("рол", "role", "цвет", "color", "colour", "иерарх", "прав", "permission", "доступ"),
+    "blueprint": ("сервер", "структур", "с нуля", "шаблон", "blueprint", "server", "structure", "template", "setup", "настрой", "спроектир", "построй", "откат", "undo"),
+    "members": ("участник", "member", "ник", "nick", "перемест", "move", "заглуш", "deafen", "выдай", "give", "забер", "сними", "всем"),
+    "moderation": ("бан", "ban", "кик", "kick", "мут", "mute", "тайм", "timeout", "очист", "удали сообщ", "purge", "аудит", "audit", "журнал", "локдаун", "lockdown", "заблок", "lock", "разблок"),
+    "messages": ("сообщ", "напиш", "отправ", "embed", "эмбед", "опрос", "poll", "закреп", "pin", "реакц", "react", "анонс", "announce", "message", "send", "say", "скажи", "опублик"),
+    "threads": ("ветк", "тред", "thread", "форум", "forum", "пост", "post", "тег", "tag"),
+    "server": ("сервер", "иконк", "аватар", "баннер", "icon", "avatar", "banner", "название", "верификац", "verification", "онбординг", "onboarding", "welcome screen", "правил", "rules", "afk", "описание"),
+    "automod": ("автомод", "automod", "фильтр", "filter", "запрещ", "мат", "ссылк", "link", "спам", "spam", "слов"),
+    "webhooks": ("вебхук", "webhook", "хук"),
+    "invites": ("инвайт", "приглаш", "invite"),
+    "expressions": ("эмодзи", "эмоджи", "смайл", "emoji", "стикер", "sticker"),
+    "events": ("событ", "ивент", "event", "мероприят", "турнир", "tournament"),
+    "features": ("меню рол", "role menu", "кнопк", "button", "верифик", "verify", "приветств", "welcome", "автороль", "auto role", "каждые", "расписан", "schedule", "регулярн", "по таймер", "глюк"),
+}
+DEFAULT_FALLBACK_CATEGORIES = ("channels", "roles", "messages")
+
+
+def route_tools_by_keywords(prompt: str) -> tuple[str, ...]:
+    text = (prompt or "").lower()
+    categories = [name for name, words in KEYWORD_ROUTES.items() if any(word in text for word in words)]
+    if not categories:
+        categories = list(DEFAULT_FALLBACK_CATEGORIES)
+    names = list(admin_tools.tool_names_in_categories(("core",)))
+    for name in admin_tools.tool_names_in_categories(categories):
+        if name not in names:
+            names.append(name)
+    return tuple(names[: MAX_EXECUTOR_TOOLS + 10])
+
+
+def _now_utc_text() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _guild_line(guild: Any) -> str:
+    name = "".join(char for char in str(getattr(guild, "name", "") or "") if char.isprintable())[:100]
+    return f'Discord server "{name}" (id {getattr(guild, "id", "?")})'
+
+
+def planner_instruction(guild: Any) -> str:
+    return (
+        f"You are the PLANNING stage of Kairo, the admin assistant bot of the {_guild_line(guild)}. "
+        f"Current UTC time: {_now_utc_text()}.\n"
+        "You cannot call tools. Decide how the request is handled and reply with ONE JSON object only "
+        "(no markdown, no code fence):\n"
+        '{"mode":"answer","answer":"<complete reply to the user>"} - only for questions or chat that need neither server data nor changes;\n'
+        '{"mode":"act","tools":["tool_name",...],"steps":["short concrete step",...],"notes":"<optional: what is impossible or must be asked>"} '
+        "- whenever the request needs server data or wants something done on the server.\n"
+        "Rules: the user wants actions performed, not advice or tutorials. If the catalog can do it (even partly), use mode act. "
+        f"List every tool the executor will need, including read tools to look up IDs (max {MAX_EXECUTOR_TOOLS}). "
+        "To create several roles/categories/channels at once, plan apply_server_blueprint (one call) instead of many single creates. "
+        "Steps must be concrete (names, colors, which roles see which channels). Never invent tool names. "
+        "Write the answer and notes in the user's language.\n"
+        "Tool catalog:\n" + admin_tools.render_tool_catalog()
+    )
+
+
+def executor_instruction(guild: Any, plan: dict[str, Any] | None) -> str:
+    text = (
+        f"You are Kairo, the admin assistant bot of the {_guild_line(guild)}. Current UTC time: {_now_utc_text()}.\n"
+        "You act through the provided tools. Every change you request is shown to the user as an exact plan with "
+        "Approve/Cancel buttons before it runs, so do not ask for confirmation in text - call the tools.\n"
+        "- Perform the task with tool calls instead of describing what the user could do.\n"
+        "- Look up IDs with read tools; never guess IDs.\n"
+        "- For several new roles/categories/channels use apply_server_blueprint with one complete blueprint.\n"
+        "- Only claim what tool results confirm. If something is impossible with the available tools, say so briefly.\n"
+        "- The AI cannot grant Administrator or act on roles/members at or above the requester's highest role.\n"
+        "- Final reply: the user's language, short, plain Discord markdown, no tables."
+    )
+    if plan:
+        steps = plan.get("steps") or []
+        lines = [f"{index}. {step}" for index, step in enumerate(steps, start=1)]
+        if plan.get("notes"):
+            lines.append(f"Notes: {plan['notes']}")
+        if lines:
+            text += "\nPlan from the planning stage (follow it; adapt if tool results require):\n" + clip_text("\n".join(lines), MAX_PLAN_TEXT_CHARS)
+    return text
+
+
+def parse_plan(content: Any) -> dict[str, Any] | None:
+    """Extract the planner JSON object. Returns None if it is not a usable plan."""
+    if not isinstance(content, str):
+        return None
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        raw = json.loads(content[start : end + 1])
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    mode = raw.get("mode")
+    if mode == "answer" and isinstance(raw.get("answer"), str) and raw["answer"].strip():
+        return {"mode": "answer", "answer": raw["answer"]}
+    if mode != "act":
+        return None
+    tools = [name for name in raw.get("tools") or [] if isinstance(name, str) and name in admin_tools.TOOL_DEFINITIONS]
+    steps = [str(step)[:300] for step in raw.get("steps") or [] if isinstance(step, (str, int, float))][:MAX_PLAN_STEPS]
+    notes = raw.get("notes") if isinstance(raw.get("notes"), str) else ""
+    return {"mode": "act", "tools": tools, "steps": steps, "notes": notes[:600]}
+
+
+def executor_tool_names(plan: dict[str, Any] | None, prompt: str) -> tuple[str, ...]:
+    """Tools for the executor: planned tools (+ core reads), or keyword routing as fallback."""
+    if not plan or not plan.get("tools"):
+        return route_tools_by_keywords(prompt)
+    names = list(admin_tools.tool_names_in_categories(("core",)))
+    for name in plan["tools"]:
+        if name not in names:
+            names.append(name)
+    return tuple(names[: MAX_EXECUTOR_TOOLS + 8])
+
+
+def _printable(text: Any, limit: int) -> str:
+    return "".join(char for char in str(text or "") if char.isprintable())[:limit]
+
+
+def collect_attachments(items: Any) -> dict[str, Any]:
+    """Map attachment ID -> discord.Attachment for at most MAX_REQUEST_ATTACHMENTS files."""
+    result: dict[str, Any] = {}
+    for item in list(items or [])[:MAX_REQUEST_ATTACHMENTS]:
+        attachment_id = getattr(item, "id", None)
+        if isinstance(attachment_id, int) and not isinstance(attachment_id, bool) and attachment_id > 0:
+            result[str(attachment_id)] = item
+    return result
+
+
+def describe_attachments(attachments: dict[str, Any]) -> str:
+    if not attachments:
+        return ""
+    lines = ["[Files attached to this request; tools take them by attachment_id]"]
+    for attachment_id, item in attachments.items():
+        lines.append(
+            f'- attachment_id={attachment_id} name="{_printable(getattr(item, "filename", ""), 80)}" '
+            f'type={_printable(getattr(item, "content_type", ""), 60) or "unknown"} size={getattr(item, "size", "?")} bytes'
+        )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
 # Confirmation state and view
 # --------------------------------------------------------------------------
 
@@ -431,6 +650,10 @@ class PendingConfirmation:
     resolved: bool = False
     # "ephemeral" (slash /ai) or "public" (control channel); kept across approval.
     delivery_mode: Any = "ephemeral"
+    # Files attached to the original request (attachment ID -> Attachment).
+    attachments: dict[str, Any] = field(default_factory=dict, repr=False)
+    # Planning engine label for the footer of continuations (two-stage).
+    planner_label: str = ""
 
 
 class ConfirmationView(discord.ui.View):
@@ -561,10 +784,16 @@ class AITransport:
         audit: AuditFn | None = None,
         orchestrator_factory: Callable[[], Any] | None = None,
         view_factory: Callable[["AITransport", PendingConfirmation], Any] | None = None,
+        feature_store: Any = None,
+        planning: bool = False,
     ) -> None:
         self._load_config = load_config
         self._fetch_user = fetch_user
         self._audit = audit
+        self.feature_store = feature_store
+        # True: a planning call (PLANNER profile, no tool schemas) picks the
+        # tools, then the executor (ROUTINE/chosen mode) runs with only those.
+        self.planning = planning is True
         self._orchestrator_factory = orchestrator_factory or _default_orchestrator_factory
         self._view_factory = view_factory or ConfirmationView
         self._orchestrator: Any = None
@@ -605,9 +834,16 @@ class AITransport:
         else:
             await interaction.response.send_message(content, ephemeral=True, allowed_mentions=no_mentions())
 
-    async def _send_result(self, delivery: Any, result: Any, binding: RequestBinding) -> None:
+    async def _send_result(
+        self,
+        delivery: Any,
+        result: Any,
+        binding: RequestBinding,
+        attachments: dict[str, Any] | None = None,
+        planner_label: str = "",
+    ) -> None:
         status = getattr(getattr(result, "status", None), "value", None)
-        footer = render_engine_footer(result)
+        footer = render_engine_footer(result, planner_label)
         if status == "NEEDS_CONFIRMATION" and getattr(result, "confirmation_id", None):
             executed = render_executed_tools(getattr(result, "executed_tools", ()))
             if executed:
@@ -629,6 +865,13 @@ class AITransport:
                     )
                 )
                 return
+            outline = ""
+            try:
+                outline = render_plan_outline(tool_plan)
+            except Exception:
+                outline = ""
+            if outline:
+                await delivery.send(outline)
             for page in pages:
                 await delivery.send(page)
             state = PendingConfirmation(
@@ -636,6 +879,8 @@ class AITransport:
                 binding=binding,
                 summary=with_footer(summary, footer),
                 delivery_mode=delivery.mode,
+                attachments=dict(attachments or {}),
+                planner_label=planner_label,
             )
             view = self._view_factory(self, state)
             message = await delivery.send(state.summary, view=view)
@@ -676,7 +921,9 @@ class AITransport:
 
     # -- executor ----------------------------------------------------------
 
-    def build_executor(self, source: Any, binding: RequestBinding) -> Callable[[str, dict], Awaitable[Any]]:
+    def build_executor(
+        self, source: Any, binding: RequestBinding, attachments: dict[str, Any] | None = None
+    ) -> Callable[[str, dict], Awaitable[Any]]:
         """Executor bound to ONE requester context (interaction or control message).
 
         ``source`` provides ``.guild`` and ``.user``; for approvals it is the fresh
@@ -701,6 +948,9 @@ class AITransport:
                 requesting_user_id=binding.user_id,
                 requesting_user_name=str(member),
                 suppress_mentions=True,
+                enforce_hierarchy=True,
+                attachments=dict(attachments or {}),
+                feature_store=self.feature_store,
             )
             result = await admin_tools.execute_tool(context, tool_name, arguments)
             audit_failure = await self._safe_audit(source, config, tool_name, result.message)
@@ -733,19 +983,55 @@ class AITransport:
         binding: RequestBinding,
         prompt: str,
         task_mode: str,
+        attachments: dict[str, Any] | None = None,
     ) -> None:
-        """One independent request (no cross-message memory): one USER message."""
+        """One independent request (no cross-message memory).
+
+        Executor messages: the agent SYSTEM instruction plus one USER message.
+        With planning enabled a tool-less planning call runs first and selects
+        the executor's tools (or answers directly when no action is needed).
+        """
+        attachments = dict(attachments or {})
+        guild = getattr(source, "guild", None)
+        note = describe_attachments(attachments)
+        user_text = f"{prompt}\n\n{note}" if note else prompt
         try:
             ai_platform, ai_orchestrator = _import_ai_modules()
             orchestrator = self.get_orchestrator()
             if orchestrator is None:
                 await delivery.send(UNAVAILABLE_MESSAGE)
                 return
-            request = ai_orchestrator.OrchestratorRequest(
-                messages=(ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=prompt),),
-                task_class=ai_platform.TaskClass(TASK_MODES[task_mode]),
-            )
             policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=True)
+            user_message = ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=user_text)
+        except Exception as exc:
+            print(f"/ai request failed: {type(exc).__name__}")
+            await delivery.send(UNAVAILABLE_MESSAGE)
+            return
+
+        plan: dict[str, Any] | None = None
+        planner_label = ""
+        if self.planning:
+            planned = await self._plan(orchestrator, ai_platform, ai_orchestrator, guild, user_message, policy)
+            if planned is not None:
+                plan, planner_result = planned
+                planner_label = engine_label(planner_result)
+                if plan["mode"] == "answer":
+                    texts = chunk_text(plan["answer"]) or ["(The AI returned no text.)"]
+                    footer = render_engine_footer(planner_result)
+                    if footer:
+                        texts[0] = with_footer(texts[0], footer)
+                    for text in texts:
+                        await delivery.send(text)
+                    return
+        try:
+            request = ai_orchestrator.OrchestratorRequest(
+                messages=(
+                    ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=executor_instruction(guild, plan)),
+                    user_message,
+                ),
+                task_class=ai_platform.TaskClass(TASK_MODES[task_mode]),
+                allowed_tool_names=executor_tool_names(plan, prompt) if self.planning else None,
+            )
         except Exception as exc:
             print(f"/ai request failed: {type(exc).__name__}")
             await delivery.send(UNAVAILABLE_MESSAGE)
@@ -753,7 +1039,7 @@ class AITransport:
         try:
             result = await orchestrator.orchestrate(
                 request,
-                executor=self.build_executor(source, binding),
+                executor=self.build_executor(source, binding, attachments),
                 confirmation_policy=policy,
             )
         except Exception as exc:
@@ -762,11 +1048,49 @@ class AITransport:
             print(f"/ai request failed: {type(exc).__name__}")
             await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
             return
-        await self._send_result(delivery, result, binding)
+        await self._send_result(delivery, result, binding, attachments, planner_label)
+
+    async def _plan(
+        self, orchestrator: Any, ai_platform: Any, ai_orchestrator: Any, guild: Any, user_message: Any, policy: Any
+    ) -> tuple[dict[str, Any], Any] | None:
+        """Tool-less planning call. PLANNER profile first, ROUTINE if no planner is configured.
+
+        Returns (plan, result) or None when no usable plan was produced; the
+        caller then falls back to keyword tool routing. Never executes tools.
+        """
+
+        async def refuse(tool_name: str, arguments: dict) -> admin_tools.ToolResult:
+            return admin_tools.ToolResult(False, tool_name, "The planning stage cannot run tools.")
+
+        messages = (
+            ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=planner_instruction(guild)),
+            user_message,
+        )
+        for task_class in ("PLANNER", "ROUTINE"):
+            try:
+                request = ai_orchestrator.OrchestratorRequest(
+                    messages=messages,
+                    task_class=ai_platform.TaskClass(task_class),
+                    allowed_tool_names=(),
+                )
+                result = await orchestrator.orchestrate(request, executor=refuse, confirmation_policy=policy)
+            except Exception as exc:
+                print(f"/ai planning failed: {type(exc).__name__}")
+                return None
+            status = getattr(getattr(result, "status", None), "value", None)
+            if status == "UNAVAILABLE" and task_class == "PLANNER":
+                continue
+            if status != "COMPLETED":
+                return None
+            plan = parse_plan(getattr(result, "content", None))
+            return (plan, result) if plan is not None else None
+        return None
 
     # -- /ai ---------------------------------------------------------------
 
-    async def handle_ai_command(self, interaction: Any, prompt: Any, mode: str | None = None) -> None:
+    async def handle_ai_command(
+        self, interaction: Any, prompt: Any, mode: str | None = None, attachments: Any = None
+    ) -> None:
         config = self._try_load_config()
         if config is None:
             await self._respond(interaction, CONFIG_UNAVAILABLE_MESSAGE)
@@ -797,6 +1121,7 @@ class AITransport:
             binding=binding,
             prompt=prompt,
             task_mode=selected_mode,
+            attachments=collect_attachments(attachments),
         )
 
     # -- natural control channel (AI-5) -------------------------------------
@@ -852,6 +1177,7 @@ class AITransport:
                 binding=binding,
                 prompt=prompt,
                 task_mode=DEFAULT_TASK_MODE,
+                attachments=collect_attachments(getattr(message, "attachments", None)),
             )
 
     # -- confirmation buttons ---------------------------------------------
@@ -925,10 +1251,10 @@ class AITransport:
             result = await orchestrator.approve_confirmation(
                 state.confirmation_id,
                 approved=approved,
-                executor=self.build_executor(interaction, state.binding),
+                executor=self.build_executor(interaction, state.binding, state.attachments),
             )
         except Exception as exc:
             print(f"/ai confirmation failed: {type(exc).__name__}")
             await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
             return
-        await self._send_result(delivery, result, state.binding)
+        await self._send_result(delivery, result, state.binding, state.attachments, state.planner_label)

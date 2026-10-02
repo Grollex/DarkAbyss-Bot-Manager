@@ -65,6 +65,36 @@ DISCORD_PERMISSION_BITS = {
     "Moderate Members": 1 << 40,
     "Kick Members": 1 << 1,
     "Ban Members": 1 << 2,
+    # AI-6 server management (still never Administrator). Discord only lets the
+    # bot grant/overwrite permissions it holds itself, so common member
+    # permissions are included for roles and channel overwrites it creates.
+    "Create Invite": 1 << 0,
+    "Manage Server": 1 << 5,
+    "Add Reactions": 1 << 6,
+    "View Audit Log": 1 << 7,
+    "Video": 1 << 9,
+    "Embed Links": 1 << 14,
+    "Attach Files": 1 << 15,
+    "Mention Everyone": 1 << 17,
+    "Use External Emojis": 1 << 18,
+    "Connect": 1 << 20,
+    "Speak": 1 << 21,
+    "Mute Members": 1 << 22,
+    "Deafen Members": 1 << 23,
+    "Move Members": 1 << 24,
+    "Use Voice Activity": 1 << 25,
+    "Change Nickname": 1 << 26,
+    "Manage Nicknames": 1 << 27,
+    "Manage Webhooks": 1 << 29,
+    "Manage Expressions": 1 << 30,
+    "Use Application Commands": 1 << 31,
+    "Manage Events": 1 << 33,
+    "Manage Threads": 1 << 34,
+    "Create Public Threads": 1 << 35,
+    "Create Private Threads": 1 << 36,
+    "Send Messages in Threads": 1 << 38,
+    "Send Polls": 1 << 49,
+    "Pin Messages": 1 << 51,
 }
 DISCORD_ADMIN_BOT_PERMISSIONS = sum(DISCORD_PERMISSION_BITS.values())
 
@@ -511,6 +541,17 @@ class AIProviderSettingsDialog(QDialog):
         self.gemini_save_button = QPushButton("Save")
         self.gemini_test_button = QPushButton("Test Connection")
         self.gemini_remove_button = QPushButton("Remove Key")
+        # AI-6 two-stage routing: a (stronger) planner picks the tools, a
+        # (cheaper) executor runs them. Stored as PLANNER vs ROUTINE/CREATIVE.
+        self.planner_combo = QComboBox()
+        self.executor_combo = QComboBox()
+        for combo in (self.planner_combo, self.executor_combo):
+            combo.addItem("Groq", GROQ_PROFILE_ID)
+            combo.addItem("Gemini", GEMINI_PROFILE_ID)
+        self.routing_fallback_checkbox = QCheckBox("If the selected engine fails, try the other one")
+        self.routing_save_button = QPushButton("Save Routing")
+        self.routing_status_label = QLabel("")
+        self.routing_status_label.setWordWrap(True)
 
         form = QFormLayout()
         form.addRow("Status:", self.status_label)
@@ -548,9 +589,33 @@ class AIProviderSettingsDialog(QDialog):
         gemini_tab = QWidget()
         gemini_tab.setLayout(gemini_tab_layout)
 
+        routing_form = QFormLayout()
+        routing_form.addRow("Planning (reasoning):", self.planner_combo)
+        routing_form.addRow("Execution (tool calls):", self.executor_combo)
+        routing_form.addRow("", self.routing_fallback_checkbox)
+        routing_help = QLabel(
+            "Every /ai request is first planned by the planning engine (it sees only a short tool catalog), "
+            "then executed by the execution engine with just the tools from the plan. "
+            "A stronger model for planning and a faster/cheaper one for execution works well. "
+            "Both engines need a saved API key."
+        )
+        routing_help.setWordWrap(True)
+        routing_button_row = QHBoxLayout()
+        routing_button_row.addWidget(self.routing_save_button)
+        routing_button_row.addStretch(1)
+        routing_tab_layout = QVBoxLayout()
+        routing_tab_layout.addWidget(routing_help)
+        routing_tab_layout.addLayout(routing_form)
+        routing_tab_layout.addWidget(self.routing_status_label)
+        routing_tab_layout.addLayout(routing_button_row)
+        routing_tab_layout.addStretch(1)
+        routing_tab = QWidget()
+        routing_tab.setLayout(routing_tab_layout)
+
         self.provider_tabs = QTabWidget()
         self.provider_tabs.addTab(groq_tab, "Groq")
         self.provider_tabs.addTab(gemini_tab, "Gemini")
+        self.provider_tabs.addTab(routing_tab, "Routing")
 
         layout = QVBoxLayout()
         layout.addWidget(self.provider_tabs)
@@ -565,12 +630,14 @@ class AIProviderSettingsDialog(QDialog):
         self.gemini_save_button.clicked.connect(self.save_gemini_settings)
         self.gemini_test_button.clicked.connect(self.test_gemini_connection)
         self.gemini_remove_button.clicked.connect(self.remove_gemini_key)
+        self.routing_save_button.clicked.connect(self.save_routing)
         self.close_button.clicked.connect(self.accept)
 
         self._load_provider_metadata()
         self._load_gemini_provider_metadata()
         self._load_settings()
         self._load_gemini_settings()
+        self._load_routing()
         self._refresh_status()
         self._refresh_gemini_status()
 
@@ -643,6 +710,69 @@ class AIProviderSettingsDialog(QDialog):
         reasoning = str(profile.options.get("reasoning_effort", "medium"))
         reasoning_index = self.gemini_reasoning_combo.findText(reasoning)
         self.gemini_reasoning_combo.setCurrentIndex(reasoning_index if reasoning_index >= 0 else 1)
+
+    def _load_routing(self) -> None:
+        if self._settings_invalid:
+            self.routing_save_button.setEnabled(False)
+            self.routing_status_label.setText("AI settings are invalid.")
+            return
+        routing = self._loaded_settings.routing
+        executor = routing.routine_profile_id or GROQ_PROFILE_ID
+        planner = routing.planner_profile_id or executor
+        for combo, profile_id in ((self.planner_combo, planner), (self.executor_combo, executor)):
+            index = combo.findData(profile_id)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        self.routing_fallback_checkbox.setChecked(bool(routing.routine_fallback_profile_ids))
+        self.routing_status_label.setText(self._routing_summary(routing))
+
+    @staticmethod
+    def _routing_summary(routing: ai_platform.RoutingConfig) -> str:
+        names = {GROQ_PROFILE_ID: "Groq", GEMINI_PROFILE_ID: "Gemini"}
+        planner = names.get(routing.planner_profile_id or "", routing.planner_profile_id or "not set")
+        executor = names.get(routing.routine_profile_id or "", routing.routine_profile_id or "not set")
+        return f"Current: planning = {planner}, execution = {executor}."
+
+    def _current_routing_settings(self) -> ai_platform.AISettings:
+        planner = str(self.planner_combo.currentData())
+        executor = str(self.executor_combo.currentData())
+        profiles = list(self._loaded_settings.profiles)
+        defaults = {
+            GROQ_PROFILE_ID: ai_platform.default_groq_settings(),
+            GEMINI_PROFILE_ID: ai_platform.default_gemini_settings(),
+        }
+        for profile_id in {planner, executor}:
+            if _profile_by_id(self._loaded_settings, profile_id) is None:
+                default_profile = _profile_by_id(defaults[profile_id], profile_id)
+                if default_profile is not None:
+                    profiles.append(default_profile)
+
+        def other(profile_id: str) -> tuple[str, ...]:
+            if not self.routing_fallback_checkbox.isChecked():
+                return ()
+            return (GEMINI_PROFILE_ID,) if profile_id == GROQ_PROFILE_ID else (GROQ_PROFILE_ID,)
+
+        routing = ai_platform.RoutingConfig(
+            routine_profile_id=executor,
+            planner_profile_id=planner,
+            creative_profile_id=executor,
+            routine_fallback_profile_ids=other(executor),
+            planner_fallback_profile_ids=other(planner),
+            creative_fallback_profile_ids=other(executor),
+        )
+        return ai_platform.AISettings(profiles=tuple(profiles), routing=routing)
+
+    def save_routing(self) -> None:
+        if self._settings_invalid:
+            self.routing_status_label.setText("AI settings are invalid.")
+            return
+        try:
+            settings = self._current_routing_settings()
+            self._settings_store.save(settings)
+            self._loaded_settings = settings
+        except Exception:
+            self.routing_status_label.setText("Save failed")
+            return
+        self.routing_status_label.setText("Saved. " + self._routing_summary(settings.routing))
 
     def _current_settings(self) -> ai_platform.AISettings | None:
         current_model = self.model_combo.currentData()

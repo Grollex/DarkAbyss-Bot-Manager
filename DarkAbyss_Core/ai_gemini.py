@@ -384,7 +384,10 @@ def _map_tool(tool: dict[str, Any]) -> dict[str, Any]:
         raise GeminiProviderError("Tool schema description must be a string.")
     if not isinstance(parameters, dict):
         raise GeminiProviderError("Tool schema parameters must be an object.")
-    declaration = {"name": name, "description": description, "parameters": parameters}
+    # parametersJsonSchema accepts standard JSON Schema (additionalProperties,
+    # ["string", "null"] type unions, nested arrays/objects). The legacy
+    # OpenAPI-subset "parameters" field rejects those constructs.
+    declaration = {"name": name, "description": description, "parametersJsonSchema": parameters}
     _json_roundtrip(declaration, "Tool schema must be JSON-safe.")
     return declaration
 

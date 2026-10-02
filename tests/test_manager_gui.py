@@ -987,6 +987,26 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertEqual(dialog.gemini_key_edit.text(), "")
         self.assertEqual(dialog.gemini_key_edit.placeholderText(), "Paste Gemini API key")
 
+    def test_ai_provider_routing_tab_sets_planner_and_executor(self):
+        dialog, settings_store, _ = self.make_ai_dialog()
+        labels = [dialog.provider_tabs.tabText(index) for index in range(dialog.provider_tabs.count())]
+        self.assertIn("Routing", labels)
+        dialog.planner_combo.setCurrentIndex(dialog.planner_combo.findData("gemini-default"))
+        dialog.executor_combo.setCurrentIndex(dialog.executor_combo.findData("groq-default"))
+        dialog.routing_fallback_checkbox.setChecked(True)
+        dialog.save_routing()
+        settings = settings_store.load()
+        self.assertEqual(settings.routing.planner_profile_id, "gemini-default")
+        self.assertEqual(settings.routing.routine_profile_id, "groq-default")
+        self.assertEqual(settings.routing.creative_profile_id, "groq-default")
+        self.assertEqual(settings.routing.routine_fallback_profile_ids, ("gemini-default",))
+        self.assertEqual(settings.routing.planner_fallback_profile_ids, ("groq-default",))
+        self.assertEqual({profile.profile_id for profile in settings.profiles}, {"groq-default", "gemini-default"})
+        self.assertIn("planning = Gemini", dialog.routing_status_label.text())
+        reopened, _, _ = self.make_ai_dialog()
+        self.assertEqual(reopened.planner_combo.currentData(), "gemini-default")
+        self.assertTrue(reopened.routing_fallback_checkbox.isChecked())
+
     def test_ai_provider_dialog_secret_save_preserve_remove_and_settings(self):
         dialog, settings_store, credential_store = self.make_ai_dialog()
         self.assertEqual(dialog.key_edit.echoMode(), self.manager_gui.QLineEdit.Password)

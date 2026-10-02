@@ -20,6 +20,12 @@ a = Analysis(
     hiddenimports=[
         "discord",
         "discord.ext.commands",
+        "discord.ext.tasks",
+        # AI-6 Admin Tool extensions are loaded by name (importlib) from admin_tools.
+        "admin_tools_server",
+        "admin_tools_content",
+        "admin_blueprint",
+        "admin_features",
         "PySide6.QtCore",
         "PySide6.QtGui",
         "PySide6.QtWidgets",

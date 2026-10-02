@@ -7,10 +7,11 @@ from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import admin_instance
 import admin_tools
+import admin_features  # after admin_tools (it loads the tool extensions)
 import app_paths
 import bot_registry
 import config_store
@@ -33,6 +34,8 @@ class AdminRuntime:
     config_path: Path
     token_path: Path
     lock_path: Path
+    # Instance data folder (bot feature store). None keeps features disabled.
+    data_dir: Path | None = None
 
 
 runtime_context: AdminRuntime | None = None
@@ -69,6 +72,7 @@ def resolve_runtime(instance_id: str = admin_instance.DEFAULT_ADMIN_INSTANCE_ID)
         config_path=instance.paths.config,
         token_path=instance.paths.token,
         lock_path=instance.paths.runtime_dir / "admin_bot.lock",
+        data_dir=instance.paths.data_dir,
     )
 
 
@@ -311,12 +315,49 @@ class AdminBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.tree.sync()
+        if feature_store is not None and not scheduled_messages_loop.is_running():
+            scheduled_messages_loop.start()
 
     async def on_ready(self) -> None:
         print(f"Discord-only Admin Bot is online as {self.user}")
 
 
 bot = AdminBot()
+
+# AI-6 persistent bot features (role menus, verification, welcome, schedules).
+# Set in main() from the instance data folder; None disables them.
+feature_store: admin_features.FeatureStore | None = None
+
+
+@bot.listen("on_interaction")
+async def feature_component_listener(interaction: discord.Interaction) -> None:
+    if interaction.type is not discord.InteractionType.component:
+        return
+    try:
+        await admin_features.handle_component_interaction(interaction, feature_store)
+    except Exception as exc:  # pragma: no cover - never let a button break the event loop
+        print(f"Role menu error: {type(exc).__name__}")
+
+
+@bot.listen("on_member_join")
+async def feature_member_join_listener(member: discord.Member) -> None:
+    try:
+        await admin_features.handle_member_join(member, feature_store)
+    except Exception as exc:  # pragma: no cover
+        print(f"Welcome feature error: {type(exc).__name__}")
+
+
+@tasks.loop(seconds=60)
+async def scheduled_messages_loop() -> None:
+    try:
+        await admin_features.run_due_schedules(bot, feature_store)
+    except Exception as exc:  # pragma: no cover
+        print(f"Scheduled messages error: {type(exc).__name__}")
+
+
+@scheduled_messages_loop.before_loop
+async def _wait_until_ready() -> None:
+    await bot.wait_until_ready()
 
 
 ACTION_CHOICES = [
@@ -416,6 +457,7 @@ ai_transport = (
         load_config=lambda: load_config(),
         fetch_user=lambda user_id: bot.fetch_user(user_id),
         audit=send_audit,
+        planning=True,
     )
     if admin_ai is not None
     else None
@@ -427,12 +469,16 @@ ai_transport = (
 @app_commands.choices(mode=AI_MODE_CHOICES)
 @app_commands.describe(
     prompt="What you want the AI to do (max 2000 characters)",
-    mode="Task mode: routine (default), planner, or creative",
+    mode="Executor mode: routine (default), planner, or creative",
+    file="Optional image for tools such as server icon, banner, emoji or sticker",
+    file2="Optional second image",
 )
 async def ai(
     interaction: discord.Interaction,
     prompt: app_commands.Range[str, 1, 2000],
     mode: Optional[app_commands.Choice[str]] = None,
+    file: Optional[discord.Attachment] = None,
+    file2: Optional[discord.Attachment] = None,
 ) -> None:
     if ai_transport is None:
         await interaction.response.send_message(
@@ -441,7 +487,8 @@ async def ai(
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
-    await ai_transport.handle_ai_command(interaction, prompt, mode.value if mode else None)
+    files = [item for item in (file, file2) if item is not None]
+    await ai_transport.handle_ai_command(interaction, prompt, mode.value if mode else None, files)
 
 
 @bot.listen("on_message")
@@ -465,6 +512,11 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(exc)
         return 1
+
+    global feature_store
+    feature_store = admin_features.store_for_data_dir(getattr(runtime, "data_dir", None))
+    if ai_transport is not None:
+        ai_transport.feature_store = feature_store
 
     natural_ai = natural_ai_enabled(config) and ai_transport is not None
     configure_message_content_intent(bot, natural_ai)
