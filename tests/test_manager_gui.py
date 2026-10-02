@@ -23,6 +23,9 @@ def load_gui_module(data_root: Path):
     for module_name in (
         "manager_gui",
         "manager_dashboard",
+        "manager_groups",
+        "manager_terminal",
+        "admin_terminal",
         "manager_core",
         "config_store",
         "instance_store",
@@ -372,6 +375,86 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertEqual(dash.read_log_tail(log, 20), "last line\n")
         self.assertEqual(dash.read_log_tail(Path(self.temp_dir.name) / "missing.log"), "")
 
+    def test_group_store_add_assign_rename_remove(self):
+        groups = self.manager_gui.manager_groups
+        store = groups.GroupStore(Path(self.temp_dir.name) / "groups.json")
+        self.assertEqual(store.groups(), [groups.DEFAULT_GROUP])
+        self.assertEqual(store.group_of("admin-main"), groups.DEFAULT_GROUP)
+        store.add_group("  Vasya  server ")
+        with self.assertRaises(groups.GroupError):
+            store.add_group("vasya server")
+        with self.assertRaises(groups.GroupError):
+            store.add_group("   ")
+        store.assign("admin-second", "Vasya server")
+        self.assertEqual(store.group_of("admin-second"), "Vasya server")
+        store.rename_group("Vasya server", "Vasya")
+        self.assertEqual(store.group_of("admin-second"), "Vasya")
+        with self.assertRaises(groups.GroupError):
+            store.remove_group(groups.DEFAULT_GROUP)
+        store.remove_group("Vasya")
+        self.assertEqual(store.group_of("admin-second"), groups.DEFAULT_GROUP)
+        (Path(self.temp_dir.name) / "groups.json").write_text("{broken", encoding="utf-8")
+        self.assertEqual(store.groups(), [groups.DEFAULT_GROUP])
+
+    def test_group_tabs_filter_the_bot_table(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        window = self.make_window(manager=manager)
+        self.assertEqual(window.instance_table.rowCount(), 2)  # "All bots" tab
+        window.group_store.add_group("Friends")
+        window.group_store.assign("admin-second", "Friends")
+        window._reload_group_tabs(select="Friends")
+        window.refresh_instances()
+        rows = [window.instance_table.item(row, 0).text() for row in range(window.instance_table.rowCount())]
+        self.assertEqual(rows, ["admin-second"])
+        self.assertTrue(window.remove_group_button.isEnabled())
+        labels = [label for _id, label, _info in window._terminal_bots()]
+        self.assertIn("Friends · Second", labels)
+        self.assertIn("Main · Main", labels)
+
+    def test_terminal_panel_sends_requests_and_renders_events(self):
+        terminal = self.manager_gui.manager_terminal.admin_terminal
+        core = self.manager_gui.manager_core
+        logs = Path(self.temp_dir.name) / "instances" / "admin-main" / "logs"
+        runtime = terminal.runtime_dir_for_logs(logs)
+        manager = FakeManager(core)
+        manager.infos = [replace(manager.infos[1], logs_dir=logs)]
+        terminal.write_bot_status(
+            runtime,
+            {"bot_name": "Kairo#1", "guilds": [{"id": "10", "name": "Null", "channels": [{"id": "100", "name": "general", "type": "text"}]}]},
+        )
+        window = self.make_window(manager=manager)
+        window.show_page("terminal")
+        panel = window.terminal_panel
+        self.assertEqual(panel.guild_combo.currentText(), "Null")
+        panel.channel_combo.setCurrentIndex(panel.channel_combo.findData("100"))
+        panel.input.setPlainText("create a role")
+        panel.send()
+
+        request = terminal.take_requests(runtime)[0]
+        self.assertEqual((request["guild_id"], request["channel_id"], request["prompt"]), ("10", "100", "create a role"))
+        writer = terminal.EventWriter(runtime, request["request_id"])
+        writer.emit("message", text="Done.\n-# Groq")
+        writer.emit("approval", token="abcd1234", text="Plan", buttons=[{"label": "Approve plan", "approved": True}, {"label": "Cancel", "approved": False}])
+        writer.emit("idle")
+        panel.poll()
+
+        card = panel._requests[request["request_id"]]["cards"]["abcd1234"]
+        self.assertEqual(card.buttons[0].text(), "Approve plan")
+        card.buttons[0].click()
+        decision = terminal.take_decisions(runtime)[0]
+        self.assertEqual((decision["token"], decision["approved"]), ("abcd1234", True))
+        writer.emit("resolved", token="abcd1234", text="Plan\n\nApproved.")
+        panel.poll()
+        self.assertTrue(card.buttons[0].isHidden())
+
+    def test_terminal_panel_explains_stopped_bot(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        manager.infos = [manager.infos[0]]  # admin-second is stopped
+        window = self.make_window(manager=manager)
+        window.show_page("terminal")
+        self.assertIn("not running", window.terminal_panel.hint_label.text())
+        self.assertFalse(window.terminal_panel.send_button.isEnabled())
+
     def test_stop_and_restart_use_worker_path(self):
         manager = FakeManager(self.manager_gui.manager_core)
         window = self.make_window(manager=manager)
@@ -633,10 +716,16 @@ class ManagerGuiTests(unittest.TestCase):
 
         dialog.ai_confirmation_combo.setCurrentIndex(dialog.ai_confirmation_combo.findData("strict"))
         dialog.ai_read_content_checkbox.setChecked(True)
+        dialog.ai_mention_checkbox.setChecked(True)
+        dialog.ai_mention_channels_edit.setText("111, 222")
         self.assertTrue(dialog.save_setup())
         saved = config_api.saved[-1][1]
         self.assertEqual(saved["ai_confirmation_mode"], "strict")
         self.assertIs(saved["ai_read_message_content"], True)
+        self.assertIs(saved["ai_mention_enabled"], True)
+        self.assertEqual(saved["ai_mention_channel_ids"], ["111", "222"])
+        dialog.ai_mention_channels_edit.setText("general")
+        self.assertFalse(dialog.save_setup())
 
     def test_setup_dialog_rejects_invalid_discord_ids(self):
         instance_api = FakeInstanceApi(self.temp_dir.name)

@@ -2025,6 +2025,207 @@ class EngineSwitchTests(PlanApprovalTests):
         self.assertIn("Reason: Gemini rate limit or quota was reached.", last[0])
 
 
+class TerminalProtocolTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(CORE_ROOT))
+        sys.modules.pop("admin_terminal", None)
+        self.terminal = importlib.import_module("admin_terminal")
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.runtime = Path(self.temp.name) / "runtime"
+
+    def test_request_decision_and_event_round_trip(self):
+        t = self.terminal
+        request_id = t.submit_request(self.runtime, guild_id="10", channel_id="100", prompt="hello", mode="planner")
+        taken = t.take_requests(self.runtime)
+        self.assertEqual([item["request_id"] for item in taken], [request_id])
+        self.assertEqual(taken[0]["prompt"], "hello")
+        self.assertEqual(t.take_requests(self.runtime), [])  # consumed
+
+        writer = t.EventWriter(self.runtime, request_id)
+        writer.emit("message", text="one")
+        events_path = writer.path
+        with events_path.open("a", encoding="utf-8") as handle:
+            handle.write('{"type": "partial"')  # incomplete line is not read yet
+        events, offset = t.read_events(self.runtime, request_id)
+        self.assertEqual([event["type"] for event in events], ["message"])
+        with events_path.open("a", encoding="utf-8") as handle:
+            handle.write("}\n")
+        events, _ = t.read_events(self.runtime, request_id, offset)
+        self.assertEqual([event["type"] for event in events], ["partial"])
+
+        t.submit_decision(self.runtime, request_id=request_id, token="abcd1234", approved=True)
+        self.assertEqual(t.take_decisions(self.runtime)[0]["approved"], True)
+
+    def test_invalid_and_stale_requests_are_refused(self):
+        t = self.terminal
+        for kwargs in (
+            {"guild_id": None, "prompt": "x"},
+            {"guild_id": "10", "prompt": "  "},
+            {"guild_id": "10", "prompt": "x" * (t.MAX_PROMPT_CHARS + 1)},
+            {"guild_id": "10", "prompt": "x", "mode": "direct"},
+            {"guild_id": "10", "prompt": "x", "channel_id": "abc"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(t.TerminalError):
+                t.submit_request(self.runtime, **kwargs)
+        with self.assertRaises(t.TerminalError):
+            t.submit_decision(self.runtime, request_id="../x", token="abcd1234", approved=True)
+
+        old = t.submit_request(self.runtime, guild_id="10", prompt="x", now=0.0)
+        self.assertEqual(t.take_requests(self.runtime, now=t.REQUEST_MAX_AGE_SECONDS + 1), [])
+        events, _ = t.read_events(self.runtime, old)
+        self.assertEqual([event["type"] for event in events], ["error", "idle"])
+
+    def test_bot_status_lists_servers_and_channels(self):
+        t = self.terminal
+        guild = FakeGuild()
+        guild.channels.append(FakeChannel(101, "voice", channel_type="voice"))
+        guild.channels.append(FakeChannel(102, "cat", channel_type="category"))
+        client = types.SimpleNamespace(guilds=[guild], user="Kairo#1")
+        status = t.build_bot_status(client)
+        self.assertEqual(status["guilds"][0]["id"], "10")
+        self.assertEqual([channel["name"] for channel in status["guilds"][0]["channels"]], ["general", "voice"])
+        t.write_bot_status(self.runtime, status)
+        self.assertEqual(t.read_bot_status(self.runtime)["guilds"][0]["name"], "Guild")
+
+
+class ManagerTerminalFlowTests(PlanApprovalTests):
+    def make_terminal(self, transport):
+        sys.modules.pop("admin_terminal", None)
+        terminal_module = self.admin_ai.admin_terminal
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        client = types.SimpleNamespace(get_guild=lambda guild_id: self.guild if guild_id == self.guild.id else None, guilds=[self.guild], user=None)
+        return terminal_module, terminal_module.BotTerminal(Path(temp.name), transport, client)
+
+    async def drain(self, terminal):
+        await terminal.poll(spawn=lambda coroutine: asyncio.get_event_loop().create_task(coroutine))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        if pending:
+            await asyncio.gather(*pending)
+
+    async def test_operator_request_plan_approval_and_execution_through_the_mailbox(self):
+        plan = {"mode": "act", "tools": ["create_role"], "steps": ["Create role Gamers"]}
+        transport, orchestrator = self.planning_transport(plan, self.completed("Role created.", provider_id="gemini", model_id="flash"))
+        self.config["ai_allowed_role_ids"] = []  # the operator needs no Discord whitelist
+        t, terminal = self.make_terminal(transport)
+
+        request_id = t.submit_request(terminal.runtime_dir, guild_id=str(self.guild.id), channel_id="100", prompt="make a role")
+        await self.drain(terminal)
+        events, offset = t.read_events(terminal.runtime_dir, request_id)
+        approval = next(event for event in events if event["type"] == "approval")
+        self.assertIn("Create role Gamers", approval["text"])
+        self.assertEqual([button["approved"] for button in approval["buttons"]], [True, False])
+        self.assertEqual(events[-1]["type"], "idle")
+        self.assertEqual(len(orchestrator.calls), 1)
+        planner_system = orchestrator.calls[0][0].messages[0].content
+        self.assertIn("bot's operator", planner_system)
+
+        t.submit_decision(terminal.runtime_dir, request_id=request_id, token=approval["token"], approved=True)
+        await self.drain(terminal)
+        events, _ = t.read_events(terminal.runtime_dir, request_id, offset)
+        types_seen = [event["type"] for event in events]
+        self.assertIn("resolved", types_seen)
+        self.assertTrue(any(event.get("text", "").startswith("Role created.") for event in events))
+        request, policy, executor = orchestrator.calls[1]
+        self.assertFalse(policy.confirm_normal)
+
+        captured = {}
+        original = self.admin_tools.execute_tool
+
+        async def fake_execute(context, tool_name, arguments=None):
+            captured["context"] = context
+            return self.admin_tools.ToolResult(True, tool_name, "ok")
+
+        self.admin_ai.admin_tools.execute_tool = fake_execute
+        self.addCleanup(setattr, self.admin_ai.admin_tools, "execute_tool", original)
+        await executor("list_roles", {})
+        self.assertFalse(captured["context"].enforce_hierarchy)
+        self.assertIsNone(captured["context"].requesting_user_id)
+
+    async def test_operator_identity_cannot_come_from_discord(self):
+        transport = self.make_transport(RecordingOrchestrator(None))
+        impostor = self.guild.add_member(FakeMember(0, "zero", roles=[self.ai_role]))
+        binding = self.admin_ai.RequestBinding(0, self.guild.id, 100)
+        executor = transport.build_executor(self.interaction(user=impostor), binding)
+        result = await executor("list_roles", {})
+        self.assertFalse(result.ok)
+        self.assertIn("no longer authorized", result.message)
+        with self.assertRaises(ValueError):
+            await transport.handle_manager_request(self.interaction(user=impostor), "hi")
+
+    async def test_unknown_decision_token_is_reported(self):
+        transport = self.make_transport(RecordingOrchestrator(None))
+        t, terminal = self.make_terminal(transport)
+        t.submit_decision(terminal.runtime_dir, request_id="abcd1234", token="dcba4321", approved=True)
+        await self.drain(terminal)
+        events, _ = t.read_events(terminal.runtime_dir, "abcd1234")
+        self.assertIn("no longer active", events[0]["text"])
+
+
+class MentionTests(ControlChannelTestBase):
+    BOT_ID = 999
+    ROLE_ID = 55
+
+    def setUp(self):
+        super().setUp()
+        self.config["ai_mention_enabled"] = True
+        self.config["ai_mention_channel_ids"] = []
+        self.guild.me = FakeMember(self.BOT_ID, "Kairo")
+        self.guild.self_role = FakeRole(self.ROLE_ID, "Kairo")
+        self.general = self.guild.text_channel
+
+    def mention_transport(self):
+        orchestrator = RecordingOrchestrator(
+            self.ai_orchestrator.OrchestratorResult(status=self.ai_orchestrator.OrchestratorStatus.COMPLETED, content="done")
+        )
+        transport = self.make_transport(orchestrator)
+        transport.mention_enabled = True
+        return transport, orchestrator
+
+    async def ping(self, transport, content, *, author=None, channel=None, users=(), roles=()):
+        message = FakeChatMessage(author or self.owner, self.guild, channel or self.general, content)
+        message.raw_mentions = list(users)
+        message.raw_role_mentions = list(roles)
+        await transport.handle_mention_message(message)
+        return message
+
+    async def test_user_or_role_ping_starts_a_request_without_the_mention_text(self):
+        transport, orchestrator = self.mention_transport()
+        await self.ping(transport, f"<@{self.BOT_ID}> сделай роль", users=[self.BOT_ID])
+        await self.ping(transport, f"<@&{self.ROLE_ID}>   покажи каналы", roles=[self.ROLE_ID])
+        prompts = [request.messages[-1].content for request, _policy, _executor in orchestrator.calls]
+        self.assertEqual(prompts, ["сделай роль", "покажи каналы"])
+        self.assert_public_no_mentions()
+
+    async def test_unauthorized_ping_gets_one_polite_refusal_per_cooldown(self):
+        transport, orchestrator = self.mention_transport()
+        stranger = self.guild.add_member(FakeMember(904, "stranger"))
+        first = await self.ping(transport, f"<@{self.BOT_ID}> забань всех", author=stranger, users=[self.BOT_ID])
+        second = await self.ping(transport, f"<@{self.BOT_ID}> ну пожалуйста", author=stranger, users=[self.BOT_ID])
+        self.assertEqual(first.replies[0][0], self.admin_ai.MENTION_DENIED_MESSAGE)
+        self.assertEqual(second.replies, [])
+        self.assertEqual(orchestrator.calls, [])
+
+    async def test_channel_filter_empty_ping_and_messages_without_mention(self):
+        transport, orchestrator = self.mention_transport()
+        other = FakeChannel(555, "other")
+        self.guild.channels.append(other)
+        self.config["ai_mention_channel_ids"] = [self.general.id]
+        await self.ping(transport, f"<@{self.BOT_ID}> hi", channel=other, users=[self.BOT_ID])
+        await self.ping(transport, "no mention here")
+        empty = await self.ping(transport, f"<@{self.BOT_ID}>", users=[self.BOT_ID])
+        self.assertEqual(orchestrator.calls, [])
+        self.assertEqual(empty.replies[0][0], self.admin_ai.MENTION_EMPTY_MESSAGE)
+
+        # Disabled in config: ignored even when the startup gate is on.
+        self.config["ai_mention_enabled"] = False
+        await self.ping(transport, f"<@{self.BOT_ID}> hi", users=[self.BOT_ID])
+        self.assertEqual(orchestrator.calls, [])
+
+
 class ConversationMemoryTests(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(CORE_ROOT))

@@ -27,6 +27,8 @@ AI_WHITELIST_DEFAULTS = {
     # AI-6.2: approve the AI plan once; message text reading off by default.
     "ai_confirmation_mode": "plan",
     "ai_read_message_content": False,
+    "ai_mention_enabled": False,
+    "ai_mention_channel_ids": [],
 }
 
 

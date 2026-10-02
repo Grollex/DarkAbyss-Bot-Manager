@@ -89,6 +89,23 @@
     "ai_read_message_content": {
       "type": "boolean"
     },
+    "ai_mention_enabled": {
+      "type": "boolean"
+    },
+    "ai_mention_channel_ids": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        ]
+      }
+    },
     "audit_channel_id": {
       "anyOf": [
         {

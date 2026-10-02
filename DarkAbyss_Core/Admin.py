@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import admin_instance
+import admin_terminal
 import admin_tools
 import admin_features  # after admin_tools (it loads the tool extensions)
 import app_paths
@@ -154,6 +155,17 @@ def validate_config(config: dict) -> dict:
     if not isinstance(read_content, bool):
         raise ValueError('"ai_read_message_content" must be a boolean.')
     config["ai_read_message_content"] = read_content
+
+    # @Kairo mentions (bot user or its role) start AI requests; an empty
+    # channel list means every channel the bot can read.
+    mention_enabled = config.get("ai_mention_enabled", False)
+    if not isinstance(mention_enabled, bool):
+        raise ValueError('"ai_mention_enabled" must be a boolean.')
+    config["ai_mention_enabled"] = mention_enabled
+    config["ai_mention_channel_ids"] = parse_snowflake_list(
+        config.get("ai_mention_channel_ids", []),
+        "ai_mention_channel_ids",
+    )
 
     return config
 
@@ -326,17 +338,23 @@ LOGIN_FAILURE_HELP = (
 
 def message_content_requested(config: dict) -> bool:
     """Message Content Intent is needed by the control channel or by AI message reading."""
-    return natural_ai_enabled(config) or config.get("ai_read_message_content") is True
+    # Role pings (@Kairo role) arrive without text unless the intent is on.
+    return (
+        natural_ai_enabled(config)
+        or config.get("ai_read_message_content") is True
+        or config.get("ai_mention_enabled") is True
+    )
 
 
 PRIVILEGED_INTENTS_HELP = (
-    "Discord refused a privileged gateway intent. With the AI control channel or 'AI can read message "
-    "text' enabled this bot requires BOTH privileged intents: 'Server Members Intent' (always required "
-    "by the Admin bot) and 'Message Content Intent' (required only for the AI control channel and AI "
-    "message reading). Enable the missing one(s) in Discord Developer Portal -> Application -> Bot -> "
-    "Privileged Gateway Intents. To run without Message Content Intent, clear 'AI control channel ID' "
-    "and turn off 'AI can read message text' in Manager Setup Bot (Server Members Intent is still "
-    "required). /execute and /ai do not need Message Content Intent."
+    "Discord refused a privileged gateway intent. With the AI control channel, @mention requests or "
+    "'AI can read message text' enabled this bot requires BOTH privileged intents: 'Server Members "
+    "Intent' (always required by the Admin bot) and 'Message Content Intent' (required only for the AI "
+    "control channel, @mention requests and AI message reading). Enable the missing one(s) in Discord "
+    "Developer Portal -> Application -> Bot -> Privileged Gateway Intents. To run without Message "
+    "Content Intent, clear 'AI control channel ID' and turn off '@mention requests' and 'AI can read "
+    "message text' in Manager Setup Bot (Server Members Intent is still required). /execute and /ai do "
+    "not need Message Content Intent."
 )
 
 
@@ -350,9 +368,12 @@ class AdminBot(commands.Bot):
         await self.tree.sync()
         if feature_store is not None and not scheduled_messages_loop.is_running():
             scheduled_messages_loop.start()
+        if terminal is not None and not terminal_loop.is_running():
+            terminal_loop.start()
 
     async def on_ready(self) -> None:
         print(f"Discord-only Admin Bot is online as {self.user}")
+        refresh_terminal_status()
 
 
 bot = AdminBot()
@@ -360,6 +381,41 @@ bot = AdminBot()
 # AI-6 persistent bot features (role menus, verification, welcome, schedules).
 # Set in main() from the instance data folder; None disables them.
 feature_store: admin_features.FeatureStore | None = None
+
+# Manager request terminal (file mailbox in the instance runtime folder).
+# Set in main(); None disables it.
+terminal: admin_terminal.BotTerminal | None = None
+TERMINAL_STATUS_EVERY_TICKS = 60  # 0.5 s ticks -> refresh server list every 30 s
+_terminal_ticks = 0
+
+
+def refresh_terminal_status() -> None:
+    if terminal is None:
+        return
+    try:
+        terminal.refresh_status()
+    except Exception as exc:  # pragma: no cover - status is best effort
+        print(f"Terminal status error: {type(exc).__name__}")
+
+
+@tasks.loop(seconds=0.5)
+async def terminal_loop() -> None:
+    global _terminal_ticks
+    if terminal is None:
+        return
+    _terminal_ticks += 1
+    if _terminal_ticks % TERMINAL_STATUS_EVERY_TICKS == 0:
+        refresh_terminal_status()
+        admin_terminal.purge_old_events(terminal.runtime_dir)
+    try:
+        await terminal.poll()
+    except Exception as exc:  # pragma: no cover - never stop the mailbox
+        print(f"Terminal error: {type(exc).__name__}")
+
+
+@terminal_loop.before_loop
+async def _terminal_wait_until_ready() -> None:
+    await bot.wait_until_ready()
 
 
 @bot.listen("on_interaction")
@@ -542,13 +598,17 @@ async def ai_reset(interaction: discord.Interaction) -> None:
 
 @bot.listen("on_message")
 async def ai_control_channel_listener(message: discord.Message) -> None:
-    # Cheap gate first: nothing happens unless the natural AI channel is enabled.
-    if ai_transport is None or ai_transport.control_channel_id is None:
+    # Cheap gates first: nothing happens unless the control channel or
+    # @mention requests are enabled.
+    if ai_transport is None:
         return
     try:
-        await ai_transport.handle_control_message(message)
+        if ai_transport.control_channel_id is not None:
+            await ai_transport.handle_control_message(message)
+        if ai_transport.mention_enabled:
+            await ai_transport.handle_mention_message(message)
     except Exception as exc:  # pragma: no cover - never let AI break the event loop
-        print(f"AI control channel error: {type(exc).__name__}")
+        print(f"AI message error: {type(exc).__name__}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -562,10 +622,13 @@ def main(argv: list[str] | None = None) -> int:
         print(exc)
         return 1
 
-    global feature_store
+    global feature_store, terminal
     feature_store = admin_features.store_for_data_dir(getattr(runtime, "data_dir", None))
     if ai_transport is not None:
         ai_transport.feature_store = feature_store
+        lock_path = getattr(runtime, "lock_path", None)
+        if lock_path is not None:
+            terminal = admin_terminal.BotTerminal(Path(lock_path).parent, ai_transport, bot)
 
     natural_ai = natural_ai_enabled(config) and ai_transport is not None
     read_content = message_content_requested(config) and ai_transport is not None
@@ -573,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
     if ai_transport is not None:
         ai_transport.set_control_channel(config.get("ai_control_channel_id") if natural_ai else None)
         ai_transport.message_content_enabled = read_content
+        ai_transport.mention_enabled = config.get("ai_mention_enabled") is True
     if natural_ai:
         print("AI control channel enabled; requesting Discord Message Content Intent.")
     elif read_content:

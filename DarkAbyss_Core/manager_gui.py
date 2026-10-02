@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QScrollArea,
     QStackedWidget,
+    QInputDialog,
+    QTabBar,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -45,6 +47,8 @@ import admin_instance
 import ai_platform
 import app_paths
 import manager_dashboard as dash
+import manager_groups
+import manager_terminal
 import runtime_layout
 import bot_registry
 import config_store
@@ -213,7 +217,9 @@ AI_BEHAVIOUR_EXPLANATION = (
     "AI confirmations: 'plan once' shows the AI's plan with one Approve button, then runs its normal actions; "
     "deletions, bans, kicks, purges and permission changes still ask separately with the exact data. "
     "'Every change' asks before each step. Reading message text (purge by text/links, chat summaries) needs "
-    "Message Content Intent in the Developer Portal and a bot restart."
+    "Message Content Intent in the Developer Portal and a bot restart. @mention requests: AI-allowed users "
+    "ping the bot or its role in the listed channels (or anywhere); others get a short refusal. Needs "
+    "Message Content Intent and a bot restart."
 )
 
 
@@ -1208,6 +1214,9 @@ class BotSetupDialog(QDialog):
         self.ai_confirmation_combo.addItem("Approve the AI plan once (recommended)", "plan")
         self.ai_confirmation_combo.addItem("Approve every change separately", "strict")
         self.ai_read_content_checkbox = QCheckBox("AI can read message text (needs Message Content Intent)")
+        self.ai_mention_checkbox = QCheckBox("Answer when someone pings the bot or its role (@Kairo)")
+        self.ai_mention_channels_edit = QLineEdit()
+        self.ai_mention_channels_edit.setPlaceholderText("Channel IDs for @mentions; empty = every channel the bot can read")
         self.ai_behaviour_label = QLabel(AI_BEHAVIOUR_EXPLANATION)
         self.ai_behaviour_label.setWordWrap(True)
 
@@ -1342,6 +1351,8 @@ class BotSetupDialog(QDialog):
         ai_form.addRow(self._help_label("AI control channel ID", self.ai_channel_help_button), self.ai_control_channel_edit)
         ai_form.addRow("AI confirmations", self.ai_confirmation_combo)
         ai_form.addRow("", self.ai_read_content_checkbox)
+        ai_form.addRow("", self.ai_mention_checkbox)
+        ai_form.addRow("@mention channels", self.ai_mention_channels_edit)
         layout = QVBoxLayout()
         layout.addWidget(description)
         layout.addLayout(form)
@@ -1412,6 +1423,8 @@ class BotSetupDialog(QDialog):
         mode_index = self.ai_confirmation_combo.findData(effective.get("ai_confirmation_mode", "plan"))
         self.ai_confirmation_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
         self.ai_read_content_checkbox.setChecked(effective.get("ai_read_message_content") is True)
+        self.ai_mention_checkbox.setChecked(effective.get("ai_mention_enabled") is True)
+        self.ai_mention_channels_edit.setText(", ".join(str(value) for value in effective.get("ai_mention_channel_ids", [])))
         self._update_invite_preview()
         self._update_ready_summary()
         self._set_status("Loaded setup.")
@@ -1450,6 +1463,12 @@ class BotSetupDialog(QDialog):
             read_content = self.ai_read_content_checkbox.isChecked()
             if read_content or "ai_read_message_content" in overrides:
                 overrides["ai_read_message_content"] = read_content
+            mention_enabled = self.ai_mention_checkbox.isChecked()
+            if mention_enabled or "ai_mention_enabled" in overrides:
+                overrides["ai_mention_enabled"] = mention_enabled
+            mention_channels = parse_id_list(self.ai_mention_channels_edit.text())
+            if mention_channels or "ai_mention_channel_ids" in overrides:
+                overrides["ai_mention_channel_ids"] = mention_channels
             self._instance_api.update_instance_display_name(self._instance_id, display_name)
             self._config_api.save_config_overrides(self._instance_id, overrides)
             if token:
@@ -1644,6 +1663,18 @@ class ManagerMainWindow(QMainWindow):
         self._provider_tests: dict[str, tuple[bool, str]] = {}
         self._provider_tests_running: set[str] = set()
         self._previous_states: dict[str, str] = {}
+        self.group_store = manager_groups.GroupStore(app_paths.CONFIG_DIR / manager_groups.FILE_NAME)
+        self.group_tabs = QTabBar()
+        self.group_tabs.setExpanding(False)
+        self.group_tabs.setDrawBase(False)
+        self.group_tabs.currentChanged.connect(lambda _index: self.refresh_instances())
+        self.new_group_button = QPushButton("New Group...")
+        self.move_group_button = QPushButton("Move to Group...")
+        self.remove_group_button = QPushButton("Remove Group")
+        self.new_group_button.clicked.connect(self.create_group)
+        self.move_group_button.clicked.connect(self.move_selected_to_group)
+        self.remove_group_button.clicked.connect(self.remove_current_group)
+        self._reload_group_tabs()
         self._version_text = dash.app_version_text(runtime_layout)
 
         self.setWindowTitle("DarkAbyss Bot Manager")
@@ -1686,6 +1717,7 @@ class ManagerMainWindow(QMainWindow):
             ("dashboard", self._build_dashboard_page),
             ("bots", self._build_bots_page),
             ("ai", self._build_ai_page),
+            ("terminal", self._build_terminal_page),
             ("commands", self._build_commands_page),
             ("logs", self._build_logs_page),
         ):
@@ -1744,6 +1776,7 @@ class ManagerMainWindow(QMainWindow):
             ("dashboard", "\U0001f3e0   Dashboard"),
             ("bots", "\U0001f916   Bots"),
             ("ai", "\U0001f9e0   AI Providers"),
+            ("terminal", "\U0001f4ac   AI Terminal"),
             ("commands", "∕   Commands && Tools"),
             ("logs", "\U0001f4c4   Logs"),
         ):
@@ -1924,6 +1957,99 @@ class ManagerMainWindow(QMainWindow):
         layout.addStretch(1)
         return self._scroll_page(inner)
 
+    def _build_terminal_page(self) -> QWidget:
+        self.terminal_panel = manager_terminal.TerminalPanel(self._terminal_bots)
+        return self.terminal_panel
+
+    def _terminal_bots(self) -> list[tuple[str, str, manager_core.InstanceInfo]]:
+        bots = []
+        for info in self._last_infos:
+            group = self.group_store.group_of(info.instance_id)
+            bots.append((info.instance_id, f"{group} · {info.display_name}", info))
+        return bots
+
+    # -- bot groups (tabs) -----------------------------------------------------
+
+    ALL_GROUPS_TAB = "All bots"
+
+    def current_group(self) -> str | None:
+        """Selected group tab; None = all bots."""
+        index = self.group_tabs.currentIndex()
+        data = self.group_tabs.tabData(index) if index >= 0 else None
+        return data if isinstance(data, str) else None
+
+    def _reload_group_tabs(self, select: str | None = None) -> None:
+        current = select if select is not None else self.current_group()
+        self.group_tabs.blockSignals(True)
+        while self.group_tabs.count():
+            self.group_tabs.removeTab(0)
+        self.group_tabs.addTab(self.ALL_GROUPS_TAB)
+        self.group_tabs.setTabData(0, None)
+        for name in self.group_store.groups():
+            index = self.group_tabs.addTab(name)
+            self.group_tabs.setTabData(index, name)
+        target = 0
+        for index in range(self.group_tabs.count()):
+            if self.group_tabs.tabData(index) == current:
+                target = index
+        self.group_tabs.setCurrentIndex(target)
+        self.group_tabs.blockSignals(False)
+        self.remove_group_button.setEnabled(current not in (None, manager_groups.DEFAULT_GROUP))
+
+    def create_group(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Group", "Group name (e.g. a person or a server):")
+        if not ok:
+            return
+        try:
+            created = self.group_store.add_group(name)
+        except (manager_groups.GroupError, OSError) as exc:
+            self._show_error(str(exc))
+            return
+        self._reload_group_tabs(select=created)
+        self.activity.add("Manager", f"Group {created} created.")
+        self.refresh_instances()
+
+    def move_selected_to_group(self) -> None:
+        instance_id = self.selected_instance_id()
+        if instance_id is None:
+            self._show_error("Select a bot first.")
+            return
+        groups = self.group_store.groups()
+        current = self.group_store.group_of(instance_id)
+        group, ok = QInputDialog.getItem(
+            self, "Move to Group", f"Group for {instance_id}:", groups, groups.index(current) if current in groups else 0, False
+        )
+        if not ok:
+            return
+        try:
+            self.group_store.assign(instance_id, group)
+        except (manager_groups.GroupError, OSError) as exc:
+            self._show_error(str(exc))
+            return
+        self.activity.add("Manager", f"{instance_id} moved to group {group}.")
+        self.refresh_instances()
+
+    def remove_current_group(self) -> None:
+        group = self.current_group()
+        if group in (None, manager_groups.DEFAULT_GROUP):
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove group?",
+            f"Remove group {group}? Its bots move to {manager_groups.DEFAULT_GROUP}; nothing else changes.",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Ok:
+            return
+        try:
+            self.group_store.remove_group(group)
+        except (manager_groups.GroupError, OSError) as exc:
+            self._show_error(str(exc))
+            return
+        self._reload_group_tabs(select=manager_groups.DEFAULT_GROUP)
+        self.refresh_instances()
+
     def _make_provider_rows(self) -> list[dash.ProviderRow]:
         rows = []
         for provider_id, name, logo, tab in (
@@ -1955,6 +2081,10 @@ class ManagerMainWindow(QMainWindow):
         ):
             button_row.addWidget(button)
         button_row.addStretch(1)
+        group_row = QHBoxLayout()
+        group_row.addWidget(self.group_tabs, 1)
+        for button in (self.new_group_button, self.move_group_button, self.remove_group_button):
+            group_row.addWidget(button)
         details_title = QLabel("Selected instance")
         details_title.setObjectName("cardTitle")
         panel = QFrame()
@@ -1962,6 +2092,7 @@ class ManagerMainWindow(QMainWindow):
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(18, 16, 18, 16)
         panel_layout.setSpacing(12)
+        panel_layout.addLayout(group_row)
         panel_layout.addWidget(self.instance_table, 2)
         panel_layout.addLayout(button_row)
         panel_layout.addWidget(details_title)
@@ -2086,6 +2217,8 @@ class ManagerMainWindow(QMainWindow):
             button.setChecked(page_name == name)
         if name == "logs":
             self.refresh_logs()
+        if name == "terminal":
+            self.terminal_panel.refresh_targets()
 
     def _open_setup_from_nav(self) -> None:
         if self.selected_instance_id() is None and self.instance_table.rowCount() > 0:
@@ -2318,8 +2451,10 @@ class ManagerMainWindow(QMainWindow):
             return
         self._last_infos = infos
         self._record_state_changes(infos)
-        self.instance_table.setRowCount(len(infos))
-        for row_index, info in enumerate(infos):
+        group = self.current_group()
+        visible = infos if group is None else [info for info in infos if self.group_store.group_of(info.instance_id) == group]
+        self.instance_table.setRowCount(len(visible))
+        for row_index, info in enumerate(visible):
             for column_index, value in enumerate(instance_info_to_display_row(info)):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -2369,6 +2504,12 @@ class ManagerMainWindow(QMainWindow):
         except (instance_store.InstanceStoreError, bot_registry.BotRegistryError, OSError) as exc:
             self._show_error(str(exc))
             return
+        group = self.current_group()
+        if group is not None:
+            try:
+                self.group_store.assign(instance_id, group)
+            except (manager_groups.GroupError, OSError):
+                pass
         self._set_status(f"Created bot {instance_id}. Opening setup...")
         self.refresh_instances()
         self._select_instance_by_id(instance_id)
@@ -2523,6 +2664,8 @@ class ManagerMainWindow(QMainWindow):
         has_selection = instance_id is not None
         for button in (self.start_button, self.stop_button, self.restart_button, self.setup_button, self.edit_config_button):
             button.setEnabled(has_selection and not busy)
+        self.move_group_button.setEnabled(has_selection)
+        self.remove_group_button.setEnabled(self.current_group() not in (None, manager_groups.DEFAULT_GROUP))
         if hasattr(self, "quick_toggle_button") and busy:
             # Disable the dashboard Start/Stop immediately while an action runs.
             self.quick_toggle_button.setEnabled(False)

@@ -7,5 +7,7 @@
   "ai_allowed_role_ids": [],
   "ai_control_channel_id": null,
   "ai_confirmation_mode": "plan",
-  "ai_read_message_content": false
+  "ai_read_message_content": false,
+  "ai_mention_enabled": false,
+  "ai_mention_channel_ids": []
 }

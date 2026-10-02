@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ from typing import Any, Awaitable, Callable
 
 import discord
 
+import admin_terminal
 import admin_tools
 import ai_context
 import ai_memory
@@ -640,6 +642,10 @@ def collect_attachments(items: Any) -> dict[str, Any]:
     return result
 
 
+MENTION_DENIED_MESSAGE = "Сорян, но у тебя нет прав мной командовать."
+MENTION_EMPTY_MESSAGE = "Слушаю! Напиши задачу сразу после упоминания."
+# One denial reply per member per window, so pinging the bot cannot spam the chat.
+MENTION_DENIAL_COOLDOWN_SECONDS = 60.0
 CONFIRMATION_MODES = ("plan", "strict")
 RESET_WORDS = frozenset({"reset", "/reset", "!reset", "сброс", "/сброс", "забудь"})
 MEMORY_CLEARED_MESSAGE = "Conversation memory for this channel was cleared."
@@ -1051,6 +1057,10 @@ class AITransport:
         # Set by Admin.main(): whether the bot requested the Message Content
         # Intent. None = unknown (tests, older wiring).
         self.message_content_enabled: bool | None = None
+        # @mention requests (gate fixed at startup like the control channel).
+        self.mention_enabled = False
+        self._mention_denials: dict[int, float] = {}
+        self._mention_clock: Callable[[], float] = time.monotonic
         # Natural-message listener gate, fixed at startup together with the
         # Message Content Intent decision. None = natural AI disabled.
         self.control_channel_id: int | None = None
@@ -1211,18 +1221,28 @@ class AITransport:
                 return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
             if getattr(getattr(source, "user", None), "id", None) != binding.user_id:
                 return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
-            # Fresh member state (current roles), fail closed if not resolvable.
-            member = guild.get_member(binding.user_id) if hasattr(guild, "get_member") else None
-            if member is None or not actor_has_ai_access(member, guild, config):
-                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
+            operator = binding.user_id == admin_terminal.OPERATOR_USER_ID
+            if operator:
+                # Local Manager operator: owns the bot token, so the Discord AI
+                # whitelist and requester hierarchy do not apply (bot hierarchy
+                # and every confirmation still do). Only ManagerInteraction
+                # sources qualify; Discord IDs are never 0.
+                if not admin_terminal.is_manager_operator(source):
+                    return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
+                member = source.user
+            else:
+                # Fresh member state (current roles), fail closed if not resolvable.
+                member = guild.get_member(binding.user_id) if hasattr(guild, "get_member") else None
+                if member is None or not actor_has_ai_access(member, guild, config):
+                    return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
             context = admin_tools.AdminToolContext(
                 guild=guild,
                 fetch_user=self._fetch_user,
-                source=AI_SOURCE,
-                requesting_user_id=binding.user_id,
+                source="manager" if operator else AI_SOURCE,
+                requesting_user_id=None if operator else binding.user_id,
                 requesting_user_name=str(member),
                 suppress_mentions=True,
-                enforce_hierarchy=True,
+                enforce_hierarchy=not operator,
                 attachments=dict(attachments or {}),
                 feature_store=self.feature_store,
                 message_content=self.message_content_enabled,
@@ -1256,9 +1276,10 @@ class AITransport:
             guild = getattr(source, "guild", None)
             if guild is None:
                 return ""
+            operator = binding.user_id == admin_terminal.OPERATOR_USER_ID
             getter = getattr(guild, "get_member", None)
-            member = getter(binding.user_id) if callable(getter) else None
-            member = member or getattr(source, "user", None)
+            member = None if operator or not callable(getter) else getter(binding.user_id)
+            member = None if operator else (member or getattr(source, "user", None))
             channel = getattr(source, "channel", None)
             if binding.channel_id is not None:
                 for name in ("get_channel_or_thread", "get_channel"):
@@ -1268,7 +1289,13 @@ class AITransport:
                         channel = found
                         break
             budget = ai_context.EXECUTOR_CONTEXT_CHARS if include_ids else ai_context.PLANNER_CONTEXT_CHARS
-            return ai_context.describe_request(guild, member, channel, include_ids=include_ids, budget=budget)
+            text = ai_context.describe_request(guild, member, channel, include_ids=include_ids, budget=budget)
+            if operator:
+                text = (
+                    "Requester: the bot's operator, typing in the local Manager app (not a Discord member; "
+                    "full bot permissions; requester role limits do not apply).\n" + text
+                )
+            return text
         except Exception as exc:
             print(f"/ai context unavailable: {type(exc).__name__}")
             return ""
@@ -1653,6 +1680,127 @@ class AITransport:
             attachments=collect_attachments(attachments),
         )
 
+    # -- Manager terminal (local operator) ----------------------------------
+
+    async def handle_manager_request(self, interaction: Any, prompt: str, mode: str | None = None) -> None:
+        """A prompt typed in the Manager terminal (admin_terminal mailbox).
+
+        Runs the same pipeline as /ai for the local operator; replies,
+        plans and confirmations go back to the Manager as events.
+        """
+        if not admin_terminal.is_manager_operator(interaction):
+            raise ValueError("handle_manager_request accepts only Manager operator interactions.")
+        selected_mode = (mode or DEFAULT_TASK_MODE).lower()
+        if selected_mode not in TASK_MODES:
+            selected_mode = DEFAULT_TASK_MODE
+        binding = RequestBinding(
+            user_id=admin_terminal.OPERATOR_USER_ID,
+            guild_id=interaction.guild.id,
+            channel_id=interaction.channel_id,
+        )
+        if prompt.strip().lower() in RESET_WORDS:
+            self.memory.clear(self.memory_key(binding))
+            await interaction.followup.send(MEMORY_CLEARED_MESSAGE)
+            return
+        await self._run_request(
+            delivery=InteractionDelivery(interaction, DeliveryMode.EPHEMERAL),
+            source=interaction,
+            binding=binding,
+            prompt=prompt,
+            task_mode=selected_mode,
+        )
+
+    async def dispatch_view_decision(self, interaction: Any, view: Any, approved: bool) -> None:
+        """Route a Manager button click to the handler of the view that asked."""
+        state = getattr(view, "state", None)
+        if isinstance(view, PlanApprovalView):
+            await self.handle_plan_decision(interaction, state, approved=approved, view=view)
+        elif isinstance(view, SwitchEngineView):
+            await self.handle_switch_decision(interaction, state, approved=approved, view=view)
+        else:
+            await self.handle_decision(interaction, state, approved=approved, view=view)
+
+    # -- @mention requests ---------------------------------------------------
+
+    def mention_prompt(self, message: Any) -> str | None:
+        """Prompt text if the message pings the bot user or its own role, else None."""
+        guild = getattr(message, "guild", None)
+        me = getattr(guild, "me", None)
+        bot_id = getattr(me, "id", None)
+        if bot_id is None:
+            return None
+        self_role = getattr(guild, "self_role", None)
+        role_id = getattr(self_role, "id", None)
+        user_hit = bot_id in (getattr(message, "raw_mentions", None) or [])
+        role_hit = role_id is not None and role_id in (getattr(message, "raw_role_mentions", None) or [])
+        if not user_hit and not role_hit:
+            return None
+        text = str(getattr(message, "content", "") or "")
+        text = re.sub(rf"<@!?{bot_id}>", " ", text)
+        if role_id is not None:
+            text = re.sub(rf"<@&{role_id}>", " ", text)
+        return " ".join(text.split())
+
+    def _mention_channel_allowed(self, message: Any, config: dict[str, Any]) -> bool:
+        allowed = {int(value) for value in config.get("ai_mention_channel_ids") or []}
+        if not allowed:
+            return True  # empty list = every channel the bot can read
+        channel = getattr(message, "channel", None)
+        ids = {getattr(channel, "id", None), getattr(channel, "parent_id", None)}
+        return bool(ids & allowed)
+
+    async def handle_mention_message(self, message: Any) -> None:
+        """@Kairo (bot user or its role) in an allowed channel starts an AI request."""
+        if not self.mention_enabled:
+            return
+        guild = getattr(message, "guild", None)
+        channel = getattr(message, "channel", None)
+        author = getattr(message, "author", None)
+        if guild is None or channel is None or author is None:
+            return
+        if getattr(message, "webhook_id", None) is not None or getattr(author, "bot", False) is not False:
+            return
+        if not isinstance(author, MEMBER_TYPES):
+            return
+        prompt = self.mention_prompt(message)
+        if prompt is None:
+            return
+        config = self._try_load_config()
+        if config is None or config.get("ai_mention_enabled") is not True:
+            return
+        if config.get("ai_control_channel_id") == getattr(channel, "id", None):
+            return  # the control channel handles every message itself
+        if not self._mention_channel_allowed(message, config):
+            return
+        delivery = ChannelDelivery(channel, reply_to=message)
+        if not actor_has_ai_access(author, guild, config):
+            now = self._mention_clock()
+            last = self._mention_denials.get(author.id, -MENTION_DENIAL_COOLDOWN_SECONDS)
+            if now - last >= MENTION_DENIAL_COOLDOWN_SECONDS:
+                self._mention_denials[author.id] = now
+                await delivery.send(MENTION_DENIED_MESSAGE)
+            return
+        binding = RequestBinding(user_id=author.id, guild_id=guild.id, channel_id=channel.id)
+        if not prompt:
+            await delivery.send(MENTION_EMPTY_MESSAGE)
+            return
+        if len(prompt) > AI_PROMPT_MAX_CHARS:
+            await delivery.send(f"Message must be {AI_PROMPT_MAX_CHARS} characters or fewer for AI requests.")
+            return
+        if prompt.lower() in RESET_WORDS:
+            self.memory.clear(self.memory_key(binding))
+            await delivery.send(MEMORY_CLEARED_MESSAGE)
+            return
+        async with _maybe_typing(channel):
+            await self._run_request(
+                delivery=delivery,
+                source=RequestContext(guild=guild, user=author),
+                binding=binding,
+                prompt=prompt,
+                task_mode=DEFAULT_TASK_MODE,
+                attachments=collect_attachments(getattr(message, "attachments", None)),
+            )
+
     # -- natural control channel (AI-5) -------------------------------------
 
     def is_control_message_candidate(self, message: Any) -> bool:
@@ -1743,15 +1891,7 @@ class AITransport:
         # Ownership and fresh authorization are checked BEFORE the core is
         # called, so a failed check never consumes the pending confirmation.
         # Denials are always ephemeral, even under a public control-channel plan.
-        if not self._binding_matches(interaction, state.binding):
-            await self._respond(interaction, NOT_OWNER_MESSAGE)
-            return
-        config = self._try_load_config()
-        if config is None:
-            await self._respond(interaction, CONFIG_UNAVAILABLE_MESSAGE)
-            return
-        if not actor_has_ai_access(interaction.user, interaction.guild, config):
-            await self._respond(interaction, ACCESS_DENIED_MESSAGE)
+        if not await self._check_button_owner(interaction, state.binding):
             return
         orchestrator = self._orchestrator
         if orchestrator is None:
@@ -1806,6 +1946,9 @@ class AITransport:
         if not self._binding_matches(interaction, binding):
             await self._respond(interaction, NOT_OWNER_MESSAGE)
             return False
+        if binding.user_id == admin_terminal.OPERATOR_USER_ID:
+            # Operator requests are decided only from the local Manager.
+            return admin_terminal.is_manager_operator(interaction)
         config = self._try_load_config()
         if config is None:
             await self._respond(interaction, CONFIG_UNAVAILABLE_MESSAGE)
