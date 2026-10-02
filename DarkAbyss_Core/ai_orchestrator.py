@@ -14,8 +14,14 @@ import ai_platform
 
 
 MAX_PROVIDER_ATTEMPTS = 4
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_ROUNDS = 15
+# Bounded by the exact confirmation preview (admin_ai.AI_MAX_PREVIEW_PAGES):
+# 8 maximal send_message calls are the worst case that still fits.
 MAX_TOOL_CALLS_PER_ROUND = 8
+# With OrchestratorRequest.recover_errors, invalid tool calls and failed tool
+# results are returned to the model (instead of ending the run) at most this
+# many times per orchestration.
+MAX_RECOVERED_ERRORS = 3
 MAX_PENDING_CONFIRMATIONS = 64
 MAX_PENDING_COMPARES = 32
 MAX_COMPARE_PROFILES = ai_platform.MAX_COMPARE_PROFILES
@@ -85,6 +91,10 @@ class OrchestratorRequest:
     manual_profile_id: str | None = None
     allow_fallback_on_manual_override: bool = False
     allowed_tool_names: tuple[str, ...] | None = None
+    # True: invalid tool calls and failed tool results go back to the model as
+    # tool results (bounded by MAX_RECOVERED_ERRORS) so it can correct itself.
+    # False keeps the strict fail-fast contract.
+    recover_errors: bool = False
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -98,6 +108,8 @@ class OrchestratorRequest:
             ai_platform._validate_identifier(self.manual_profile_id, "manual_profile_id")
         if not isinstance(self.allow_fallback_on_manual_override, bool):
             raise ValueError("allow_fallback_on_manual_override must be boolean.")
+        if type(self.recover_errors) is not bool:
+            raise ValueError("recover_errors must be boolean.")
         if self.allowed_tool_names is not None:
             object.__setattr__(self, "allowed_tool_names", _coerce_allowed_tool_names(self.allowed_tool_names))
 
@@ -288,6 +300,7 @@ class _RunContext:
     allowed_tool_names: tuple[str, ...] | None
     tools: tuple[Mapping[str, Any], ...]
     confirmation_policy: ConfirmationPolicy
+    recover_errors: bool = False
 
 
 @dataclass(frozen=True)
@@ -302,6 +315,8 @@ class _PendingPlan:
     executed_tools: tuple[ExecutedToolSummary, ...]
     # Total tool rounds consumed by this orchestration, INCLUDING tool_plan.
     tool_rounds_used: int
+    # Errors already returned to the model (recover_errors runs only).
+    tool_errors_used: int = 0
 
 
 @dataclass(frozen=True)
@@ -462,6 +477,7 @@ class AIOrchestrator:
                 allowed_tool_names=request.allowed_tool_names,
                 tools=tools,
                 confirmation_policy=confirmation_policy,
+                recover_errors=request.recover_errors,
             )
             result = await self._run_loop(
                 context=context,
@@ -760,6 +776,7 @@ class AIOrchestrator:
         attempts: tuple[AttemptRecord, ...],
         executed_tools: tuple[ExecutedToolSummary, ...],
         tool_rounds_used: int,
+        tool_errors_used: int = 0,
     ) -> OrchestratorResult:
         """Run the bounded tool loop on ALREADY-INITIALIZED provider history.
 
@@ -767,6 +784,7 @@ class AIOrchestrator:
         (including earlier runs before a confirmation pause), so
         MAX_TOOL_ROUNDS is a hard cap across resumes. Every iteration either
         returns or consumes one tool round, so the loop is bounded.
+        ``tool_errors_used`` likewise bounds recovered errors across resumes.
         """
         while True:
             try:
@@ -799,7 +817,12 @@ class AIOrchestrator:
                     message=safe_message,
                 )
             try:
-                tool_plan = _validate_tool_plan(response.tool_calls, context.allowed_tool_names)
+                if context.recover_errors:
+                    tool_plan, call_errors = _validate_tool_plan(
+                        response.tool_calls, context.allowed_tool_names, collect_errors=True
+                    )
+                else:
+                    tool_plan, call_errors = _validate_tool_plan(response.tool_calls, context.allowed_tool_names), {}
             except Exception as exc:
                 # Model-controlled plans can never crash the caller.
                 message = str(exc) if isinstance(exc, OrchestratorError) else _safe_exception_message(
@@ -813,6 +836,23 @@ class AIOrchestrator:
                     executed_tools=executed_tools,
                     message=message,
                 )
+            if call_errors:
+                # Nothing from this batch runs; every call gets a result so the
+                # model can correct the arguments and try again.
+                first_error = next(iter(call_errors.values()))
+                if tool_errors_used >= MAX_RECOVERED_ERRORS or tool_rounds_used >= MAX_TOOL_ROUNDS:
+                    return _context_result(
+                        context,
+                        OrchestratorStatus.INVALID_TOOL_PLAN,
+                        content=response.content,
+                        attempts=attempts,
+                        executed_tools=executed_tools,
+                        message=first_error,
+                    )
+                tool_errors_used += 1
+                tool_rounds_used += 1
+                history = _append_tool_round(history, response, _rejected_call_messages(response.tool_calls, call_errors))
+                continue
             if not tool_plan:
                 return _context_result(
                     context,
@@ -846,6 +886,7 @@ class AIOrchestrator:
                 attempts=attempts,
                 executed_tools=executed_tools,
                 tool_rounds_used=tool_rounds_used,
+                tool_errors_used=tool_errors_used,
             )
             if _requires_confirmation(context.confirmation_policy, _batch_risk(tool_plan)):
                 return self._store_confirmation(pending)
@@ -860,15 +901,17 @@ class AIOrchestrator:
             executed = await _execute_tool_batch(tool_plan, executor)
             executed_tools = (*executed_tools, *executed.summaries)
             if executed.failure:
-                return _context_result(
-                    context,
-                    OrchestratorStatus.TOOL_EXECUTION_FAILED,
-                    content=response.content,
-                    attempts=attempts,
-                    executed_tools=executed_tools,
-                    message=executed.failure,
-                )
-            history = _append_tool_round(history, response, executed.tool_messages)
+                if not _can_recover(context, executed, tool_errors_used):
+                    return _context_result(
+                        context,
+                        OrchestratorStatus.TOOL_EXECUTION_FAILED,
+                        content=response.content,
+                        attempts=attempts,
+                        executed_tools=executed_tools,
+                        message=executed.failure,
+                    )
+                tool_errors_used += 1
+            history = _append_tool_round(history, response, _completed_tool_messages(tool_plan, executed))
 
     def _store_confirmation(self, pending: _PendingPlan) -> OrchestratorResult:
         self._purge_expired()
@@ -906,17 +949,24 @@ class AIOrchestrator:
     ) -> OrchestratorResult:
         executed = await _execute_tool_batch(pending.tool_plan, executor)
         executed_tools = (*pending.executed_tools, *executed.summaries)
+        tool_errors_used = pending.tool_errors_used
         if executed.failure:
-            return _context_result(
-                pending.context,
-                OrchestratorStatus.TOOL_EXECUTION_FAILED,
-                content=pending.response.content,
-                attempts=pending.attempts,
-                executed_tools=executed_tools,
-                message=executed.failure,
-            )
+            if not _can_recover(pending.context, executed, tool_errors_used):
+                return _context_result(
+                    pending.context,
+                    OrchestratorStatus.TOOL_EXECUTION_FAILED,
+                    content=pending.response.content,
+                    attempts=pending.attempts,
+                    executed_tools=executed_tools,
+                    message=executed.failure,
+                )
+            tool_errors_used += 1
         # pending.history_before_response is already initialized; reuse it as-is.
-        history = _append_tool_round(pending.history_before_response, pending.response, executed.tool_messages)
+        history = _append_tool_round(
+            pending.history_before_response,
+            pending.response,
+            _completed_tool_messages(pending.tool_plan, executed),
+        )
         return await self._run_loop(
             context=pending.context,
             history=history,
@@ -924,6 +974,7 @@ class AIOrchestrator:
             attempts=pending.attempts,
             executed_tools=executed_tools,
             tool_rounds_used=pending.tool_rounds_used,
+            tool_errors_used=tool_errors_used,
         )
 
 
@@ -962,6 +1013,9 @@ class _ExecutionBatch:
     summaries: tuple[ExecutedToolSummary, ...]
     tool_messages: tuple[ai_platform.AIMessage, ...]
     failure: str | None = None
+    # Fatal failures (executor crash, a result flagged data={"fatal": True},
+    # e.g. revoked authorization) always end the run, even with recover_errors.
+    fatal: bool = False
 
 
 EXECUTOR_FAILURE_MESSAGE = "Tool executor failed unexpectedly."
@@ -986,12 +1040,62 @@ async def _execute_tool_batch(tool_plan: tuple[ValidatedToolCall, ...], executor
                 tuple(summaries),
                 tuple(tool_messages),
                 _safe_exception_message(EXECUTOR_FAILURE_MESSAGE, exc),
+                fatal=True,
             )
         summaries.append(ExecutedToolSummary(call.call_id, call.tool_name, ok, result_message))
         tool_messages.append(ai_platform.AIMessage(role=ai_platform.MessageRole.TOOL, content=safe_content, tool_call_id=call.call_id))
         if not ok:
-            return _ExecutionBatch(tuple(summaries), tuple(tool_messages), f"Tool failed: {call.tool_name}")
+            data = getattr(result, "data", None)
+            fatal = isinstance(data, dict) and data.get("fatal") is True
+            return _ExecutionBatch(tuple(summaries), tuple(tool_messages), f"Tool failed: {call.tool_name}", fatal=fatal)
     return _ExecutionBatch(tuple(summaries), tuple(tool_messages))
+
+
+def _can_recover(context: _RunContext, executed: _ExecutionBatch, tool_errors_used: int) -> bool:
+    return context.recover_errors and not executed.fatal and tool_errors_used < MAX_RECOVERED_ERRORS
+
+
+def _tool_error_message(call_id: str, tool_name: str, message: str) -> ai_platform.AIMessage:
+    payload = {"ok": False, "tool_name": tool_name, "message": _bounded_text(message), "data": None}
+    return ai_platform.AIMessage(
+        role=ai_platform.MessageRole.TOOL,
+        content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        tool_call_id=call_id,
+    )
+
+
+def _completed_tool_messages(
+    tool_plan: tuple[ValidatedToolCall, ...], executed: _ExecutionBatch
+) -> tuple[ai_platform.AIMessage, ...]:
+    """Executed results plus a "skipped" result for every call after a failure.
+
+    Providers require exactly one result per tool call of the replayed step.
+    """
+    if not executed.failure:
+        return executed.tool_messages
+    answered = {message.tool_call_id for message in executed.tool_messages}
+    skipped = tuple(
+        _tool_error_message(call.call_id, call.tool_name, "Not executed: an earlier action in this batch failed.")
+        for call in tool_plan
+        if call.call_id not in answered
+    )
+    return (*executed.tool_messages, *skipped)
+
+
+def _rejected_call_messages(
+    tool_calls: tuple[ai_platform.AIToolCall, ...], call_errors: Mapping[str, str]
+) -> tuple[ai_platform.AIMessage, ...]:
+    """One result per call of a batch that was rejected before execution."""
+    messages = []
+    for tool_call in tool_calls:
+        error = call_errors.get(tool_call.call_id)
+        text = (
+            f"Not executed: {error} Fix the call and try again."
+            if error
+            else "Not executed: another call in the same batch was invalid; call it again if still needed."
+        )
+        messages.append(_tool_error_message(tool_call.call_id, tool_call.tool_name, text))
+    return tuple(messages)
 
 
 def _append_tool_round(
@@ -1023,12 +1127,23 @@ def _provider_tool_schemas(allowed_tool_names: tuple[str, ...] | None) -> tuple[
 def _validate_tool_plan(
     tool_calls: tuple[ai_platform.AIToolCall, ...],
     allowed_tool_names: tuple[str, ...] | None,
-) -> tuple[ValidatedToolCall, ...]:
+    *,
+    collect_errors: bool = False,
+) -> Any:
+    """Validate a provider tool batch.
+
+    Default: return the validated plan or raise OrchestratorError on the first
+    problem. ``collect_errors=True``: return ``(plan, {call_id: error})`` so
+    per-call problems can be reported back to the model; structural problems
+    (missing/duplicate/over-long call IDs) still raise because results could
+    not be matched to calls.
+    """
     if not tool_calls:
-        return ()
+        return ((), {}) if collect_errors else ()
     allowed = None if allowed_tool_names is None else set(allowed_tool_names)
     seen_call_ids: set[str] = set()
     validated: list[ValidatedToolCall] = []
+    errors: dict[str, str] = {}
     for tool_call in tool_calls:
         if not tool_call.call_id:
             raise OrchestratorError("Provider tool call is missing a call ID.")
@@ -1037,22 +1152,31 @@ def _validate_tool_plan(
         if tool_call.call_id in seen_call_ids:
             raise OrchestratorError("Provider tool call IDs must be unique.")
         seen_call_ids.add(tool_call.call_id)
-        if allowed is not None and tool_call.tool_name not in allowed:
-            raise OrchestratorError(f"Tool is not allowed: {tool_call.tool_name}")
         try:
-            definition = admin_tools.get_tool_definition(tool_call.tool_name)
-            arguments = admin_tools.validate_tool_arguments(tool_call.tool_name, dict(tool_call.arguments))
-        except (admin_tools.AdminToolError, ValueError) as exc:
-            raise OrchestratorError(str(exc)) from exc
-        validated.append(
-            ValidatedToolCall(
-                call_id=tool_call.call_id,
-                tool_name=tool_call.tool_name,
-                arguments=arguments,
-                risk=_risk_from_admin_tool(definition.risk),
-            )
-        )
+            validated.append(_validate_tool_call(tool_call, allowed))
+        except OrchestratorError as exc:
+            if not collect_errors:
+                raise
+            errors[tool_call.call_id] = str(exc)
+    if collect_errors:
+        return tuple(validated), errors
     return tuple(validated)
+
+
+def _validate_tool_call(tool_call: ai_platform.AIToolCall, allowed: set[str] | None) -> ValidatedToolCall:
+    if allowed is not None and tool_call.tool_name not in allowed:
+        raise OrchestratorError(f"Tool is not allowed: {tool_call.tool_name}")
+    try:
+        definition = admin_tools.get_tool_definition(tool_call.tool_name)
+        arguments = admin_tools.validate_tool_arguments(tool_call.tool_name, dict(tool_call.arguments))
+        return ValidatedToolCall(
+            call_id=tool_call.call_id,
+            tool_name=tool_call.tool_name,
+            arguments=arguments,
+            risk=_risk_from_admin_tool(definition.risk),
+        )
+    except (admin_tools.AdminToolError, ValueError) as exc:
+        raise OrchestratorError(str(exc)) from exc
 
 
 def _validate_confirmation_policy(policy: ConfirmationPolicy) -> None:

@@ -24,6 +24,9 @@ AI_WHITELIST_DEFAULTS = {
     "ai_allowed_role_ids": [],
     # AI-5: natural control channel disabled by default.
     "ai_control_channel_id": None,
+    # AI-6.2: approve the AI plan once; message text reading off by default.
+    "ai_confirmation_mode": "plan",
+    "ai_read_message_content": False,
 }
 
 

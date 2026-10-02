@@ -82,6 +82,13 @@
         }
       ]
     },
+    "ai_confirmation_mode": {
+      "type": "string",
+      "pattern": "^(plan|strict)$"
+    },
+    "ai_read_message_content": {
+      "type": "boolean"
+    },
     "audit_channel_id": {
       "anyOf": [
         {

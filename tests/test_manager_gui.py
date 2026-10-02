@@ -534,6 +534,24 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertNotIn("ai_allowed_user_ids", saved)
         self.assertNotIn("ai_allowed_role_ids", saved)
         self.assertNotIn("ai_control_channel_id", saved)
+        self.assertNotIn("ai_confirmation_mode", saved)
+        self.assertNotIn("ai_read_message_content", saved)
+
+    def test_setup_dialog_ai_confirmation_mode_and_message_reading(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        config_api = FakeConfigApi()
+        dialog = self.manager_gui.BotSetupDialog("admin-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+        self.assertEqual(dialog.ai_confirmation_combo.currentData(), "plan")
+        self.assertFalse(dialog.ai_read_content_checkbox.isChecked())
+        self.assertIn("Message Content Intent", dialog.ai_behaviour_label.text())
+
+        dialog.ai_confirmation_combo.setCurrentIndex(dialog.ai_confirmation_combo.findData("strict"))
+        dialog.ai_read_content_checkbox.setChecked(True)
+        self.assertTrue(dialog.save_setup())
+        saved = config_api.saved[-1][1]
+        self.assertEqual(saved["ai_confirmation_mode"], "strict")
+        self.assertIs(saved["ai_read_message_content"], True)
 
     def test_setup_dialog_rejects_invalid_discord_ids(self):
         instance_api = FakeInstanceApi(self.temp_dir.name)

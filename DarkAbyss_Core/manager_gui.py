@@ -201,6 +201,12 @@ AI_CONTROL_CHANNEL_EXPLANATION = (
     "AI control channel: Kairo answers normal messages in this one channel (AI whitelist still required). "
     "Needs Message Content Intent enabled in Discord Developer Portal and a bot restart. Leave empty to disable."
 )
+AI_BEHAVIOUR_EXPLANATION = (
+    "AI confirmations: 'plan once' shows the AI's plan with one Approve button, then runs its normal actions; "
+    "deletions, bans, kicks, purges and permission changes still ask separately with the exact data. "
+    "'Every change' asks before each step. Reading message text (purge by text/links, chat summaries) needs "
+    "Message Content Intent in the Developer Portal and a bot restart."
+)
 
 
 def parse_optional_channel_id(text: str, label: str) -> str | None:
@@ -1190,6 +1196,12 @@ class BotSetupDialog(QDialog):
         self.ai_channel_help_button = self._create_help_button("ai_channel")
         self.ai_control_channel_label = QLabel(AI_CONTROL_CHANNEL_EXPLANATION)
         self.ai_control_channel_label.setWordWrap(True)
+        self.ai_confirmation_combo = QComboBox()
+        self.ai_confirmation_combo.addItem("Approve the AI plan once (recommended)", "plan")
+        self.ai_confirmation_combo.addItem("Approve every change separately", "strict")
+        self.ai_read_content_checkbox = QCheckBox("AI can read message text (needs Message Content Intent)")
+        self.ai_behaviour_label = QLabel(AI_BEHAVIOUR_EXPLANATION)
+        self.ai_behaviour_label.setWordWrap(True)
 
         self.invite_link_edit = QLineEdit()
         self.invite_link_edit.setReadOnly(True)
@@ -1320,12 +1332,15 @@ class BotSetupDialog(QDialog):
         ai_form.addRow(self._help_label("AI allowed user IDs", self.ai_users_help_button), self.ai_allowed_users_edit)
         ai_form.addRow(self._help_label("AI allowed role IDs", self.ai_roles_help_button), self.ai_allowed_roles_edit)
         ai_form.addRow(self._help_label("AI control channel ID", self.ai_channel_help_button), self.ai_control_channel_edit)
+        ai_form.addRow("AI confirmations", self.ai_confirmation_combo)
+        ai_form.addRow("", self.ai_read_content_checkbox)
         layout = QVBoxLayout()
         layout.addWidget(description)
         layout.addLayout(form)
         layout.addWidget(self.ai_access_label)
         layout.addLayout(ai_form)
         layout.addWidget(self.ai_control_channel_label)
+        layout.addWidget(self.ai_behaviour_label)
         layout.addStretch(1)
         page.setLayout(layout)
         return page
@@ -1386,6 +1401,9 @@ class BotSetupDialog(QDialog):
         self.ai_allowed_roles_edit.setText(", ".join(str(value) for value in effective.get("ai_allowed_role_ids", [])))
         ai_control_channel_id = effective.get("ai_control_channel_id")
         self.ai_control_channel_edit.setText("" if ai_control_channel_id is None else str(ai_control_channel_id))
+        mode_index = self.ai_confirmation_combo.findData(effective.get("ai_confirmation_mode", "plan"))
+        self.ai_confirmation_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self.ai_read_content_checkbox.setChecked(effective.get("ai_read_message_content") is True)
         self._update_invite_preview()
         self._update_ready_summary()
         self._set_status("Loaded setup.")
@@ -1416,6 +1434,14 @@ class BotSetupDialog(QDialog):
             ai_channel = parse_optional_channel_id(self.ai_control_channel_edit.text(), "AI control channel ID")
             if ai_channel is not None or "ai_control_channel_id" in overrides:
                 overrides["ai_control_channel_id"] = ai_channel
+            # Program defaults are "plan" and false: write only real choices or
+            # existing overrides, like the AI whitelist fields above.
+            confirmation_mode = str(self.ai_confirmation_combo.currentData() or "plan")
+            if confirmation_mode != "plan" or "ai_confirmation_mode" in overrides:
+                overrides["ai_confirmation_mode"] = confirmation_mode
+            read_content = self.ai_read_content_checkbox.isChecked()
+            if read_content or "ai_read_message_content" in overrides:
+                overrides["ai_read_message_content"] = read_content
             self._instance_api.update_instance_display_name(self._instance_id, display_name)
             self._config_api.save_config_overrides(self._instance_id, overrides)
             if token:

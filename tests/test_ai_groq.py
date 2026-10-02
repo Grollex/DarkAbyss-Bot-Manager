@@ -481,6 +481,16 @@ class GroqRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(transport.calls), 3)
         self.assertEqual(sleeps, [3.0, 8.0])
 
+    async def test_tool_use_failed_is_resampled_once_per_retry_slot(self):
+        failed = {"error": {"message": "Failed to call a function.", "code": "tool_use_failed"}}
+        transport = FakeTransport([(400, failed), (200, self.ok_payload())])
+        _, provider, request, sleeps = self.make_provider(transport)
+
+        response = await provider.generate(request, "groq-default")
+
+        self.assertEqual(response.content, "done")
+        self.assertEqual(sleeps, [0.5])
+
     async def test_long_waits_and_client_errors_are_not_retried(self):
         daily = {"error": {"message": "Rate limit reached on requests per day. Please try again in 12m30s."}}
         for status, payload in ((429, daily), (401, {}), (400, {})):

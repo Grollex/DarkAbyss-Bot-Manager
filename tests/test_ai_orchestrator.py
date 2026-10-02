@@ -1880,5 +1880,163 @@ class DefaultRegistryTests(unittest.TestCase):
             self.assertEqual(len(registry), 0)
 
 
+class RecoverErrorsTests(unittest.IsolatedAsyncioTestCase):
+    """recover_errors=True: mistakes go back to the model instead of ending the run."""
+
+    make_store = OrchestratorTests.make_store
+    make_orchestrator = OrchestratorTests.make_orchestrator
+    profile = OrchestratorTests.profile
+    user_message = OrchestratorTests.user_message
+
+    def setup_run(self, responses, executor_results=None):
+        ai_platform, ai_orchestrator, admin_tools = load_modules()
+        provider = FakeProvider(ai_platform, responses=responses(ai_platform))
+        settings = ai_platform.AISettings(
+            profiles=(self.profile(ai_platform, "routine"),),
+            routing=ai_platform.RoutingConfig(routine_profile_id="routine"),
+        )
+        orchestrator = self.make_orchestrator(ai_platform, ai_orchestrator, settings, {"fake": provider})
+        executor = FakeExecutor(admin_tools, results=(executor_results or (lambda _tools: []))(admin_tools))
+        return ai_platform, ai_orchestrator, provider, orchestrator, executor
+
+    def request(self, ai_platform, ai_orchestrator, recover=True):
+        return ai_orchestrator.OrchestratorRequest(
+            messages=(self.user_message(ai_platform),), task_class="ROUTINE", recover_errors=recover
+        )
+
+    @staticmethod
+    def call(ai_platform, call_id, tool_name, **arguments):
+        return ai_platform.AIToolCall(call_id=call_id, tool_name=tool_name, arguments=arguments)
+
+    @staticmethod
+    def tool_results(provider_request):
+        return [
+            (message.tool_call_id, json.loads(message.content))
+            for message in provider_request.messages
+            if message.role.value == "tool"
+        ]
+
+    def test_recover_errors_must_be_boolean(self):
+        ai_platform, ai_orchestrator, _ = load_modules()
+        with self.assertRaises(ValueError):
+            ai_orchestrator.OrchestratorRequest(
+                messages=(self.user_message(ai_platform),), task_class="ROUTINE", recover_errors="yes"
+            )
+
+    async def test_invalid_arguments_are_returned_and_the_model_corrects_them(self):
+        ai_platform, ai_orchestrator, provider, orchestrator, executor = self.setup_run(
+            lambda p: [
+                p.AIResponse(tool_calls=(self.call(p, "c1", "get_channel_details", channel_id="general"),)),
+                p.AIResponse(tool_calls=(self.call(p, "c2", "get_channel_details", channel_id="100"),)),
+                p.AIResponse(content="Channel found."),
+            ]
+        )
+
+        result = await orchestrator.orchestrate(self.request(ai_platform, ai_orchestrator), executor=executor)
+
+        self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.COMPLETED)
+        self.assertEqual(result.content, "Channel found.")
+        self.assertEqual(executor.calls, [("get_channel_details", {"channel_id": "100"})])
+        rejected = self.tool_results(provider.requests[1][0])
+        self.assertEqual(rejected[0][0], "c1")
+        self.assertFalse(rejected[0][1]["ok"])
+        self.assertIn("Not executed", rejected[0][1]["message"])
+
+    async def test_unknown_or_disallowed_tool_is_reported_not_fatal(self):
+        ai_platform, ai_orchestrator, provider, orchestrator, executor = self.setup_run(
+            lambda p: [
+                p.AIResponse(tool_calls=(self.call(p, "c1", "list_roles"), self.call(p, "c2", "list_channels"))),
+                p.AIResponse(content="done"),
+            ]
+        )
+        request = ai_orchestrator.OrchestratorRequest(
+            messages=(self.user_message(ai_platform),),
+            task_class="ROUTINE",
+            allowed_tool_names=("list_channels",),
+            recover_errors=True,
+        )
+
+        result = await orchestrator.orchestrate(request, executor=executor)
+
+        self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.COMPLETED)
+        self.assertEqual(executor.calls, [])  # nothing from a rejected batch runs
+        results = dict(self.tool_results(provider.requests[1][0]))
+        self.assertIn("not allowed", results["c1"]["message"])
+        self.assertIn("another call in the same batch", results["c2"]["message"])
+
+    async def test_failed_tool_result_lets_the_model_continue_and_skips_rest_of_batch(self):
+        ai_platform, ai_orchestrator, provider, orchestrator, executor = self.setup_run(
+            lambda p: [
+                p.AIResponse(tool_calls=(self.call(p, "c1", "list_channels"), self.call(p, "c2", "list_roles"))),
+                p.AIResponse(content="The channel list failed; roles were not read."),
+            ],
+            lambda tools: [tools.ToolResult(False, "list_channels", "Discord API error: 500")],
+        )
+
+        result = await orchestrator.orchestrate(self.request(ai_platform, ai_orchestrator), executor=executor)
+
+        self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.COMPLETED)
+        self.assertEqual([name for name, _ in executor.calls], ["list_channels"])
+        self.assertEqual([(tool.tool_name, tool.ok) for tool in result.executed_tools], [("list_channels", False)])
+        results = dict(self.tool_results(provider.requests[1][0]))
+        self.assertEqual(results["c1"]["message"], "Discord API error: 500")
+        self.assertIn("earlier action in this batch failed", results["c2"]["message"])
+
+    async def test_error_budget_is_bounded(self):
+        def bad(p, index):
+            return p.AIResponse(tool_calls=(self.call(p, f"c{index}", "get_channel_details", channel_id="bad"),))
+
+        ai_platform, ai_orchestrator, provider, orchestrator, executor = self.setup_run(
+            lambda p: [bad(p, index) for index in range(10)]
+        )
+
+        result = await orchestrator.orchestrate(self.request(ai_platform, ai_orchestrator), executor=executor)
+
+        self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.INVALID_TOOL_PLAN)
+        self.assertEqual(len(provider.requests), ai_orchestrator.MAX_RECOVERED_ERRORS + 1)
+        self.assertEqual(executor.calls, [])
+
+    async def test_fatal_result_still_ends_the_run(self):
+        ai_platform, ai_orchestrator, provider, orchestrator, executor = self.setup_run(
+            lambda p: [p.AIResponse(tool_calls=(self.call(p, "c1", "list_channels"),)), p.AIResponse(content="unused")],
+            lambda tools: [tools.ToolResult(False, "list_channels", "not authorized", {"fatal": True})],
+        )
+
+        result = await orchestrator.orchestrate(self.request(ai_platform, ai_orchestrator), executor=executor)
+
+        self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.TOOL_EXECUTION_FAILED)
+        self.assertEqual(len(provider.requests), 1)
+
+    async def test_without_recover_errors_the_strict_contract_is_unchanged(self):
+        ai_platform, ai_orchestrator, provider, orchestrator, executor = self.setup_run(
+            lambda p: [p.AIResponse(tool_calls=(self.call(p, "c1", "get_channel_details", channel_id="bad"),))]
+        )
+
+        result = await orchestrator.orchestrate(
+            self.request(ai_platform, ai_orchestrator, recover=False), executor=executor
+        )
+
+        self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.INVALID_TOOL_PLAN)
+        self.assertEqual(len(provider.requests), 1)
+
+    async def test_failure_after_approval_is_recovered_and_next_writes_need_approval_again(self):
+        ai_platform, ai_orchestrator, provider, orchestrator, executor = self.setup_run(
+            lambda p: [
+                p.AIResponse(tool_calls=(self.call(p, "c1", "delete_role", role_id="200"),)),
+                p.AIResponse(tool_calls=(self.call(p, "c2", "delete_role", role_id="201"),)),
+            ],
+            lambda tools: [tools.ToolResult(False, "delete_role", "Role 200 was not found.")],
+        )
+
+        first = await orchestrator.orchestrate(self.request(ai_platform, ai_orchestrator), executor=executor)
+        self.assertEqual(first.status, ai_orchestrator.OrchestratorStatus.NEEDS_CONFIRMATION)
+        second = await orchestrator.approve_confirmation(first.confirmation_id, approved=True, executor=executor)
+
+        self.assertEqual(second.status, ai_orchestrator.OrchestratorStatus.NEEDS_CONFIRMATION)
+        self.assertEqual(second.tool_plan[0].arguments["role_id"], "201")
+        self.assertEqual([(tool.tool_name, tool.ok) for tool in second.executed_tools], [("delete_role", False)])
+        self.assertEqual(len(executor.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

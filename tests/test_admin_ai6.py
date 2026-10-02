@@ -363,7 +363,7 @@ class RegistryTests(unittest.TestCase):
 
     def test_no_host_or_network_surface_in_new_tool_modules(self):
         forbidden = ["subprocess", "shell=True", "os.system", "eval(", "exec(", "urlopen", "requests.", "aiohttp", "open("]
-        for module in ("admin_tools_server.py", "admin_tools_content.py", "admin_blueprint.py"):
+        for module in ("admin_tools_server.py", "admin_tools_content.py", "admin_blueprint.py", "ai_context.py", "ai_memory.py"):
             source = (CORE_ROOT / module).read_text(encoding="utf-8")
             for pattern in forbidden:
                 with self.subTest(module=module, pattern=pattern):

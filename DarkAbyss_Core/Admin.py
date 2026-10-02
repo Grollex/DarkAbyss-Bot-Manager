@@ -140,6 +140,20 @@ def validate_config(config: dict) -> dict:
         None if ai_control_channel_id is None else parse_snowflake(ai_control_channel_id, "ai_control_channel_id")
     )
 
+    # AI-6.2: "plan" = approve the AI's plan once (destructive actions are still
+    # confirmed one by one with exact arguments); "strict" = approve every change.
+    confirmation_mode = config.get("ai_confirmation_mode", "plan")
+    if confirmation_mode not in ("plan", "strict"):
+        raise ValueError('"ai_confirmation_mode" must be "plan" or "strict".')
+    config["ai_confirmation_mode"] = confirmation_mode
+
+    # Lets AI tools read message text (purge filters, summaries) without the
+    # control channel. Requires the privileged Message Content Intent.
+    read_content = config.get("ai_read_message_content", False)
+    if not isinstance(read_content, bool):
+        raise ValueError('"ai_read_message_content" must be a boolean.')
+    config["ai_read_message_content"] = read_content
+
     return config
 
 
@@ -302,13 +316,19 @@ def configure_message_content_intent(client: discord.Client, enabled: bool) -> N
     client._connection._intents.message_content = bool(enabled)
 
 
+def message_content_requested(config: dict) -> bool:
+    """Message Content Intent is needed by the control channel or by AI message reading."""
+    return natural_ai_enabled(config) or config.get("ai_read_message_content") is True
+
+
 PRIVILEGED_INTENTS_HELP = (
-    "Discord refused a privileged gateway intent. With the AI control channel enabled this bot "
-    "requires BOTH privileged intents: 'Server Members Intent' (always required by the Admin bot) and "
-    "'Message Content Intent' (required only for the AI control channel). Enable the missing one(s) in "
-    "Discord Developer Portal -> Application -> Bot -> Privileged Gateway Intents. To run without "
-    "Message Content Intent, clear 'AI control channel ID' in Manager Setup Bot (Server Members Intent "
-    "is still required). /execute and /ai do not need Message Content Intent."
+    "Discord refused a privileged gateway intent. With the AI control channel or 'AI can read message "
+    "text' enabled this bot requires BOTH privileged intents: 'Server Members Intent' (always required "
+    "by the Admin bot) and 'Message Content Intent' (required only for the AI control channel and AI "
+    "message reading). Enable the missing one(s) in Discord Developer Portal -> Application -> Bot -> "
+    "Privileged Gateway Intents. To run without Message Content Intent, clear 'AI control channel ID' "
+    "and turn off 'AI can read message text' in Manager Setup Bot (Server Members Intent is still "
+    "required). /execute and /ai do not need Message Content Intent."
 )
 
 
@@ -423,6 +443,9 @@ async def execute(
         source="/execute",
         requesting_user_id=interaction.user.id,
         requesting_user_name=str(interaction.user),
+        # Same anti-escalation as /ai: whitelisted non-owners cannot act on
+        # roles/members at or above their own highest role.
+        enforce_hierarchy=True,
     )
     try:
         arguments = build_execute_tool_arguments(
@@ -496,6 +519,19 @@ async def ai(
     await ai_transport.handle_ai_command(interaction, prompt, mode.value if mode else None, files)
 
 
+@bot.tree.command(name="ai_reset", description="Forget your recent AI conversation in this channel")
+@app_commands.guild_only()
+async def ai_reset(interaction: discord.Interaction) -> None:
+    if ai_transport is None:
+        await interaction.response.send_message(
+            "AI is currently unavailable.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    await ai_transport.handle_reset_command(interaction)
+
+
 @bot.listen("on_message")
 async def ai_control_channel_listener(message: discord.Message) -> None:
     # Cheap gate first: nothing happens unless the natural AI channel is enabled.
@@ -524,17 +560,21 @@ def main(argv: list[str] | None = None) -> int:
         ai_transport.feature_store = feature_store
 
     natural_ai = natural_ai_enabled(config) and ai_transport is not None
-    configure_message_content_intent(bot, natural_ai)
+    read_content = message_content_requested(config) and ai_transport is not None
+    configure_message_content_intent(bot, read_content)
     if ai_transport is not None:
         ai_transport.set_control_channel(config.get("ai_control_channel_id") if natural_ai else None)
+        ai_transport.message_content_enabled = read_content
     if natural_ai:
         print("AI control channel enabled; requesting Discord Message Content Intent.")
+    elif read_content:
+        print("AI message reading enabled; requesting Discord Message Content Intent.")
 
     if acquire_single_instance_lock(runtime):
         try:
             bot.run(token)
         except discord.PrivilegedIntentsRequired:
-            if not natural_ai:
+            if not read_content:
                 raise  # unchanged pre-AI-5 behaviour (e.g. Server Members Intent missing)
             print(PRIVILEGED_INTENTS_HELP)
             return 1

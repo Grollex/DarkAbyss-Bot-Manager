@@ -28,6 +28,8 @@ from typing import Any, Awaitable, Callable
 import discord
 
 import admin_tools
+import ai_context
+import ai_memory
 
 
 AI_SOURCE = "/ai"
@@ -526,10 +528,14 @@ def _guild_line(guild: Any) -> str:
     return f'Discord server "{name}" (id {getattr(guild, "id", "?")})'
 
 
-def planner_instruction(guild: Any) -> str:
+def planner_instruction(guild: Any, context_text: str = "") -> str:
+    context = f"Request context:\n{context_text}\n" if context_text else ""
     return (
         f"You are the PLANNING stage of Kairo, the admin assistant bot of the {_guild_line(guild)}. "
         f"Current UTC time: {_now_utc_text()}.\n"
+        + context
+        + "Earlier user/assistant messages, if any, are the recent conversation; use them to resolve "
+        "references such as 'it', 'him', 'that channel'.\n"
         "You cannot call tools. Decide how the request is handled and reply with ONE JSON object only "
         "(no markdown, no code fence):\n"
         '{"mode":"answer","answer":"<complete reply to the user>"} - only for questions or chat that need neither server data nor changes;\n'
@@ -544,18 +550,34 @@ def planner_instruction(guild: Any) -> str:
     )
 
 
-def executor_instruction(guild: Any, plan: dict[str, Any] | None) -> str:
+def executor_instruction(
+    guild: Any,
+    plan: dict[str, Any] | None,
+    context_text: str = "",
+    message_content: bool | None = None,
+) -> str:
     text = (
         f"You are Kairo, the admin assistant bot of the {_guild_line(guild)}. Current UTC time: {_now_utc_text()}.\n"
-        "You act through the provided tools. Every change you request is shown to the user as an exact plan with "
-        "Approve/Cancel buttons before it runs, so do not ask for confirmation in text - call the tools.\n"
+        "You act through the provided tools. The bot asks the user for approval where needed (buttons), "
+        "so do not ask for confirmation in text - call the tools.\n"
         "- Perform the task with tool calls instead of describing what the user could do.\n"
-        "- Look up IDs with read tools; never guess IDs.\n"
+        "- Use IDs from the request context or from read tools; never guess IDs. Find members by name with list_members.\n"
+        "- Independent calls can go in one batch; calls that need an earlier result go in a later batch.\n"
         "- For several new roles/categories/channels use apply_server_blueprint with one complete blueprint.\n"
+        "- If a tool result has ok=false, read its message: fix the arguments and retry, or explain the problem. "
+        "Never repeat the same failing call unchanged.\n"
         "- Only claim what tool results confirm. If something is impossible with the available tools, say so briefly.\n"
         "- The AI cannot grant Administrator or act on roles/members at or above the requester's highest role.\n"
+        "- Earlier user/assistant messages, if any, are the recent conversation.\n"
         "- Final reply: the user's language, short, plain Discord markdown, no tables."
     )
+    if message_content is False:
+        text += (
+            "\n- Message text is NOT readable (Message Content Intent is off): message contents arrive empty "
+            "and text-based purge filters are refused. Tell the user how to enable it if they need it."
+        )
+    if context_text:
+        text += "\nRequest context:\n" + context_text
     if plan:
         steps = plan.get("steps") or []
         lines = [f"{index}. {step}" for index, step in enumerate(steps, start=1)]
@@ -616,6 +638,72 @@ def collect_attachments(items: Any) -> dict[str, Any]:
     return result
 
 
+CONFIRMATION_MODES = ("plan", "strict")
+RESET_WORDS = frozenset({"reset", "/reset", "!reset", "сброс", "/сброс", "забудь"})
+MEMORY_CLEARED_MESSAGE = "Conversation memory for this channel was cleared."
+MAX_APPROVAL_STEPS = 12
+MAX_APPROVAL_STEP_CHARS = 200
+
+
+def confirmation_mode(config: dict[str, Any]) -> str:
+    """"plan" or "strict"; anything missing/unknown is the safe "strict"."""
+    value = config.get("ai_confirmation_mode") if isinstance(config, dict) else None
+    return value if value in CONFIRMATION_MODES else "strict"
+
+
+def plan_write_tools(plan: dict[str, Any] | None) -> list[str]:
+    if not plan:
+        return []
+    return [
+        name
+        for name in plan.get("tools") or []
+        if name in admin_tools.TOOL_DEFINITIONS and admin_tools.TOOL_DEFINITIONS[name].kind == "write"
+    ]
+
+
+def render_plan_approval(plan: dict[str, Any]) -> str:
+    """One readable approval message for a planner plan.
+
+    Steps are model text (mentions are suppressed on send); the enforced
+    boundary is the tool list: the executor only gets these tools, and every
+    destructive one is still confirmed separately with its exact arguments.
+    """
+    steps = [_printable(step, MAX_APPROVAL_STEP_CHARS) for step in plan.get("steps") or [] if _printable(step, 1)]
+    lines = ["**AI plan - approve to run it**"]
+    for index, step in enumerate(steps[:MAX_APPROVAL_STEPS], start=1):
+        lines.append(f"{index}. {step}")
+    if len(steps) > MAX_APPROVAL_STEPS:
+        lines.append(f"... and {len(steps) - MAX_APPROVAL_STEPS} more step(s).")
+    if not steps:
+        lines.append("(The planner gave no step list.)")
+    writes = plan_write_tools(plan)
+    destructive = [name for name in writes if admin_tools.TOOL_DEFINITIONS[name].risk == "destructive"]
+    lines.append("Changes allowed: " + ", ".join(f"`{_code_safe(name)}`" for name in writes))
+    if destructive:
+        lines.append(
+            "Destructive actions (" + ", ".join(f"`{_code_safe(name)}`" for name in destructive) + ") will still "
+            "ask for confirmation with the exact data."
+        )
+    if plan.get("notes"):
+        lines.append(f"Notes: {_printable(plan['notes'], 300)}")
+    lines.append("Approve runs the normal actions of this plan without further prompts. Cancel changes nothing.")
+    return clip_text("\n".join(lines), AI_MESSAGE_CHUNK_CHARS - AI_ENGINE_FOOTER_CHARS * 2)
+
+
+def memory_text(result: Any) -> str:
+    """What the conversation memory keeps from one finished request."""
+    status = getattr(getattr(result, "status", None), "value", None)
+    executed = [
+        f"{getattr(tool, 'tool_name', '?')} {'ok' if getattr(tool, 'ok', False) is True else 'FAILED'}"
+        for tool in getattr(result, "executed_tools", ()) or ()
+    ]
+    actions = f" [actions: {', '.join(executed[:10])}]" if executed else ""
+    if status == "COMPLETED":
+        return f"{getattr(result, 'content', '') or ''}{actions}".strip()
+    message = getattr(result, "message", "") or ""
+    return f"(Request ended: {status or 'unknown'}. {message}){actions}".strip()
+
+
 def describe_attachments(attachments: dict[str, Any]) -> str:
     if not attachments:
         return ""
@@ -654,6 +742,56 @@ class PendingConfirmation:
     attachments: dict[str, Any] = field(default_factory=dict, repr=False)
     # Planning engine label for the footer of continuations (two-stage).
     planner_label: str = ""
+    # (memory_key, prompt) recorded when the request reaches a final state.
+    memory: Any = field(default=None, repr=False)
+
+
+@dataclass
+class RequestRun:
+    """Everything needed to (re)start the executor stage of one request."""
+
+    binding: RequestBinding
+    prompt: str = field(repr=False)
+    user_text: str = field(repr=False)
+    task_mode: str
+    attachments: dict[str, Any] = field(default_factory=dict, repr=False)
+    planner_label: str = ""
+
+
+@dataclass
+class PendingPlanApproval:
+    """A planner plan waiting for one Approve/Cancel (plan confirmation mode)."""
+
+    run: RequestRun
+    plan: dict[str, Any] = field(repr=False)
+    delivery_mode: Any = "ephemeral"
+    summary: str = ""
+    resolved: bool = False
+
+
+class PlanApprovalView(discord.ui.View):
+    def __init__(self, transport: "AITransport", state: PendingPlanApproval) -> None:
+        super().__init__(timeout=CONFIRMATION_VIEW_TIMEOUT_SECONDS)
+        self.transport = transport
+        self.state = state
+        self.message: Any = None
+
+    @discord.ui.button(label="Approve plan", style=discord.ButtonStyle.success)
+    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.transport.handle_plan_decision(interaction, self.state, approved=True, view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.transport.handle_plan_decision(interaction, self.state, approved=False, view=self)
+
+    async def on_timeout(self) -> None:
+        # Nothing executes on timeout.
+        self.state.resolved = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except Exception:
+                pass
 
 
 class ConfirmationView(discord.ui.View):
@@ -797,6 +935,11 @@ class AITransport:
         self._orchestrator_factory = orchestrator_factory or _default_orchestrator_factory
         self._view_factory = view_factory or ConfirmationView
         self._orchestrator: Any = None
+        # Short per (guild, channel, user) conversation memory, RAM only.
+        self.memory = ai_memory.ConversationMemory()
+        # Set by Admin.main(): whether the bot requested the Message Content
+        # Intent. None = unknown (tests, older wiring).
+        self.message_content_enabled: bool | None = None
         # Natural-message listener gate, fixed at startup together with the
         # Message Content Intent decision. None = natural AI disabled.
         self.control_channel_id: int | None = None
@@ -841,9 +984,14 @@ class AITransport:
         binding: RequestBinding,
         attachments: dict[str, Any] | None = None,
         planner_label: str = "",
+        memory: Any = None,
     ) -> None:
+        """Render a result. ``memory`` = (memory_key, prompt): recorded once the
+        request reaches a final state, carried along while a confirmation is pending."""
         status = getattr(getattr(result, "status", None), "value", None)
         footer = render_engine_footer(result, planner_label)
+        if status != "NEEDS_CONFIRMATION" or not getattr(result, "confirmation_id", None):
+            self._remember(memory, result)
         if status == "NEEDS_CONFIRMATION" and getattr(result, "confirmation_id", None):
             executed = render_executed_tools(getattr(result, "executed_tools", ()))
             if executed:
@@ -858,6 +1006,7 @@ class AITransport:
                 if not too_large:
                     print(f"/ai plan preview failed: {type(exc).__name__}")
                 cancelled = await self._cancel_unreviewable(result.confirmation_id)
+                self._remember(memory, result)
                 await delivery.send(
                     with_footer(
                         unreviewable_plan_message(too_large=too_large, cancelled=cancelled, earlier_actions=bool(executed)),
@@ -881,6 +1030,7 @@ class AITransport:
                 delivery_mode=delivery.mode,
                 attachments=dict(attachments or {}),
                 planner_label=planner_label,
+                memory=memory,
             )
             view = self._view_factory(self, state)
             message = await delivery.send(state.summary, view=view)
@@ -930,17 +1080,21 @@ class AITransport:
         button interaction.
         """
 
+        # data={"fatal": True}: the orchestrator ends the run instead of letting
+        # the model retry (recover_errors) - authorization will not come back.
+        revoked = {"fatal": True}
+
         async def executor(tool_name: str, arguments: dict) -> admin_tools.ToolResult:
             config = self._try_load_config()
             guild = getattr(source, "guild", None)
             if config is None or guild is None or getattr(guild, "id", None) != binding.guild_id:
-                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE)
+                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
             if getattr(getattr(source, "user", None), "id", None) != binding.user_id:
-                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE)
+                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
             # Fresh member state (current roles), fail closed if not resolvable.
             member = guild.get_member(binding.user_id) if hasattr(guild, "get_member") else None
             if member is None or not actor_has_ai_access(member, guild, config):
-                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE)
+                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
             context = admin_tools.AdminToolContext(
                 guild=guild,
                 fetch_user=self._fetch_user,
@@ -951,6 +1105,7 @@ class AITransport:
                 enforce_hierarchy=True,
                 attachments=dict(attachments or {}),
                 feature_store=self.feature_store,
+                message_content=self.message_content_enabled,
             )
             result = await admin_tools.execute_tool(context, tool_name, arguments)
             audit_failure = await self._safe_audit(source, config, tool_name, result.message)
@@ -973,6 +1128,52 @@ class AITransport:
         except Exception as exc:
             return f"Audit logging failed: {type(exc).__name__}"
 
+    # -- request context and memory ----------------------------------------
+
+    def _context_text(self, source: Any, binding: RequestBinding, *, include_ids: bool) -> str:
+        """Requester/channel/server snapshot for the prompts; never fails the request."""
+        try:
+            guild = getattr(source, "guild", None)
+            if guild is None:
+                return ""
+            getter = getattr(guild, "get_member", None)
+            member = getter(binding.user_id) if callable(getter) else None
+            member = member or getattr(source, "user", None)
+            channel = getattr(source, "channel", None)
+            if binding.channel_id is not None:
+                for name in ("get_channel_or_thread", "get_channel"):
+                    lookup = getattr(guild, name, None)
+                    found = lookup(binding.channel_id) if callable(lookup) else None
+                    if found is not None:
+                        channel = found
+                        break
+            budget = ai_context.EXECUTOR_CONTEXT_CHARS if include_ids else ai_context.PLANNER_CONTEXT_CHARS
+            return ai_context.describe_request(guild, member, channel, include_ids=include_ids, budget=budget)
+        except Exception as exc:
+            print(f"/ai context unavailable: {type(exc).__name__}")
+            return ""
+
+    @staticmethod
+    def memory_key(binding: RequestBinding) -> tuple[int, int, int]:
+        return (binding.guild_id, binding.channel_id or 0, binding.user_id)
+
+    def _memory_messages(self, ai_platform: Any, key: tuple[int, int, int]) -> tuple[Any, ...]:
+        messages = []
+        for user_text, assistant_text in self.memory.history(key):
+            messages.append(ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=user_text))
+            messages.append(ai_platform.AIMessage(role=ai_platform.MessageRole.ASSISTANT, content=assistant_text))
+        return tuple(messages)
+
+    def _remember(self, memory: Any, result: Any = None, text: str | None = None) -> None:
+        """Record one finished exchange: (memory_key, prompt) plus the final answer."""
+        if not memory:
+            return
+        key, prompt = memory
+        try:
+            self.memory.record(key, prompt, text if text is not None else memory_text(result))
+        except Exception as exc:  # pragma: no cover - memory must never break a reply
+            print(f"/ai memory failed: {type(exc).__name__}")
+
     # -- shared orchestration ---------------------------------------------
 
     async def _run_request(
@@ -985,16 +1186,22 @@ class AITransport:
         task_mode: str,
         attachments: dict[str, Any] | None = None,
     ) -> None:
-        """One independent request (no cross-message memory).
+        """One request: optional planning, optional plan approval, then execution.
 
-        Executor messages: the agent SYSTEM instruction plus one USER message.
-        With planning enabled a tool-less planning call runs first and selects
-        the executor's tools (or answers directly when no action is needed).
+        Planner and executor both see the bounded request context and the
+        short conversation memory of this user in this channel. With planning
+        enabled a tool-less planning call runs first and selects the executor's
+        tools (or answers directly when no action is needed). In "plan"
+        confirmation mode a plan that changes the server is shown once for
+        approval; after Approve its normal actions run without further prompts
+        and destructive ones are still confirmed with exact arguments.
         """
         attachments = dict(attachments or {})
         guild = getattr(source, "guild", None)
+        memory_key = self.memory_key(binding)
         note = describe_attachments(attachments)
         user_text = f"{prompt}\n\n{note}" if note else prompt
+        config = self._try_load_config() or {}
         try:
             ai_platform, ai_orchestrator = _import_ai_modules()
             orchestrator = self.get_orchestrator()
@@ -1002,19 +1209,34 @@ class AITransport:
                 await delivery.send(UNAVAILABLE_MESSAGE)
                 return
             policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=True)
+            history = self._memory_messages(ai_platform, memory_key)
             user_message = ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=user_text)
         except Exception as exc:
             print(f"/ai request failed: {type(exc).__name__}")
             await delivery.send(UNAVAILABLE_MESSAGE)
             return
 
+        run = RequestRun(
+            binding=binding,
+            prompt=prompt,
+            user_text=user_text,
+            task_mode=task_mode,
+            attachments=attachments,
+        )
         plan: dict[str, Any] | None = None
-        planner_label = ""
         if self.planning:
-            planned = await self._plan(orchestrator, ai_platform, ai_orchestrator, guild, user_message, policy)
+            planned = await self._plan(
+                orchestrator,
+                ai_platform,
+                ai_orchestrator,
+                guild,
+                (*history, user_message),
+                policy,
+                self._context_text(source, binding, include_ids=False),
+            )
             if planned is not None:
                 plan, planner_result = planned
-                planner_label = engine_label(planner_result)
+                run.planner_label = engine_label(planner_result)
                 if plan["mode"] == "answer":
                     texts = chunk_text(plan["answer"]) or ["(The AI returned no text.)"]
                     footer = render_engine_footer(planner_result)
@@ -1022,16 +1244,48 @@ class AITransport:
                         texts[0] = with_footer(texts[0], footer)
                     for text in texts:
                         await delivery.send(text)
+                    self._remember((memory_key, prompt), text=plan["answer"])
                     return
+                if confirmation_mode(config) == "plan" and plan_write_tools(plan):
+                    await self._offer_plan(delivery, run, plan, render_engine_footer(planner_result))
+                    return
+        await self._execute(delivery, source, run, plan, confirm_normal=True)
+
+    async def _execute(
+        self,
+        delivery: Any,
+        source: Any,
+        run: "RequestRun",
+        plan: dict[str, Any] | None,
+        *,
+        confirm_normal: bool,
+    ) -> None:
+        """Executor stage. ``confirm_normal=False`` only after the user approved ``plan``."""
+        guild = getattr(source, "guild", None)
+        memory_key = self.memory_key(run.binding)
         try:
+            ai_platform, ai_orchestrator = _import_ai_modules()
+            orchestrator = self.get_orchestrator()
+            if orchestrator is None:
+                await delivery.send(UNAVAILABLE_MESSAGE)
+                return
+            instruction = executor_instruction(
+                guild,
+                plan,
+                context_text=self._context_text(source, run.binding, include_ids=True),
+                message_content=self.message_content_enabled,
+            )
             request = ai_orchestrator.OrchestratorRequest(
                 messages=(
-                    ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=executor_instruction(guild, plan)),
-                    user_message,
+                    ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=instruction),
+                    *self._memory_messages(ai_platform, memory_key),
+                    ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=run.user_text),
                 ),
-                task_class=ai_platform.TaskClass(TASK_MODES[task_mode]),
-                allowed_tool_names=executor_tool_names(plan, prompt) if self.planning else None,
+                task_class=ai_platform.TaskClass(TASK_MODES[run.task_mode]),
+                allowed_tool_names=executor_tool_names(plan, run.prompt) if self.planning else None,
+                recover_errors=True,
             )
+            policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=confirm_normal)
         except Exception as exc:
             print(f"/ai request failed: {type(exc).__name__}")
             await delivery.send(UNAVAILABLE_MESSAGE)
@@ -1039,7 +1293,7 @@ class AITransport:
         try:
             result = await orchestrator.orchestrate(
                 request,
-                executor=self.build_executor(source, binding, attachments),
+                executor=self.build_executor(source, run.binding, run.attachments),
                 confirmation_policy=policy,
             )
         except Exception as exc:
@@ -1048,23 +1302,46 @@ class AITransport:
             print(f"/ai request failed: {type(exc).__name__}")
             await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
             return
-        await self._send_result(delivery, result, binding, attachments, planner_label)
+        await self._send_result(
+            delivery, result, run.binding, run.attachments, run.planner_label, memory=(memory_key, run.prompt)
+        )
+
+    async def _offer_plan(self, delivery: Any, run: "RequestRun", plan: dict[str, Any], footer: str) -> None:
+        """Show the planner's plan once with Approve/Cancel (plan confirmation mode)."""
+        state = PendingPlanApproval(run=run, plan=plan, delivery_mode=delivery.mode)
+        state.summary = with_footer(render_plan_approval(plan), footer)
+        view = PlanApprovalView(self, state)
+        message = await delivery.send(state.summary, view=view)
+        try:
+            view.message = message
+        except Exception:
+            pass
 
     async def _plan(
-        self, orchestrator: Any, ai_platform: Any, ai_orchestrator: Any, guild: Any, user_message: Any, policy: Any
+        self,
+        orchestrator: Any,
+        ai_platform: Any,
+        ai_orchestrator: Any,
+        guild: Any,
+        conversation: Any,
+        policy: Any,
+        context_text: str = "",
     ) -> tuple[dict[str, Any], Any] | None:
         """Tool-less planning call. PLANNER profile first, ROUTINE if no planner is configured.
 
-        Returns (plan, result) or None when no usable plan was produced; the
-        caller then falls back to keyword tool routing. Never executes tools.
+        ``conversation`` is the memory plus the current USER message. Returns
+        (plan, result) or None when no usable plan was produced; the caller
+        then falls back to keyword tool routing. Never executes tools.
         """
 
         async def refuse(tool_name: str, arguments: dict) -> admin_tools.ToolResult:
             return admin_tools.ToolResult(False, tool_name, "The planning stage cannot run tools.")
 
+        if not isinstance(conversation, tuple):
+            conversation = (conversation,)
         messages = (
-            ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=planner_instruction(guild)),
-            user_message,
+            ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=planner_instruction(guild, context_text)),
+            *conversation,
         )
         for task_class in ("PLANNER", "ROUTINE"):
             try:
@@ -1170,6 +1447,10 @@ class AITransport:
             await delivery.send(f"Message must be {AI_PROMPT_MAX_CHARS} characters or fewer for AI requests.")
             return
         binding = RequestBinding(user_id=message.author.id, guild_id=message.guild.id, channel_id=message.channel.id)
+        if prompt.strip().lower() in RESET_WORDS:
+            self.memory.clear(self.memory_key(binding))
+            await delivery.send(MEMORY_CLEARED_MESSAGE)
+            return
         async with _maybe_typing(message.channel):
             await self._run_request(
                 delivery=delivery,
@@ -1257,4 +1538,84 @@ class AITransport:
             print(f"/ai confirmation failed: {type(exc).__name__}")
             await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
             return
-        await self._send_result(delivery, result, state.binding, state.attachments, state.planner_label)
+        await self._send_result(
+            delivery, result, state.binding, state.attachments, state.planner_label, memory=state.memory
+        )
+
+    async def _check_button_owner(self, interaction: Any, binding: RequestBinding) -> bool:
+        """Ownership + fresh AI authorization for a button click; replies on denial."""
+        if not self._binding_matches(interaction, binding):
+            await self._respond(interaction, NOT_OWNER_MESSAGE)
+            return False
+        config = self._try_load_config()
+        if config is None:
+            await self._respond(interaction, CONFIG_UNAVAILABLE_MESSAGE)
+            return False
+        if not actor_has_ai_access(interaction.user, interaction.guild, config):
+            await self._respond(interaction, ACCESS_DENIED_MESSAGE)
+            return False
+        return True
+
+    async def handle_plan_decision(
+        self,
+        interaction: Any,
+        state: "PendingPlanApproval",
+        *,
+        approved: bool,
+        view: Any = None,
+    ) -> None:
+        """Approve or cancel a planner plan (plan confirmation mode).
+
+        Approve runs the executor restricted to the plan's tools with normal
+        actions unconfirmed; destructive actions still need their own exact
+        confirmation. Checks mirror handle_decision: owner, guild, channel and
+        fresh AI authorization, all before the single-use state is consumed.
+        """
+        if type(approved) is not bool:
+            raise ValueError("approved must be exactly True or False.")
+        if state.resolved:
+            await self._respond(interaction, INACTIVE_MESSAGE)
+            return
+        if not await self._check_button_owner(interaction, state.run.binding):
+            return
+        state.resolved = True
+        if view is not None:
+            try:
+                view.stop()
+            except Exception:
+                pass
+        decision = "Approved. Working on it..." if approved else "Cancelled. Nothing was changed."
+        try:
+            await interaction.response.edit_message(
+                content=clip_text(f"{state.summary}\n\n{decision}", AI_MESSAGE_CHUNK_CHARS),
+                view=None,
+                allowed_mentions=no_mentions(),
+            )
+        except Exception:
+            if not interaction.response.is_done():
+                await interaction.response.defer(
+                    ephemeral=DeliveryMode(state.delivery_mode) == DeliveryMode.EPHEMERAL, thinking=True
+                )
+        if not approved:
+            self._remember((self.memory_key(state.run.binding), state.run.prompt), text="(The user cancelled the proposed plan.)")
+            return
+        delivery = InteractionDelivery(interaction, state.delivery_mode)
+        await self._execute(delivery, interaction, state.run, state.plan, confirm_normal=False)
+
+    # -- memory reset ----------------------------------------------------------
+
+    async def handle_reset_command(self, interaction: Any) -> None:
+        config = self._try_load_config()
+        if config is None:
+            await self._respond(interaction, CONFIG_UNAVAILABLE_MESSAGE)
+            return
+        if not actor_has_ai_access(interaction.user, interaction.guild, config):
+            await self._respond(interaction, ACCESS_DENIED_MESSAGE)
+            return
+        binding = RequestBinding(
+            user_id=interaction.user.id,
+            guild_id=interaction.guild.id,
+            channel_id=getattr(interaction, "channel_id", None),
+        )
+        self.memory.clear(self.memory_key(binding))
+        await self._respond(interaction, MEMORY_CLEARED_MESSAGE)

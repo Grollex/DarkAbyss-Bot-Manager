@@ -62,6 +62,16 @@ class AdminToolContext:
     # Persistent per-instance store for bot features (role menus, welcome,
     # schedules, blueprint undo records). None when unavailable.
     feature_store: Any = None
+    # False when the bot runs without the Message Content Intent: message text
+    # then arrives empty, so text-based filters must refuse instead of silently
+    # matching nothing. None = unknown (no check).
+    message_content: bool | None = None
+
+
+MESSAGE_CONTENT_HELP = (
+    "Message text is not available: turn on 'AI can read message text' in Manager Setup Bot and "
+    "'Message Content Intent' in the Discord Developer Portal, then restart the bot."
+)
 
 
 def parse_snowflake(value: object, field_name: str) -> int:
@@ -1064,7 +1074,10 @@ async def _get_recent_messages(context: AdminToolContext, arguments: dict[str, A
     messages = []
     async for message in history(limit=limit):
         messages.append(_serialize_message(message))
-    return {"messages": messages, "limit": limit}
+    data: dict[str, Any] = {"messages": messages, "limit": limit}
+    if context.message_content is False:
+        data["content_note"] = MESSAGE_CONTENT_HELP
+    return data
 
 
 async def _send_message(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1082,6 +1095,9 @@ async def _purge_messages(context: AdminToolContext, arguments: dict[str, Any]) 
     count = _optional_positive_int(arguments.get("count"), "count", 10)
     if count > 100:
         raise ValueError("count must be 100 or lower.")
+    uses_text = bool(arguments.get("contains_text")) or arguments.get("links_only") is True
+    if uses_text and context.message_content is False:
+        raise AdminToolError(f"contains_text/links_only cannot work. {MESSAGE_CONTENT_HELP}")
     check = _purge_filter(arguments)
     if check is None:
         deleted = await channel.purge(limit=count, reason=_reason(arguments))
