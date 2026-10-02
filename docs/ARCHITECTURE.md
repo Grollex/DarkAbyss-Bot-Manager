@@ -19,14 +19,41 @@ If `--instance` is omitted, `admin-main` is selected.
 
 Only `admin-main` receives special first-run bootstrap and Phase 1 migration behavior. Other instance IDs must already exist.
 
+## Bot Types and Instances at a Glance
+
+Every bot is an independent instance with its own Discord application/token,
+process, config, data, logs and AI settings/keys. Provider adapters,
+orchestrator, safety checks and the Game Presence domain are shared code; only
+the storage is per instance.
+
+```text
+Manager
+├── Admin Bot instance (bot type "admin", Admin.py)
+│   ├── Discord Token A          instances/<admin>/secrets/token.txt
+│   ├── AI Settings A            instances/<admin>/data/ai.json
+│   ├── Groq Key A               instances/<admin>/secrets/ai/groq/groq-default.secret
+│   └── Gemini Key A             instances/<admin>/secrets/ai/gemini/gemini-default.secret
+└── Game Presence Bot instance (bot type "game_presence", GamePresence.py)
+    ├── Discord Token B          instances/<gp>/secrets/token.txt
+    ├── AI Settings B            instances/<gp>/data/ai.json
+    ├── Groq Key B               instances/<gp>/secrets/ai/groq/groq-default.secret
+    └── Gemini Key B             instances/<gp>/secrets/ai/gemini/gemini-default.secret
+```
+
+Both run at the same time as separate processes (`--bot-runner admin` /
+`--bot-runner game_presence` in the packaged app, the manifest entrypoint in
+source mode), with separate provider quotas unless the user deliberately pastes
+the same key into both.
+
 ## Bot Type
 
 A Bot Type is program-owned. It describes an available bot implementation and lives in the application/release tree.
 
-Current manifest:
+Current manifests:
 
 ```text
-bots/admin/manifest.json
+bots/admin/manifest.json            Admin Bot (DarkAbyss_Core/Admin.py)
+bots/game_presence/manifest.json    Game Presence Bot (DarkAbyss_Core/GamePresence.py)
 ```
 
 Current manifest shape:
@@ -230,16 +257,16 @@ When a Gemini model step emits multiple parallel function calls and the followin
 
 Gemini errors are normalized without raw response bodies: `401` or explicit invalid-key reasons become `CREDENTIAL_INVALID`; `403` becomes `ACCESS_FORBIDDEN`; quota/rate-limit, billing/credit prerequisites, model unavailable, 5xx, network, and timeout conditions become safe unavailable states/messages.
 
-The Manager `AI Providers...` dialog is device-local and global. It is not tied to the selected Discord Bot Instance and can be opened even when no bot is selected.
+The Manager `AI Providers` page and dialog work on ONE selected bot instance ("Bot:" selector). Each instance has its own keys, models, routing and fallbacks (`ai_storage.InstanceAIStores`: `instances/<id>/data/ai.json` + `instances/<id>/secrets/ai/`). There is no global store: `AISettingsStore(path)` and `CredentialStore(root)` require an explicit location, `AIOrchestrator` requires the instance's stores, and `Test Connection` uses the selected instance's key.
 
 Current AI provider settings behavior:
 
-- The user enters Groq and/or Gemini API keys inside Manager.
-- The key is stored device-locally via `CredentialStore`.
+- The user enters Groq and/or Gemini API keys inside Manager for the selected bot.
+- The key is stored device-locally via that instance's `CredentialStore`.
 - Existing saved keys are never re-displayed, partially displayed, or copied back into the UI.
 - Saving an empty key field preserves an existing key.
 - Removing a key is an explicit action.
-- Model/profile settings are stored separately in `<DATA_ROOT>/config/ai.json`.
+- Model/profile settings are stored separately in `<DATA_ROOT>/instances/<id>/data/ai.json`.
 - `ai.json` contains no raw API key.
 - Editing Groq settings replaces only the `groq-default` profile. Editing Gemini settings replaces only the `gemini-default` profile. Both preserve other provider profiles and existing routing assignments.
 - Malformed `ai.json` is preserved and normal Save is disabled until the user explicitly resolves the settings file.
@@ -338,19 +365,22 @@ AI-6.1/6.2 harden the runtime and make the agent usable for multi-step work:
 - Engine switching (AI-6.3/6.4): the Discord transport sends `OrchestratorRequest(auto_fallback=False)` so routing fallbacks never switch engines silently. When the planning or execution engine fails (rate limit, outage), the transport asks `AIOrchestrator.alternative_profile(task_class, exclude)` (local checks only) and shows the failed engine, its sanitized reason (provider adapter error texts are kept; other exceptions stay type-name only), the actions already executed, and a "Continue with <engine>" / Cancel prompt bound to the requester. Continuing re-plans with the chosen engine (`manual_profile_id`) or restarts the executor on it with the same plan, the same confirmation policy and a system note listing the actions that already ran so they are not repeated. Failed engines are not offered again within the request. With no alternative the reply includes the reason. `auto_fallback=True` callers keep automatic fallback, which now also applies after read-only tools (they have no side effects). The bot exits with an actionable message (no traceback dialog) when Discord rejects the token.
 - Manager AI terminal (`admin_terminal.py`, `manager_terminal.py`): a file mailbox in the instance `runtime` folder (`ai_terminal/requests`, `ai_terminal/decisions`, `ai_terminal/events/<id>.jsonl`, `bot_status.json`); the bot polls it every 0.5 s (`terminal_loop`) and opens no port. Requests run through `AITransport.handle_manager_request` as the local operator (binding user ID 0, only for `ManagerInteraction` objects, which Discord can never produce): no AI whitelist and no requester hierarchy, bot hierarchy and every plan/destructive/engine-switch confirmation still apply. `ManagerInteraction` imitates the interaction API, so views become `approval` events and Manager clicks become decision files dispatched by `dispatch_view_decision`. Stale requests (>5 min) are refused; event files are purged after 24 h. `bot_status.json` lists servers and channels for the Manager pickers (refreshed on ready and every 30 s).
 - @mention requests: `ai_mention_enabled` + `ai_mention_channel_ids` (empty = every channel). A message pinging the bot user or its managed role (`guild.self_role`) starts the same public flow as the control channel (mention text stripped, buttons owner-only); non-whitelisted members get one refusal per 60 s. Requests the Message Content Intent (role pings carry no text without it).
-- Game Presence (capability of the Admin bot instance, no second application/token): `game_presence.py` is the pure domain (no discord import): `GameNormalizer` (trim/casefold key + display name, alias hook), `ActivityTracker` (current game + voice per member, index guild+game -> users, so selection is never O(n^2)), `SessionTracker` (session start per member+game, 120 s restart grace, Discord activity start used as hint), `CandidateSelector` (groups of >= 2 per guild+game, allow/ignore lists), pending candidates (created on first sight, re-checked against the CURRENT state after the delay, then re-armed; a group that falls apart is cancelled silently), replaceable `SuggestionPolicy` (default: >= 2 players settled for the delay, guild cooldown, opt-out + per-user cooldown filter the mention targets, all eligible in one voice -> nothing, group cooldown by >= 2-member overlap, optional voice-aware "join" suggestion, max 10 mentions), `PreferenceBook` and `CooldownLedger` over a `PresenceStore` (backed by the instance FeatureStore key `game_presence`, scoped per guild + user). `game_presence_discord.py` reads `Member.activities` (Playing) and voice state, renders deterministic Russian templates, builds mentions only from approved IDs and sends with `AllowedMentions(users=targets, everyone=False, roles=False)`; persistent `dab:gp:mute`/`dab:gp:allow` buttons change only `interaction.user`'s state (ephemeral replies, idempotent); the optional AI rewrite may only rephrase a template with fixed placeholders and is validated by the runtime (fallback to the template on any failure). Config section `game_presence` (defaults off, nested merge, validated fail-closed by `normalize_config_dict`); live settings reload every 15 s; the Presence Intent is requested only when enabled at startup, and `PrivilegedIntentsRequired` prints `privileged_intents_help()` naming every requested intent. The bot writes `runtime/game_presence_status.json` for the Manager "Game Presence" page (settings, status, required intents, Save & Restart through the normal lifecycle path). Session state is rebuilt from presence after a restart; cooldowns/history persist, and pending delays always restart, so a restart never re-posts. Future large-server work: sampling, per-pool policies, sharding the tracker, batching status.
+- Game Presence (separate bot type `game_presence` with its own Discord application, token and process; see "Game Presence Bot" below): `game_presence.py` is the pure domain (no discord import): `GameNormalizer` (trim/casefold key + display name, alias hook), `ActivityTracker` (current game + voice per member, index guild+game -> users, so selection is never O(n^2)), `SessionTracker` (session start per member+game, 120 s restart grace, Discord activity start used as hint), `CandidateSelector` (groups of >= 2 per guild+game, allow/ignore lists), pending candidates (created on first sight, re-checked against the CURRENT state after the delay, then re-armed; a group that falls apart is cancelled silently), replaceable `SuggestionPolicy` (default: >= 2 players settled for the delay, guild cooldown, opt-out + per-user cooldown filter the mention targets, all eligible in one voice -> nothing, group cooldown by >= 2-member overlap, optional voice-aware "join" suggestion, max 10 mentions), `PreferenceBook` and `CooldownLedger` over a `PresenceStore` (backed by the instance FeatureStore key `game_presence`, scoped per guild + user). `game_presence_discord.py` reads `Member.activities` (Playing) and voice state, renders deterministic Russian templates, builds mentions only from approved IDs and sends with `AllowedMentions(users=targets, everyone=False, roles=False)`; persistent `dab:gp:mute`/`dab:gp:allow` buttons change only `interaction.user`'s state (ephemeral replies, idempotent); the optional AI rewrite may only rephrase a template with fixed placeholders and is validated by the runtime (fallback to the template on any failure). The settings are the Game Presence instance's top-level config (validated fail-closed by `normalize_bot_config`, which only differs from `normalize_config_dict` in treating "on but no server/channel yet" as "not configured"); live settings reload every 15 s. The bot writes `runtime/game_presence_status.json` for the Manager "Game Presence" page (settings, status, required intents, Save & Restart through the normal lifecycle path). Session state is rebuilt from presence after a restart; cooldowns/history persist, and pending delays always restart, so a restart never re-posts. Future large-server work: sampling, per-pool policies, sharding the tracker, batching status.
 - Manager bot groups (`manager_groups.py`): Manager-only tabs stored in `config/manager_groups.json`; bots without an assignment are in "Main".
 - Message text: `ai_read_message_content` (default false) requests the Message Content Intent without a control channel. When the intent is off, `AdminToolContext.message_content=False`: text/link purge filters refuse with an actionable message instead of silently matching nothing, `get_recent_messages` adds a `content_note`, and the executor instruction says message text is unreadable.
 
-AI credentials are device-local and stored outside program versions, bot instance config, release artifacts, and the source tree:
+AI credentials are device-local and stored per bot instance, outside program versions, the instance's portable `config.json`, release artifacts, and the source tree:
 
 ```text
-<DATA_ROOT>/secrets/ai/<provider_id>/<credential_ref>.secret
+<DATA_ROOT>/instances/<instance_id>/secrets/ai/<provider_id>/<credential_ref>.secret
+<DATA_ROOT>/instances/<instance_id>/data/ai.json
 ```
 
-Gemini keys are stored at `<DATA_ROOT>/secrets/ai/gemini/gemini-default.secret`. Groq keys are stored at `<DATA_ROOT>/secrets/ai/groq/groq-default.secret`.
+`ai_storage.for_instance()` re-validates the instance ID and requires both paths to resolve inside `instances/<instance_id>`; `CredentialStore.path_for()` validates provider/ref components and containment, so one instance cannot read another instance's secrets by a crafted ID or name. A corrupted instance `ai.json` fails closed (AI unavailable, file preserved).
 
-`CredentialReference` is only a logical pointer. The same `credential_ref` such as `groq-default` or `gemini-default` may resolve to different local secrets on different computers. AI profiles and routing preferences are also device-local by default in the current architecture and do not belong to the Discord Bot Instance's portable config. This allows PC A and PC B to use different providers/profiles while hosting the same logical bot at different times. Cloud sync is not implemented.
+Migration from the old global store (`<DATA_ROOT>/config/ai.json`, `<DATA_ROOT>/secrets/ai/...`): `ai_storage.migrate_legacy_global_ai()` runs at Manager and Admin start. With exactly one Admin instance it COPIES the old settings and keys into that instance, never overwriting files the instance already has; the old files are kept; a marker (`config/ai.migrated.json`, names only, no secrets) makes it idempotent. With several Admin instances it does nothing (ambiguous: enter keys per bot), with none it waits, a corrupted old file stops it without a marker, and a Game Presence instance never receives migrated keys.
+
+`CredentialReference` is only a logical pointer. The same `credential_ref` such as `groq-default` or `gemini-default` resolves to a different local secret in each bot instance and on each computer. AI profiles and routing preferences are device-local and do not belong to the Discord Bot Instance's portable config. This allows PC A and PC B to use different providers/profiles while hosting the same logical bot at different times. Cloud sync is not implemented.
 
 Routing distinguishes local availability states without network access: `NOT_CONFIGURED`, `PROVIDER_MISSING`, `CREDENTIAL_MISSING`, `CREDENTIAL_INVALID`, `ACCESS_FORBIDDEN`, `DISABLED`, `UNAVAILABLE`, and `AVAILABLE`.
 
@@ -402,6 +432,17 @@ Future user controls should allow:
 - selecting one generated plan
 
 Compare mode is plan-only until the user chooses a plan. A fallback-generated destructive plan requires fresh review/confirmation if it differs from the original plan or comes from another provider.
+
+## Game Presence Bot
+
+Bot type `game_presence` (`bots/game_presence/manifest.json`, entrypoint `DarkAbyss_Core/GamePresence.py`, defaults `DarkAbyss_Core/defaults/game_presence_config.json`, schema with `additionalProperties: false`). It is created like any bot (Manager -> Bots -> Add Bot -> Game Presence Bot) and needs its own Discord application and token; the Manager never creates one automatically.
+
+- Process: `discord.Client` with intents guilds, members, presences and voice_states only (no Message Content). `PrivilegedIntentsRequired` exits with a message naming Presence Intent + Server Members Intent (also written to the status file); `LoginFailure` exits with an actionable message; no traceback dialog.
+- Data: `data/game_presence_state.json` (opt-outs, history, cooldowns per guild) through `PresenceStateStore`, a FeatureStore that fails closed: an unreadable file pauses posting and buttons instead of resetting everyone to "allowed". Runtime: own lock, `bot_status.json` (servers/channels for the Manager pickers) and `game_presence_status.json`.
+- Buttons: persistent `dab:gp:mute` / `dab:gp:allow`, handled by this bot's `on_interaction` against its own state; only `interaction.user` changes, replies are ephemeral.
+- AI: optional wording only, through `InstanceAI` (this instance's `ai_storage` stores) and `TextOnlyAI`, which strips every tool from the request and never passes a tool executor, so Admin tools are unreachable.
+- Admin separation: `Admin.py` has no Game Presence import, listener, loop, intent or status. An old Admin config with a `game_presence` section still starts (root schema allows unknown keys) and the section is ignored, never deleted. The Manager "Game Presence" page lists only Game Presence instances, shows such leftover sections and imports them (settings; opt-outs/cooldowns only while the Game Presence bot is stopped, never overwriting its existing state) when the user clicks Import.
+- Manager: Bot Setup for this type has Name, Token, Presence + Server Members intents, Invite (View Channels + Send Messages, scope `bot`) and Ready; the AI terminal lists only Admin bots; the dashboard shows each type's capabilities.
 
 ## Shared AI Access And Runtime Ownership
 

@@ -14,6 +14,14 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CORE_ROOT = PROJECT_ROOT / "DarkAbyss_Core"
 
+# Never touch the real user data folder: modules imported by these tests
+# resolve app_paths from DARKABYSS_DATA_DIR (AI storage, instances, migration).
+import os as _os  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+
+if not _os.environ.get("DARKABYSS_DATA_DIR"):
+    _os.environ["DARKABYSS_DATA_DIR"] = _tempfile.mkdtemp(prefix="darkabyss-test-")
+
 AI_MODULES = ("ai_orchestrator", "ai_platform", "ai_groq", "ai_gemini")
 
 
@@ -1403,6 +1411,7 @@ class MessageContentIntentTests(unittest.TestCase):
             "load_config": lambda runtime=None: admin.validate_config(dict(config)),
             "load_token": lambda runtime=None: "not-a-real-token",
             "acquire_single_instance_lock": lambda runtime=None: True,
+            "resolve_ai_stores": lambda runtime=None: None,
         }
         originals = {name: getattr(admin, name) for name in patches}
         original_run = admin.bot.run

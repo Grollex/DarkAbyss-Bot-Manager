@@ -34,6 +34,7 @@ def load_gui_module(data_root: Path):
         "app_paths",
         "admin_instance",
         "ai_platform",
+        "ai_storage",
         "ai_groq",
         "ai_gemini",
     ):
@@ -971,15 +972,15 @@ class ManagerGuiTests(unittest.TestCase):
         window = self.make_window(instance_api=instance_api)
         fake_dialog = mock.Mock()
         fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
-        fake_dialog.values.return_value = ("admin-second", "Second")
+        fake_dialog.values.return_value = ("admin", "admin-second", "Second")
         fake_setup = mock.Mock()
         fake_setup.exec.return_value = self.manager_gui.QDialog.Accepted
         fake_setup.start_requested = False
 
-        with mock.patch.object(self.manager_gui, "CreateAdminInstanceDialog", return_value=fake_dialog), mock.patch.object(
+        with mock.patch.object(self.manager_gui, "CreateBotInstanceDialog", return_value=fake_dialog), mock.patch.object(
             self.manager_gui, "BotSetupDialog", return_value=fake_setup
         ) as setup_class:
-            window.create_admin_instance()
+            window.create_bot_instance()
 
         self.assertEqual(instance_api.created, [("admin", "admin-second", "Second")])
         setup_class.assert_called_once()
@@ -992,10 +993,10 @@ class ManagerGuiTests(unittest.TestCase):
         window._show_error = lambda message: setattr(window, "_last_error", message)
         fake_dialog = mock.Mock()
         fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
-        fake_dialog.values.return_value = ("admin-second", "Second")
+        fake_dialog.values.return_value = ("admin", "admin-second", "Second")
 
-        with mock.patch.object(self.manager_gui, "CreateAdminInstanceDialog", return_value=fake_dialog):
-            window.create_admin_instance()
+        with mock.patch.object(self.manager_gui, "CreateBotInstanceDialog", return_value=fake_dialog):
+            window.create_bot_instance()
 
         self.assertIn("disk failed", window.last_error)
 
@@ -1527,6 +1528,198 @@ class ManagerGuiTests(unittest.TestCase):
         event = FakeEvent()
         dialog.closeEvent(event)
         self.assertTrue(event.accepted)
+
+
+class PerInstanceManagerTests(unittest.TestCase):
+    """Manager: AI settings per bot instance, bot types, Game Presence bots."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manager_gui = load_gui_module(Path(self.temp_dir.name))
+        self.app = get_qapplication()
+        self.data_root = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def gp_info(self, manager, instance_id="gp-main", state=None):
+        core = self.manager_gui.manager_core
+        return replace(
+            manager.info(instance_id, "Games", state or core.STATE_STOPPED, None),
+            bot_type="game_presence",
+            bot_type_display_name="Game Presence Bot",
+        )
+
+    def make_window(self, manager=None, instance_api=None, config_api=None):
+        window = self.manager_gui.ManagerMainWindow(
+            manager=manager or FakeManager(self.manager_gui.manager_core),
+            instance_api=instance_api or FakeInstanceApi(),
+            config_api=config_api or FakeConfigApi(),
+            auto_refresh=False,
+        )
+
+        def close_without_prompt():
+            window._allow_close = True
+            window.close()
+
+        self.addCleanup(close_without_prompt)
+        return window
+
+    def select_ai_bot(self, window, instance_id):
+        index = window.ai_bot_combo.findData(instance_id)
+        self.assertGreaterEqual(index, 0)
+        window.ai_bot_combo.setCurrentIndex(index)
+
+    def test_ai_page_lists_every_bot_and_dialog_gets_that_bots_stores(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        manager.infos = [*manager.infos, self.gp_info(manager)]
+        window = self.make_window(manager=manager)
+        ids = [window.ai_bot_combo.itemData(i) for i in range(window.ai_bot_combo.count())]
+        self.assertEqual(ids, ["admin-main", "admin-second", "gp-main"])
+        self.assertEqual(window.ai_bot_combo.currentData(), "admin-main")
+
+        self.select_ai_bot(window, "gp-main")
+        self.assertIn("Games (gp-main)", window.dashboard_ai_bot_label.text())
+        self.assertIn("wording", window.ai_bot_hint.text())
+        fake_dialog = mock.Mock()
+        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
+        with mock.patch.object(self.manager_gui, "AIProviderSettingsDialog", return_value=fake_dialog) as dialog_class:
+            window.open_ai_providers()
+        kwargs = dialog_class.call_args.kwargs
+        instance_root = (self.data_root / "instances" / "gp-main").resolve()
+        self.assertEqual(kwargs["settings_store"].path, instance_root / "data" / "ai.json")
+        self.assertEqual(kwargs["credential_store"].root, instance_root / "secrets" / "ai")
+        self.assertIn("gp-main", kwargs["bot_label"])
+
+    def test_connection_test_uses_the_selected_bots_key(self):
+        window = self.make_window()
+        second = window.ai_stores_for("admin-second")
+        second.credentials.write_secret("groq", "groq-default", "test-key-second-bot")
+        started = []
+        window._start_worker = lambda action, finished: started.append(action)
+
+        window.test_provider("groq")  # admin-main is selected and has no key
+        self.assertEqual(started, [])
+        self.assertIn("no API key saved for this bot", window.last_error)
+        self.assertEqual(window.provider_rows[0].status_label.text(), "Not configured")
+
+        self.select_ai_bot(window, "admin-second")
+        self.assertEqual(window.provider_rows[0].status_label.text(), "Configured")
+        used = []
+
+        class FakeProvider:
+            async def test_connection(self, credential_ref):
+                return self.availability
+
+        def factory(credential_store):
+            used.append(credential_store.root)
+            provider = FakeProvider()
+            provider.availability = window_ai.Availability(window_ai.AvailabilityState.AVAILABLE, "ok")
+            return provider
+
+        window_ai = self.manager_gui.ai_platform
+        with mock.patch.object(self.manager_gui, "create_groq_provider", factory):
+            window.test_provider("groq")
+            self.assertEqual(len(started), 1)
+            started[0]()
+        self.assertEqual(used, [second.credentials.root])
+        self.assertNotEqual(used[0], window.ai_stores_for("admin-main").credentials.root)
+
+    def test_ai_dialog_has_no_global_default_store(self):
+        with self.assertRaises(ValueError):
+            self.manager_gui.AIProviderSettingsDialog()
+
+    def test_dashboard_shows_capabilities_per_bot_type(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        manager.infos = [*manager.infos, self.gp_info(manager)]
+        window = self.make_window(manager=manager)
+        self.select_instance_row(window, "admin-main")
+        text = window.bot_facts_label.text()
+        self.assertIn("Can do: Slash commands", text)
+        self.assertNotIn("Game Presence", text)
+        self.assertNotIn("Modules:", text)
+
+        self.select_instance_row(window, "gp-main")
+        text = window.bot_facts_label.text()
+        self.assertIn("Can do: Game suggestions", text)
+        self.assertNotIn("slash", text)
+
+    def select_instance_row(self, window, instance_id):
+        for row_index in range(window.instance_table.rowCount()):
+            if window.instance_table.item(row_index, 0).text() == instance_id:
+                window.instance_table.selectRow(row_index)
+                window._refresh_dashboard()
+                return
+        self.fail(f"Missing row for {instance_id}")
+
+    def test_ai_terminal_lists_only_admin_bots_and_presence_page_only_presence_bots(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        manager.infos = [*manager.infos, self.gp_info(manager)]
+        window = self.make_window(manager=manager)
+        self.assertEqual(sorted(bot[0] for bot in window._terminal_bots()), ["admin-main", "admin-second"])
+        window.show_page("presence")
+        combo = window.presence_panel.bot_combo
+        self.assertEqual([combo.itemData(i) for i in range(combo.count())], ["gp-main"])
+
+    def test_add_bot_offers_registered_bot_types(self):
+        dialog = self.manager_gui.CreateBotInstanceDialog()
+        self.addCleanup(dialog.close)
+        types_ = [dialog.type_combo.itemData(i) for i in range(dialog.type_combo.count())]
+        self.assertEqual(types_[0], "admin")
+        self.assertIn("game_presence", types_)
+        dialog.type_combo.setCurrentIndex(types_.index("game_presence"))
+        self.assertIn("OWN Discord application", dialog.type_hint.text())
+        dialog.instance_id_edit.setText("gp-main")
+        self.assertEqual(dialog.values(), ("game_presence", "gp-main", None))
+
+    def test_create_game_presence_bot_through_the_standard_flow(self):
+        instance_api = FakeInstanceApi()
+        window = self.make_window(instance_api=instance_api)
+        fake_dialog = mock.Mock()
+        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
+        fake_dialog.values.return_value = ("game_presence", "gp-main", "Games")
+        fake_setup = mock.Mock()
+        fake_setup.exec.return_value = self.manager_gui.QDialog.Rejected
+        with mock.patch.object(self.manager_gui, "CreateBotInstanceDialog", return_value=fake_dialog), mock.patch.object(
+            self.manager_gui, "BotSetupDialog", return_value=fake_setup
+        ):
+            window.create_bot_instance()
+        self.assertEqual(instance_api.created, [("game_presence", "gp-main", "Games")])
+
+    def test_game_presence_setup_wizard_saves_only_name_and_token(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        original_load = instance_api.load_instance
+
+        def load_instance(instance_id):
+            return replace_namespace(original_load(instance_id), bot_type="game_presence")
+
+        instance_api.load_instance = load_instance
+        config_api = FakeConfigApi()
+        dialog = self.manager_gui.BotSetupDialog("gp-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+        self.assertTrue(dialog.is_game_presence)
+        self.assertEqual(dialog.pages.count(), 5)
+        self.assertIn("Presence Intent", dialog.intent_ack_checkbox.text())
+
+        dialog.application_id_edit.setText("1234567890")
+        dialog.pages.setCurrentWidget(dialog.invite_page)
+        from urllib.parse import parse_qs, urlparse
+
+        params = parse_qs(urlparse(dialog.invite_link_edit.text()).query)
+        self.assertEqual(params["scope"], ["bot"])
+        # View Channels + Send Messages only: no moderation, no slash commands.
+        self.assertEqual(int(params["permissions"][0]), (1 << 10) | (1 << 11))
+
+        dialog.display_name_edit.setText("Game Pings")
+        dialog.token_edit.setText("FAKE_GP_TOKEN")
+        self.assertTrue(dialog.save_setup())
+        self.assertEqual(instance_api.token_path.read_text(encoding="utf-8"), "FAKE_GP_TOKEN\n")
+        self.assertEqual(instance_api.display_names["gp-main"], "Game Pings")
+        self.assertEqual(config_api.saved, [])  # Game Presence settings live on their own page
+
+
+def replace_namespace(namespace, **changes):
+    return SimpleNamespace(**{**vars(namespace), **changes})
 
 
 if __name__ == "__main__":

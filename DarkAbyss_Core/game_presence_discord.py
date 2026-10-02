@@ -12,7 +12,8 @@
   with fixed placeholders, never choose whom or when to ping. Any failure
   falls back to the deterministic template.
 * GamePresenceRuntime: wires the engine to bot events and writes a status
-  file for the Manager.
+  file for the Manager. Used by the dedicated Game Presence bot
+  (GamePresence.py), which has its own Discord application and process.
 """
 
 from __future__ import annotations
@@ -272,6 +273,9 @@ class GamePresenceRuntime:
         self.runtime_dir = runtime_dir
         self.presence_intent = presence_intent
         self.problem: str | None = None
+        # Set by the bot when its config is invalid / not configured yet; it
+        # survives tick() so the Manager sees why nothing is posted.
+        self.config_problem: str | None = None
 
     # -- configuration ----------------------------------------------------------
 
@@ -335,7 +339,7 @@ class GamePresenceRuntime:
     async def tick(self) -> int:
         """Publish due suggestions; returns how many were posted."""
         config = self.engine.config
-        self.problem = None
+        self.problem = self.config_problem
         if config.enabled and not self.presence_intent:
             self.problem = "Restart the bot: Presence Intent is requested only at startup."
             self.write_status()

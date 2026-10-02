@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "game_presence",
+  "display_name": "Game Presence Bot",
+  "version": "1.0.0",
+  "entrypoint": "DarkAbyss_Core/GamePresence.py",
+  "default_config": "DarkAbyss_Core/defaults/game_presence_config.json",
+  "config_schema": "bots/game_presence/config.schema.json",
+  "config_version": 1
+}

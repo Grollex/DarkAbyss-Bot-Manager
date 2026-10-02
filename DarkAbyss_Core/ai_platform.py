@@ -17,7 +17,11 @@ import app_paths
 # this many profiles (one provider request each).
 MAX_COMPARE_PROFILES = 4
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-DEFAULT_CREDENTIALS_ROOT = app_paths.DATA_ROOT / "secrets" / "ai"
+# Pre-per-instance (global) locations. Read ONLY by ai_storage's one-time
+# migration; no runtime code uses them. AI settings and credentials now
+# belong to one bot instance (see ai_storage.for_instance).
+LEGACY_SETTINGS_PATH = app_paths.CONFIG_DIR / "ai.json"
+LEGACY_CREDENTIALS_ROOT = app_paths.DATA_ROOT / "secrets" / "ai"
 
 
 class AIPlatformError(Exception):
@@ -301,7 +305,15 @@ class CredentialReference:
 
 
 class CredentialStore:
-    def __init__(self, root: Path | str = DEFAULT_CREDENTIALS_ROOT) -> None:
+    """API keys under one explicit root (a bot instance's secrets/ai folder).
+
+    There is deliberately no default root: every caller must say whose
+    credentials it uses, so two bots never share a key file by accident.
+    """
+
+    def __init__(self, root: Path | str) -> None:
+        if root is None or (isinstance(root, str) and not root.strip()):
+            raise CredentialStoreError("Credential store root is required.")
         self.root = Path(root).expanduser().resolve()
 
     def path_for(self, provider_id: str, credential_ref: str) -> Path:
@@ -372,8 +384,12 @@ class AISettings:
 
 
 class AISettingsStore:
-    def __init__(self, path: Path | str | None = None) -> None:
-        self.path = Path(path or (app_paths.CONFIG_DIR / "ai.json")).resolve()
+    """AI profiles + routing in one explicit file (a bot instance's data/ai.json)."""
+
+    def __init__(self, path: Path | str) -> None:
+        if path is None or (isinstance(path, str) and not path.strip()):
+            raise AIPlatformError("AI settings path is required.")
+        self.path = Path(path).resolve()
 
     def load(self) -> AISettings:
         if not self.path.exists():

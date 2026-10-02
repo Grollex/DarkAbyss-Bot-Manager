@@ -948,9 +948,12 @@ def _import_ai_modules() -> tuple[Any, Any]:
     return ai_platform, ai_orchestrator
 
 
-def _default_orchestrator_factory() -> Any:
+def _default_orchestrator_factory(stores: Any = None) -> Any:
+    """Orchestrator over ONE bot instance's AI settings and keys (ai_storage)."""
     _ai_platform, ai_orchestrator = _import_ai_modules()
-    return ai_orchestrator.AIOrchestrator()
+    if stores is None:
+        raise ValueError("This bot instance has no AI storage configured.")
+    return ai_orchestrator.AIOrchestrator(stores=stores)
 
 
 AuditFn = Callable[[Any, dict, str, str], Awaitable[str | None]]
@@ -1041,6 +1044,7 @@ class AITransport:
         view_factory: Callable[["AITransport", PendingConfirmation], Any] | None = None,
         feature_store: Any = None,
         planning: bool = False,
+        ai_stores: Any = None,
     ) -> None:
         self._load_config = load_config
         self._fetch_user = fetch_user
@@ -1049,7 +1053,9 @@ class AITransport:
         # True: a planning call (PLANNER profile, no tool schemas) picks the
         # tools, then the executor (ROUTINE/chosen mode) runs with only those.
         self.planning = planning is True
-        self._orchestrator_factory = orchestrator_factory or _default_orchestrator_factory
+        # ai_storage.InstanceAIStores of THIS bot instance (set by Admin.main).
+        self.ai_stores = ai_stores
+        self._orchestrator_factory = orchestrator_factory or (lambda: _default_orchestrator_factory(self.ai_stores))
         self._view_factory = view_factory or ConfirmationView
         self._orchestrator: Any = None
         # Short per (guild, channel, user) conversation memory, RAM only.

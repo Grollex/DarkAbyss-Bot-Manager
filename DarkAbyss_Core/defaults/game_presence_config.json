@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "guild_id": null,
+  "channel_id": null,
+  "delay_minutes": 3,
+  "user_cooldown_minutes": 60,
+  "group_cooldown_minutes": 180,
+  "guild_cooldown_minutes": 15,
+  "voice_aware": true,
+  "allowlist": [],
+  "ignore_list": [],
+  "ai_rewrite": false
+}

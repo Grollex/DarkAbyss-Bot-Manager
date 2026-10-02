@@ -9,18 +9,5 @@
   "ai_confirmation_mode": "plan",
   "ai_read_message_content": false,
   "ai_mention_enabled": false,
-  "ai_mention_channel_ids": [],
-  "game_presence": {
-    "enabled": false,
-    "guild_id": null,
-    "channel_id": null,
-    "delay_minutes": 3,
-    "user_cooldown_minutes": 60,
-    "group_cooldown_minutes": 180,
-    "guild_cooldown_minutes": 15,
-    "voice_aware": true,
-    "allowlist": [],
-    "ignore_list": [],
-    "ai_rewrite": false
-  }
+  "ai_mention_channel_ids": []
 }

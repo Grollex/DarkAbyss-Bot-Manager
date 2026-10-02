@@ -41,6 +41,7 @@ def dispatch(
     *,
     manager_main: Callable[[manager_core.BotProcessManager], int] | None = None,
     admin_main: Callable[[list[str]], int] | None = None,
+    game_presence_main: Callable[[list[str]], int] | None = None,
 ) -> int:
     if args.manager:
         if args.instance:
@@ -59,6 +60,15 @@ def dispatch(
 
             admin_main = Admin.main
         return int(admin_main(["--instance", args.instance]))
+
+    if args.bot_runner == "game_presence":
+        if not args.instance:
+            raise AppEntryError("--bot-runner game_presence requires --instance.")
+        if game_presence_main is None:
+            import GamePresence
+
+            game_presence_main = GamePresence.main
+        return int(game_presence_main(["--instance", args.instance]))
 
     raise AppEntryError(f"Unknown bot type for --bot-runner: {args.bot_runner!r}")
 

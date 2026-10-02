@@ -182,6 +182,33 @@ def normalize_config_dict(raw: Any) -> dict[str, Any]:
     return out
 
 
+NOT_CONFIGURED_TEXT = "Choose a server and a suggestion channel in Manager -> Game Presence."
+
+
+def normalize_bot_config(raw: Any) -> dict[str, Any]:
+    """Config of a dedicated Game Presence bot instance (top-level keys).
+
+    Same validation as ``normalize_config_dict``; the only difference is that a
+    bot which is switched on but has no server/channel yet is valid and simply
+    "not configured" (nothing is posted until both are chosen).
+    """
+    if isinstance(raw, dict) and raw.get("enabled") is True and (raw.get("guild_id") is None or raw.get("channel_id") is None):
+        data = normalize_config_dict({**raw, "enabled": False})
+        data["enabled"] = True
+        return data
+    return normalize_config_dict(raw)
+
+
+def is_configured(data: Mapping[str, Any]) -> bool:
+    return data.get("guild_id") is not None and data.get("channel_id") is not None
+
+
+def parse_bot_config(raw: Any, normalizer: GameNormalizer | None = None) -> GamePresenceConfig:
+    """GamePresenceConfig for a dedicated bot; "not configured" = inactive (no posting)."""
+    data = normalize_bot_config(raw)
+    return parse_config({**data, "enabled": data["enabled"] and is_configured(data)}, normalizer)
+
+
 def parse_config(raw: Any, normalizer: GameNormalizer | None = None) -> GamePresenceConfig:
     data = normalize_config_dict(raw)
     normalizer = normalizer or GameNormalizer()

@@ -16,6 +16,7 @@ a = Analysis(
         (str(project_root / "bots"), "bots"),
         (str(project_root / "DarkAbyss_Core" / "defaults"), "DarkAbyss_Core/defaults"),
         (str(project_root / "DarkAbyss_Core" / "Admin.py"), "DarkAbyss_Core"),
+        (str(project_root / "DarkAbyss_Core" / "GamePresence.py"), "DarkAbyss_Core"),
     ],
     hiddenimports=[
         "discord",
@@ -26,6 +27,12 @@ a = Analysis(
         "admin_tools_content",
         "admin_blueprint",
         "admin_features",
+        # Bot entrypoints run in-process by app_entry --bot-runner <type>.
+        "Admin",
+        "GamePresence",
+        "game_presence",
+        "game_presence_discord",
+        "ai_storage",
         "PySide6.QtCore",
         "PySide6.QtGui",
         "PySide6.QtWidgets",

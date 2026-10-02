@@ -13,8 +13,6 @@ from discord.ext import commands, tasks
 import admin_instance
 import admin_terminal
 import admin_tools
-import game_presence
-import game_presence_discord
 import admin_features  # after admin_tools (it loads the tool extensions)
 import app_paths
 import bot_registry
@@ -168,9 +166,6 @@ def validate_config(config: dict) -> dict:
         config.get("ai_mention_channel_ids", []),
         "ai_mention_channel_ids",
     )
-
-    # Game Presence capability (off by default; missing section = defaults).
-    config["game_presence"] = game_presence.normalize_config_dict(config.get("game_presence"))
 
     return config
 
@@ -351,16 +346,6 @@ def message_content_requested(config: dict) -> bool:
     )
 
 
-def game_presence_enabled(config: dict) -> bool:
-    section = config.get("game_presence")
-    return isinstance(section, dict) and section.get("enabled") is True
-
-
-def configure_presence_intent(client: discord.Client, enabled: bool) -> None:
-    """Presence Intent only when Game Presence is on (set BEFORE connecting)."""
-    client._connection._intents.presences = bool(enabled)
-
-
 PRIVILEGED_INTENTS_HELP = (
     "Discord refused a privileged gateway intent. With the AI control channel, @mention requests or "
     "'AI can read message text' enabled this bot requires BOTH privileged intents: 'Server Members "
@@ -371,27 +356,6 @@ PRIVILEGED_INTENTS_HELP = (
     "message text' in Manager Setup Bot (Server Members Intent is still required). /execute and /ai do "
     "not need Message Content Intent."
 )
-
-PRESENCE_INTENT_HELP = (
-    "Game Presence is enabled, so this bot also needs 'Presence Intent'. Enable it in Discord Developer "
-    "Portal -> Application -> Bot -> Privileged Gateway Intents -> Presence Intent, then start the bot "
-    "again. Turning Game Presence off in Manager -> Game Presence removes the Presence Intent requirement."
-)
-
-
-def privileged_intents_help(read_content: bool, presence: bool) -> str:
-    """Startup diagnostic naming every privileged intent this configuration requests."""
-    needed = ["Server Members Intent"]
-    if read_content:
-        needed.append("Message Content Intent")
-    if presence:
-        needed.append("Presence Intent")
-    lines = [f"Required privileged intents for this configuration: {', '.join(needed)}."]
-    if read_content:
-        lines.append(PRIVILEGED_INTENTS_HELP)
-    if presence:
-        lines.append(PRESENCE_INTENT_HELP)
-    return "\n".join(lines)
 
 
 class AdminBot(commands.Bot):
@@ -406,14 +370,10 @@ class AdminBot(commands.Bot):
             scheduled_messages_loop.start()
         if terminal is not None and not terminal_loop.is_running():
             terminal_loop.start()
-        if game_presence_runtime is not None and not game_presence_loop.is_running():
-            game_presence_loop.start()
 
     async def on_ready(self) -> None:
         print(f"Discord-only Admin Bot is online as {self.user}")
         refresh_terminal_status()
-        if game_presence_runtime is not None:
-            game_presence_runtime.seed()
 
 
 bot = AdminBot()
@@ -458,76 +418,6 @@ async def _terminal_wait_until_ready() -> None:
     await bot.wait_until_ready()
 
 
-# Game Presence capability. The runtime exists only when the module was
-# enabled at startup (Presence Intent is decided before connecting); the
-# Mute/Allow buttons work whenever the feature store exists.
-game_presence_runtime: game_presence_discord.GamePresenceRuntime | None = None
-GAME_PRESENCE_TICK_SECONDS = 15
-
-
-def game_presence_preferences() -> game_presence.PreferenceBook | None:
-    if feature_store is None:
-        return None
-    return game_presence.PreferenceBook(game_presence.FeatureStorePresenceStore(feature_store))
-
-
-def reload_game_presence_config() -> None:
-    """Live settings from the instance config; invalid config disables posting (fail closed)."""
-    if game_presence_runtime is None:
-        return
-    try:
-        config = game_presence.parse_config(load_config().get("game_presence"))
-    except Exception as exc:
-        game_presence_runtime.apply_config(game_presence.GamePresenceConfig())
-        game_presence_runtime.problem = f"Invalid Game Presence config: {exc}"
-        return
-    game_presence_runtime.apply_config(config)
-
-
-@tasks.loop(seconds=GAME_PRESENCE_TICK_SECONDS)
-async def game_presence_loop() -> None:
-    if game_presence_runtime is None:
-        return
-    reload_game_presence_config()
-    try:
-        await game_presence_runtime.tick()
-    except Exception as exc:  # pragma: no cover - never stop the loop
-        print(f"Game Presence error: {type(exc).__name__}")
-
-
-@game_presence_loop.before_loop
-async def _game_presence_wait_until_ready() -> None:
-    await bot.wait_until_ready()
-
-
-@bot.listen("on_presence_update")
-async def game_presence_presence_listener(before: discord.Member, after: discord.Member) -> None:
-    if game_presence_runtime is not None:
-        game_presence_runtime.on_presence_update(before, after)
-
-
-@bot.listen("on_voice_state_update")
-async def game_presence_voice_listener(member: discord.Member, before: Any, after: Any) -> None:
-    if game_presence_runtime is not None:
-        game_presence_runtime.on_voice_state_update(member, before, after)
-
-
-@bot.listen("on_member_remove")
-async def game_presence_member_remove_listener(member: discord.Member) -> None:
-    if game_presence_runtime is not None:
-        game_presence_runtime.on_member_remove(member)
-
-
-@bot.listen("on_interaction")
-async def game_presence_button_listener(interaction: discord.Interaction) -> None:
-    if interaction.type is not discord.InteractionType.component:
-        return
-    try:
-        await game_presence_discord.handle_preference_interaction(interaction, game_presence_preferences())
-    except Exception as exc:  # pragma: no cover
-        print(f"Game Presence button error: {type(exc).__name__}")
-
-
 @bot.listen("on_interaction")
 async def feature_component_listener(interaction: discord.Interaction) -> None:
     if interaction.type is not discord.InteractionType.component:
@@ -544,8 +434,6 @@ async def feature_member_join_listener(member: discord.Member) -> None:
         await admin_features.handle_member_join(member, feature_store)
     except Exception as exc:  # pragma: no cover
         print(f"Welcome feature error: {type(exc).__name__}")
-    if game_presence_runtime is not None:
-        game_presence_runtime.on_member_join(member)
 
 
 @tasks.loop(seconds=60)
@@ -723,6 +611,20 @@ async def ai_control_channel_listener(message: discord.Message) -> None:
         print(f"AI message error: {type(exc).__name__}")
 
 
+def resolve_ai_stores(runtime: AdminRuntime) -> Any:
+    """This instance's own AI settings + keys; None leaves AI unavailable (fail closed)."""
+    try:
+        import ai_storage
+
+        result = ai_storage.migrate_legacy_global_ai()
+        if result.status in ("migrated", "ambiguous", "failed"):
+            print(result.message)
+        return ai_storage.for_instance_id(runtime.instance_id)
+    except Exception as exc:
+        print(f"AI storage unavailable for this bot: {type(exc).__name__}")
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
@@ -738,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
     feature_store = admin_features.store_for_data_dir(getattr(runtime, "data_dir", None))
     if ai_transport is not None:
         ai_transport.feature_store = feature_store
+        ai_transport.ai_stores = resolve_ai_stores(runtime)
         lock_path = getattr(runtime, "lock_path", None)
         if lock_path is not None:
             terminal = admin_terminal.BotTerminal(Path(lock_path).parent, ai_transport, bot)
@@ -754,37 +657,13 @@ def main(argv: list[str] | None = None) -> int:
     elif read_content:
         print("AI message reading enabled; requesting Discord Message Content Intent.")
 
-    global game_presence_runtime
-    presence = game_presence_enabled(config)
-    configure_presence_intent(bot, presence)
-    if presence:
-        print("Game Presence enabled; requesting Discord Presence Intent.")
-        store = (
-            game_presence.FeatureStorePresenceStore(feature_store)
-            if feature_store is not None
-            else game_presence.MemoryPresenceStore()
-        )
-        lock_path = getattr(runtime, "lock_path", None)
-        game_presence_runtime = game_presence_discord.GamePresenceRuntime(
-            bot,
-            game_presence.GamePresenceEngine(store),
-            rewriter=(
-                game_presence_discord.make_ai_rewriter(ai_transport.get_orchestrator)
-                if ai_transport is not None
-                else None
-            ),
-            runtime_dir=Path(lock_path).parent if lock_path is not None else None,
-            presence_intent=True,
-        )
-        game_presence_runtime.apply_config(game_presence.parse_config(config.get("game_presence")))
-
     if acquire_single_instance_lock(runtime):
         try:
             bot.run(token)
         except discord.PrivilegedIntentsRequired:
-            if not read_content and not presence:
+            if not read_content:
                 raise  # unchanged pre-AI-5 behaviour (e.g. Server Members Intent missing)
-            print(privileged_intents_help(read_content, presence))
+            print(PRIVILEGED_INTENTS_HELP)
             return 1
         except discord.LoginFailure:
             # A packaged (windowed) bot would otherwise show a raw traceback dialog.

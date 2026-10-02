@@ -341,9 +341,12 @@ class _StoredCompare:
 
 
 def build_default_provider_registry(
-    credential_store: ai_platform.CredentialStore | None = None,
+    credential_store: ai_platform.CredentialStore,
 ) -> ai_platform.LazyProviderRegistry:
-    credentials = credential_store if credential_store is not None else ai_platform.CredentialStore()
+    """Shared Groq/Gemini adapters bound to ONE bot instance's credentials."""
+    if not isinstance(credential_store, ai_platform.CredentialStore):
+        raise ValueError("A bot instance's CredentialStore is required.")
+    credentials = credential_store
     registry = ai_platform.LazyProviderRegistry()
 
     # Bot requests retry transient provider failures (rate limit, 5xx, network);
@@ -372,12 +375,22 @@ class AIOrchestrator:
         provider_registry: ai_platform.ProviderRegistry | None = None,
         credential_store: ai_platform.CredentialStore | None = None,
         clock: Callable[[], float] | None = None,
+        stores: Any = None,
     ) -> None:
+        if stores is not None:
+            # ai_storage.InstanceAIStores of one bot instance.
+            settings_store = settings_store or stores.settings
+            credential_store = credential_store or stores.credentials
+        # AI settings and credentials belong to one bot instance (ai_storage);
+        # there is no global fallback, so a bot can never pick up another
+        # bot's keys or routing by accident.
+        if settings_store is None or credential_store is None:
+            raise ValueError("AIOrchestrator needs the bot instance's settings_store and credential_store.")
+        self._settings_store = settings_store
+        self._credential_store = credential_store
         # Use explicit None checks: an injected empty ProviderRegistry has len()==0
         # and is falsy, but it is a valid caller choice (zero providers) and must
         # never be silently replaced by the default Groq/Gemini registry.
-        self._settings_store = settings_store if settings_store is not None else ai_platform.AISettingsStore()
-        self._credential_store = credential_store if credential_store is not None else ai_platform.CredentialStore()
         self._providers = (
             provider_registry
             if provider_registry is not None

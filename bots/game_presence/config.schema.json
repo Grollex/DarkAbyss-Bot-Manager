@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "type": "object",
+  "required": [
+    "enabled",
+    "guild_id",
+    "channel_id",
+    "delay_minutes",
+    "user_cooldown_minutes",
+    "group_cooldown_minutes",
+    "guild_cooldown_minutes",
+    "voice_aware",
+    "allowlist",
+    "ignore_list",
+    "ai_rewrite"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "enabled": {"type": "boolean"},
+    "guild_id": {"anyOf": [{"type": "null"}, {"type": "string", "pattern": "^[0-9]+$"}, {"type": "integer"}]},
+    "channel_id": {"anyOf": [{"type": "null"}, {"type": "string", "pattern": "^[0-9]+$"}, {"type": "integer"}]},
+    "delay_minutes": {"type": "integer"},
+    "user_cooldown_minutes": {"type": "integer"},
+    "group_cooldown_minutes": {"type": "integer"},
+    "guild_cooldown_minutes": {"type": "integer"},
+    "voice_aware": {"type": "boolean"},
+    "allowlist": {"type": "array", "items": {"type": "string"}},
+    "ignore_list": {"type": "array", "items": {"type": "string"}},
+    "ai_rewrite": {"type": "boolean"}
+  }
+}

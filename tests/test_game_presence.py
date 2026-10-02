@@ -1,4 +1,5 @@
-"""Game Presence: engine, policy, persistence, Discord adapter, bot wiring, Manager page."""
+"""Game Presence: engine, policy, persistence, Discord adapter, the dedicated
+Game Presence bot type, Admin separation, Manager page."""
 
 import asyncio
 import contextlib
@@ -10,11 +11,20 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CORE_ROOT = PROJECT_ROOT / "DarkAbyss_Core"
+
+# Never touch the real user data folder: modules imported by these tests
+# resolve app_paths from DARKABYSS_DATA_DIR (AI storage, instances, migration).
+import os as _os  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+
+if not _os.environ.get("DARKABYSS_DATA_DIR"):
+    _os.environ["DARKABYSS_DATA_DIR"] = _tempfile.mkdtemp(prefix="darkabyss-test-")
 sys.path.insert(0, str(CORE_ROOT))
 
 import discord  # noqa: E402
@@ -275,6 +285,14 @@ class NormalizationAndConfigTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 gp.normalize_config_dict(bad)
+        for bad in ({"enabled": "yes"}, {"delay_minutes": 0}, {"unknown": 1}, {"guild_id": "abc"}):
+            with self.subTest(bot_config=bad), self.assertRaises(ValueError):
+                gp.normalize_bot_config(bad)
+        not_configured = gp.normalize_bot_config({"enabled": True})
+        self.assertTrue(not_configured["enabled"])
+        self.assertFalse(gp.is_configured(not_configured))
+        self.assertFalse(gp.parse_bot_config({"enabled": True}).active)
+        self.assertTrue(gp.parse_bot_config({"enabled": True, "guild_id": "1", "channel_id": "2"}).active)
 
 
 @dataclass
@@ -478,7 +496,29 @@ def import_admin_module():
     return importlib.import_module("Admin")
 
 
-class AdminWiringTests(unittest.TestCase):
+PATH_MODULES = (
+    "GamePresence",
+    "Admin",
+    "admin_instance",
+    "ai_storage",
+    "config_store",
+    "instance_store",
+    "bot_registry",
+    "app_paths",
+)
+
+
+def load_with_data_root(data_root, *names):
+    """Fresh path-dependent modules bound to a temporary DATA_ROOT."""
+    os.environ["DARKABYSS_DATA_DIR"] = str(data_root)
+    for name in PATH_MODULES:
+        sys.modules.pop(name, None)
+    return [importlib.import_module(name) for name in names]
+
+
+class AdminSeparationTests(unittest.TestCase):
+    """The Admin bot no longer knows anything about Game Presence."""
+
     def base(self, **extra):
         return {
             "allow_server_administrators": True,
@@ -495,7 +535,6 @@ class AdminWiringTests(unittest.TestCase):
             seen["presences"] = admin.bot.intents.presences
             seen["members"] = admin.bot.intents.members
             seen["message_content"] = admin.bot.intents.message_content
-            seen["runtime"] = admin.game_presence_runtime
             if side_effect is not None:
                 raise side_effect
 
@@ -509,6 +548,7 @@ class AdminWiringTests(unittest.TestCase):
             "load_config": lambda runtime=None: admin.validate_config(json.loads(json.dumps(config_dict))),
             "load_token": lambda runtime=None: "not-a-real-token",
             "acquire_single_instance_lock": lambda runtime=None: True,
+            "resolve_ai_stores": lambda runtime=None: None,
         }
         originals = {name: getattr(admin, name) for name in patches}
         original_run = admin.bot.run
@@ -521,52 +561,262 @@ class AdminWiringTests(unittest.TestCase):
             for name, value in originals.items():
                 setattr(admin, name, value)
             admin.bot.run = original_run
-            admin.game_presence_runtime = None
-            admin.configure_presence_intent(admin.bot, False)
         return code, seen
 
-    def test_old_configs_get_disabled_game_presence_and_no_presence_intent(self):
+    def test_admin_source_has_no_game_presence_wiring(self):
+        source = (CORE_ROOT / "Admin.py").read_text(encoding="utf-8")
+        for needle in ("game_presence", "GamePresence", "presences", "on_presence_update", "Presence Intent"):
+            self.assertNotIn(needle, source)
         admin = import_admin_module()
-        validated = admin.validate_config(self.base())
-        self.assertFalse(validated["game_presence"]["enabled"])
-        code, seen = self.run_main(admin, self.base())
+        self.assertFalse(hasattr(admin, "game_presence_runtime"))
+        self.assertFalse(hasattr(admin, "game_presence_loop"))
+        self.assertNotIn("on_presence_update", getattr(admin.bot, "extra_events", {}))
+        self.assertFalse(admin.bot.intents.presences)
+
+    def test_admin_defaults_and_schema_have_no_game_presence(self):
+        defaults = json.loads((CORE_ROOT / "defaults" / "admin_config.json").read_text(encoding="utf-8"))
+        schema = json.loads((PROJECT_ROOT / "bots" / "admin" / "config.schema.json").read_text(encoding="utf-8"))
+        self.assertNotIn("game_presence", defaults)
+        self.assertNotIn("game_presence", schema["properties"])
+
+    def test_legacy_enabled_section_starts_admin_without_presence(self):
+        admin = import_admin_module()
+        legacy = {"enabled": True, "guild_id": "1", "channel_id": "2", "delay_minutes": 5}
+        validated = admin.validate_config(self.base(game_presence=dict(legacy)))
+        self.assertEqual(validated["game_presence"], legacy)  # kept as-is (not deleted), just ignored
+        code, seen = self.run_main(admin, self.base(game_presence=legacy))
         self.assertEqual(code, 0)
         self.assertFalse(seen["presences"])
         self.assertTrue(seen["members"])
         self.assertFalse(seen["message_content"])
-        self.assertIsNone(seen["runtime"])
 
-    def test_enabled_module_requests_presence_intent_and_builds_runtime(self):
+    def test_even_broken_legacy_section_does_not_stop_admin(self):
         admin = import_admin_module()
-        section = {"enabled": True, "guild_id": "1", "channel_id": "2"}
-        code, seen = self.run_main(admin, self.base(game_presence=section))
+        code, seen = self.run_main(admin, self.base(game_presence={"enabled": True, "delay_minutes": "soon"}))
         self.assertEqual(code, 0)
-        self.assertTrue(seen["presences"])
-        self.assertFalse(seen["message_content"])  # Game Presence does not need it
-        self.assertIsNotNone(seen["runtime"])
-        self.assertTrue(seen["runtime"].engine.config.active)
+        self.assertFalse(seen["presences"])
 
-    def test_invalid_config_fails_closed(self):
-        admin = import_admin_module()
-        with self.assertRaises(ValueError):
-            admin.validate_config(self.base(game_presence={"enabled": True}))
+    def test_legacy_section_passes_admin_config_store_validation(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            instance_store, config_store = load_with_data_root(data_dir, "instance_store", "config_store")
+            instance = instance_store.create_instance("admin", "admin-old")
+            instance.paths.config.write_text(json.dumps({"game_presence": {"enabled": True, "guild_id": "1", "channel_id": "2"}}), encoding="utf-8")
+            effective = config_store.load_effective_config("admin-old")
+            self.assertTrue(effective["game_presence"]["enabled"])  # preserved for the Manager import
+            self.assertEqual(instance_store.list_instances()[0].bot_type, "admin")  # no GP instance auto-created
 
-    def test_rejected_presence_intent_gives_actionable_diagnostic(self):
-        admin = import_admin_module()
-        captured = io.StringIO()
-        with contextlib.redirect_stdout(captured):
-            code, _ = self.run_main(
-                admin,
-                self.base(game_presence={"enabled": True, "guild_id": "1", "channel_id": "2"}),
-                side_effect=discord.PrivilegedIntentsRequired(None),
-            )
+
+class GamePresenceBotTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.data_root = Path(temp.name)
+        (
+            self.G,
+            self.instance_store,
+            self.config_store,
+            self.bot_registry,
+        ) = load_with_data_root(self.data_root, "GamePresence", "instance_store", "config_store", "bot_registry")
+        self.instance = self.instance_store.create_instance("game_presence", "gp-main", "Games")
+
+    def configure(self, **overrides):
+        self.config_store.save_config_overrides("gp-main", overrides)
+
+    def bot(self):
+        return self.G.GamePresenceBot(self.G.resolve_runtime("gp-main"))
+
+    def test_registry_discovers_both_bot_types(self):
+        types_ = self.bot_registry.discover_bot_types()
+        self.assertIn("admin", types_)
+        self.assertIn("game_presence", types_)
+        gp_type = types_["game_presence"]
+        self.assertEqual(gp_type.entrypoint.name, "GamePresence.py")
+        self.assertEqual(gp_type.display_name, "Game Presence Bot")
+        self.assertNotEqual(gp_type.entrypoint, types_["admin"].entrypoint)
+
+    def test_own_token_config_runtime_logs_data(self):
+        admin = self.instance_store.create_instance("admin", "admin-main")
+        self.assertNotEqual(admin.paths.token, self.instance.paths.token)
+        self.assertNotEqual(admin.paths.data_dir, self.instance.paths.data_dir)
+        self.assertEqual(self.instance.bot_type, "game_presence")
+        runtime = self.G.resolve_runtime("gp-main")
+        self.assertEqual(runtime.token_path, self.instance.paths.token)
+        self.assertTrue(str(runtime.lock_path).startswith(str(self.instance.paths.runtime_dir)))
+        with self.assertRaises(RuntimeError):
+            self.G.resolve_runtime("admin-main")  # an Admin instance can never run as Game Presence
+
+    def test_intents_are_only_what_game_presence_needs(self):
+        intents = self.bot().intents
+        self.assertTrue(intents.guilds)
+        self.assertTrue(intents.members)
+        self.assertTrue(intents.presences)
+        self.assertTrue(intents.voice_states)
+        self.assertFalse(intents.message_content)
+        self.assertFalse(intents.messages)
+
+    def test_fresh_instance_is_not_configured_and_posts_nothing(self):
+        config, problem = self.G.load_settings("gp-main")
+        self.assertFalse(config.active)
+        self.assertEqual(problem, gp.NOT_CONFIGURED_TEXT)
+        self.configure(guild_id="1", channel_id="2")
+        config, problem = self.G.load_settings("gp-main")
+        self.assertTrue(config.active)
+        self.assertIsNone(problem)
+        self.configure(guild_id="1", channel_id="2", enabled=False)  # pause
+        config, problem = self.G.load_settings("gp-main")
+        self.assertFalse(config.active)
+
+    def test_corrupted_or_invalid_config_fails_closed(self):
+        for raw in (b"{not json", b'{"delay_minutes": 0}', b'{"unknown": 1}', b'{"guild_id": "abc", "channel_id": "2"}'):
+            with self.subTest(raw=raw):
+                self.instance.paths.config.write_bytes(raw)
+                config, problem = self.G.load_settings("gp-main")
+                self.assertFalse(config.active)
+                self.assertFalse(config.enabled)
+                self.assertTrue(problem)
+
+    async def test_live_config_reload_and_problem_in_status(self):
+        bot = self.bot()
+        self.assertEqual(bot.presence_runtime.config_problem, gp.NOT_CONFIGURED_TEXT)
+        self.configure(guild_id="1", channel_id="2", delay_minutes=7)
+        await bot.run_tick()
+        self.assertEqual(bot.presence_runtime.engine.config.delay_seconds, 420.0)
+        self.assertIsNone(bot.presence_runtime.config_problem)
+        self.instance.paths.config.write_bytes(b"{broken")
+        await bot.run_tick()
+        self.assertFalse(bot.presence_runtime.engine.config.active)
+        status = json.loads((self.instance.paths.runtime_dir / gpd.STATUS_FILE_NAME).read_text(encoding="utf-8"))
+        self.assertIn("Invalid Game Presence config", status["problem"])
+
+    async def test_buttons_use_this_instance_state_only(self):
+        admin = self.instance_store.create_instance("admin", "admin-main")
+        bot = self.bot()
+        interaction, response = click(gpd.CUSTOM_ID_MUTE, A)
+        interaction.type = discord.InteractionType.component
+        await bot.on_interaction(interaction)
+        self.assertEqual(response.sent[0][0], gpd.PREF_MUTED)
+        self.assertIs(response.sent[0][1]["ephemeral"], True)
+        state_file = self.instance.paths.data_dir / self.G.STATE_FILE_NAME
+        self.assertTrue(state_file.is_file())
+        self.assertTrue(self.bot().preferences.is_muted(GUILD, A))  # persistent across restarts
+        self.assertFalse(self.bot().preferences.is_muted(GUILD, B))
+        self.assertFalse((admin.paths.data_dir / "admin_features.json").exists())
+
+    async def test_corrupted_state_stops_posting_and_buttons(self):
+        state_file = self.instance.paths.data_dir / self.G.STATE_FILE_NAME
+        state_file.write_text("{oops", encoding="utf-8")
+        self.configure(guild_id=str(GUILD), channel_id=str(CHANNEL))
+        bot = self.bot()
+        guild = FakeGuild()
+        bot.presence_runtime.client = types.SimpleNamespace(get_guild=lambda guild_id: guild if guild_id == GUILD else None)
+        bot.presence_runtime.engine.clock = Clock()
+        guild.members = [member(guild, A, OW), member(guild, B, OW)]
+        bot.presence_runtime.seed()
+        await bot.run_tick()
+        bot.presence_runtime.engine.clock.advance(600)
+        await bot.run_tick()
+        self.assertEqual(guild.text.sent, [])
+        self.assertIn("state file", bot.presence_runtime.problem)
+        self.assertEqual(state_file.read_text(encoding="utf-8"), "{oops")  # never reset to "everyone allowed"
+        interaction, response = click(gpd.CUSTOM_ID_MUTE, A)
+        interaction.type = discord.InteractionType.component
+        await bot.on_interaction(interaction)
+        self.assertEqual(response.sent[0][0], gpd.PREF_UNAVAILABLE)
+
+    async def test_third_player_aggregation_in_the_dedicated_bot(self):
+        self.configure(guild_id=str(GUILD), channel_id=str(CHANNEL))
+        bot = self.bot()
+        guild = FakeGuild()
+        clock = Clock()
+        bot.presence_runtime.client = types.SimpleNamespace(get_guild=lambda guild_id: guild if guild_id == GUILD else None)
+        bot.presence_runtime.engine.clock = clock
+        guild.members = [member(guild, A, OW), member(guild, B, OW)]
+        bot.presence_runtime.seed()
+        await bot.run_tick()
+        clock.advance(60)
+        bot.presence_runtime.on_presence_update(None, member(guild, C, OW))
+        await bot.run_tick()
+        clock.advance(200)
+        await bot.run_tick()
+        self.assertEqual(len(guild.text.sent), 1)
+        content, kwargs = guild.text.sent[0]
+        self.assertEqual(sorted(user.id for user in kwargs["allowed_mentions"].users), [A, B, C])
+        self.assertFalse(kwargs["allowed_mentions"].everyone)
+        self.assertFalse(kwargs["allowed_mentions"].roles)
+
+    async def test_ai_wording_uses_this_instance_and_never_tools(self):
+        captured = {}
+
+        class FakeOrchestrator:
+            async def orchestrate(self, request, **kwargs):
+                captured["request"] = request
+                captured["kwargs"] = kwargs
+                return types.SimpleNamespace(status=types.SimpleNamespace(value="COMPLETED"), content="{targets}, го в {game}?")
+
+        import ai_orchestrator
+
+        request = ai_orchestrator.OrchestratorRequest(
+            messages=(importlib.import_module("ai_platform").AIMessage(role="user", content="x"),),
+            task_class="CREATIVE",
+            allowed_tool_names=("send_message",),
+        )
+        ai = self.G.TextOnlyAI(FakeOrchestrator())
+        await ai.orchestrate(request)
+        self.assertEqual(captured["request"].allowed_tool_names, ())
+        self.assertEqual(captured["kwargs"], {})  # no executor -> no tool can ever run
+
+        instance_ai = self.G.InstanceAI("gp-main")
+        built = instance_ai.get()
+        stores = built._orchestrator._settings_store, built._orchestrator._credential_store
+        self.assertEqual(stores[0].path, (self.instance.paths.data_dir / "ai.json").resolve())
+        self.assertEqual(stores[1].root, (self.instance.paths.secrets_dir / "ai").resolve())
+
+    def test_missing_token_is_actionable(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = self.G.main(["--instance", "gp-main"])
         self.assertEqual(code, 1)
-        text = captured.getvalue()
+        self.assertIn("Bot Setup", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_rejected_intents_give_actionable_diagnostic(self):
+        self.instance.paths.token.write_text("not-a-real-token\n", encoding="utf-8")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()), unittest.mock.patch.object(
+            self.G, "acquire_single_instance_lock", return_value=True
+        ), unittest.mock.patch.object(self.G.GamePresenceBot, "run", side_effect=discord.PrivilegedIntentsRequired(None)):
+            code = self.G.main(["--instance", "gp-main"])
+        self.assertEqual(code, 1)
+        text = errors.getvalue()
         self.assertIn("Presence Intent", text)
         self.assertIn("Server Members Intent", text)
-        self.assertIn("Developer Portal", text)
-        self.assertIn("Turning Game Presence off", text)
+        self.assertIn("Message Content Intent' is NOT needed", text)
         self.assertNotIn("Traceback", text)
+        status = json.loads((self.instance.paths.runtime_dir / gpd.STATUS_FILE_NAME).read_text(encoding="utf-8"))
+        self.assertIn("Presence Intent", status["problem"])
+
+    def test_rejected_token_is_actionable(self):
+        self.instance.paths.token.write_text("not-a-real-token\n", encoding="utf-8")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()), unittest.mock.patch.object(
+            self.G, "acquire_single_instance_lock", return_value=True
+        ), unittest.mock.patch.object(self.G.GamePresenceBot, "run", side_effect=discord.LoginFailure("bad")):
+            code = self.G.main(["--instance", "gp-main"])
+        self.assertEqual(code, 1)
+        self.assertIn("Game Presence bot token", errors.getvalue())
+
+    def test_app_entry_runs_game_presence_bot_type(self):
+        sys.modules.pop("app_entry", None)
+        app_entry = importlib.import_module("app_entry")
+        calls = []
+        args = app_entry.parse_args(["--bot-runner", "game_presence", "--instance", "gp-main"])
+        self.assertEqual(app_entry.dispatch(args, game_presence_main=lambda argv: calls.append(argv) or 0), 0)
+        self.assertEqual(calls, [["--instance", "gp-main"]])
+        with self.assertRaises(app_entry.AppEntryError):
+            app_entry.dispatch(app_entry.parse_args(["--bot-runner", "game_presence"]), game_presence_main=lambda argv: 0)
+        spec = (PROJECT_ROOT / "packaging" / "DarkAbyssApp.spec").read_text(encoding="utf-8")
+        self.assertIn("GamePresence.py", spec)
+        self.assertIn('"GamePresence"', spec)
 
 
 @unittest.skipIf(importlib.util.find_spec("PySide6") is None, "PySide6 not installed")
@@ -576,66 +826,86 @@ class ManagerPageTests(unittest.TestCase):
         from PySide6.QtWidgets import QApplication
 
         self.app = QApplication.instance() or QApplication([])
-        self.page_module = importlib.import_module("manager_game_presence")
-        self.terminal = importlib.import_module("admin_terminal")
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.logs = Path(temp.name) / "instances" / "admin-main" / "logs"
+        self.data_root = Path(temp.name)
+        os.environ["DARKABYSS_DATA_DIR"] = str(self.data_root)
+        for name in ("manager_game_presence", "admin_terminal", *PATH_MODULES):
+            sys.modules.pop(name, None)
+        self.page_module = importlib.import_module("manager_game_presence")
+        self.terminal = importlib.import_module("admin_terminal")
+        self.logs = self.data_root / "instances" / "gp-main" / "logs"
         self.runtime = self.terminal.runtime_dir_for_logs(self.logs)
         self.terminal.write_bot_status(
             self.runtime,
             {"guilds": [{"id": "1", "name": "Null", "channels": [{"id": "2", "name": "games", "type": "text"}, {"id": "3", "name": "vc", "type": "voice"}]}]},
         )
 
-    def make_page(self, effective_section=None, state="RUNNING"):
-        info = types.SimpleNamespace(logs_dir=self.logs, state=state)
+    def make_page(self, effective=None, state="RUNNING", admin_overrides=None, extra_bots=()):
+        info = types.SimpleNamespace(logs_dir=self.logs, state=state, bot_type="game_presence")
+        admin_info = types.SimpleNamespace(logs_dir=self.data_root / "instances" / "admin-main" / "logs", state="STOPPED", bot_type="admin")
         saved = []
         restarted = []
+        defaults = dict(gp.DEFAULT_CONFIG, enabled=True)
 
         class ConfigApi:
             def get_config_snapshot(self, instance_id):
-                effective = {"game_presence": effective_section} if effective_section is not None else {}
-                overrides = {"allowed_user_ids": ["5"]}
-                if saved:
-                    overrides = saved[-1][1]
-                    effective = {"game_presence": overrides["game_presence"]}
-                return types.SimpleNamespace(effective=effective, overrides=overrides)
+                if instance_id == "admin-main":
+                    overrides = dict(admin_overrides or {"allowed_user_ids": ["5"]})
+                    return types.SimpleNamespace(effective=overrides, overrides=overrides)
+                overrides = saved[-1][1] if saved else {}
+                current = {**defaults, **(effective or {}), **overrides}
+                return types.SimpleNamespace(effective=current, overrides=overrides)
 
             def save_config_overrides(self, instance_id, overrides):
                 saved.append((instance_id, json.loads(json.dumps(overrides))))
                 return overrides
 
-        page = self.page_module.GamePresencePanel(lambda: [("admin-main", "Main · Bot", info)], ConfigApi(), restarted.append)
+        bots = [("admin-main", "Main · Admin", admin_info), ("gp-main", "Main · Games", info), *extra_bots]
+        page = self.page_module.GamePresencePanel(lambda: list(bots), ConfigApi(), restarted.append)
         self.addCleanup(page.close)
         return page, saved, restarted
 
+    def test_only_game_presence_bots_are_listed(self):
+        page, _saved, _restarted = self.make_page()
+        self.assertEqual([page.bot_combo.itemData(i) for i in range(page.bot_combo.count())], ["gp-main"])
+        self.assertTrue(page.legacy_panel.isHidden())
+
+    def test_no_game_presence_bot_yet(self):
+        info = types.SimpleNamespace(logs_dir=self.logs, state="STOPPED", bot_type="admin")
+        page = self.page_module.GamePresencePanel(lambda: [("admin-main", "Main", info)], types.SimpleNamespace(), lambda _id: None)
+        self.addCleanup(page.close)
+        self.assertEqual(page.status_title.text(), "No Game Presence bot")
+        self.assertFalse(page.save_button.isEnabled())
+        self.assertFalse(page.save())
+
     def test_load_defaults_then_save_settings_and_restart(self):
         page, saved, restarted = self.make_page()
-        self.assertFalse(page.enabled_checkbox.isChecked())
+        self.assertTrue(page.enabled_checkbox.isChecked())
         self.assertEqual(page.spins["delay_minutes"].value(), 3)
         self.assertEqual(page.guild_combo.currentText(), "Null")
         self.assertEqual([page.channel_combo.itemText(i) for i in range(page.channel_combo.count())], ["#games"])
-        self.assertEqual(page.status_title.text(), "Disabled")
+        self.assertEqual(page.status_title.text(), "Not configured")
         self.assertIn("Presence Intent", self.page_module.REQUIRED_INTENTS_TEXT)
+        self.assertIn("Message Content Intent is not needed", self.page_module.REQUIRED_INTENTS_TEXT)
 
-        page.enabled_checkbox.setChecked(True)
         page.spins["delay_minutes"].setValue(5)
         page.voice_checkbox.setChecked(False)
         page.allowlist_edit.setPlainText("Overwatch 2\n\nDota 2")
         page.ignore_edit.setPlainText("Wallpaper Engine")
         self.assertTrue(page.save(restart=True))
         instance_id, overrides = saved[-1]
-        section = overrides["game_presence"]
-        self.assertEqual(overrides["allowed_user_ids"], ["5"])  # other settings kept
-        self.assertEqual((section["enabled"], section["guild_id"], section["channel_id"]), (True, "1", "2"))
-        self.assertEqual(section["delay_minutes"], 5)
-        self.assertFalse(section["voice_aware"])
-        self.assertEqual(section["allowlist"], ["Overwatch 2", "Dota 2"])
-        self.assertEqual(section["ignore_list"], ["Wallpaper Engine"])
-        self.assertEqual(restarted, ["admin-main"])
+        self.assertEqual(instance_id, "gp-main")
+        self.assertNotIn("game_presence", overrides)  # top-level config of the Game Presence bot
+        self.assertEqual((overrides["enabled"], overrides["guild_id"], overrides["channel_id"]), (True, "1", "2"))
+        self.assertEqual(overrides["delay_minutes"], 5)
+        self.assertFalse(overrides["voice_aware"])
+        self.assertEqual(overrides["allowlist"], ["Overwatch 2", "Dota 2"])
+        self.assertEqual(overrides["ignore_list"], ["Wallpaper Engine"])
+        self.assertEqual(restarted, ["gp-main"])
 
     def test_saved_values_reload_and_status_is_shown(self):
-        section = {**gp.DEFAULT_CONFIG, "enabled": True, "guild_id": "1", "channel_id": "2", "guild_cooldown_minutes": 30}
+        section = {"guild_id": "1", "channel_id": "2", "guild_cooldown_minutes": 30}
         self.terminal.write_runtime_json(
             self.runtime,
             self.page_module.STATUS_FILE_NAME,
@@ -649,13 +919,59 @@ class ManagerPageTests(unittest.TestCase):
         self.assertEqual(page.status_title.text(), "Active")
         self.assertIn("Overwatch 2 (3)", page.status_details.text())
 
+        page, _saved, _restarted = self.make_page({**section, "enabled": False})
+        self.assertEqual(page.status_title.text(), "Paused")
+
     def test_invalid_settings_are_not_saved(self):
         page, saved, _ = self.make_page()
-        page.enabled_checkbox.setChecked(True)
-        page.channel_combo.clear()  # no channel chosen
+        page.allowlist_edit.setPlainText("x" * 101)
         self.assertFalse(page.save())
         self.assertEqual(saved, [])
         self.assertIn("Not saved", page.result_label.text())
+
+    def test_corrupted_config_is_shown_not_silently_used(self):
+        page, saved, _ = self.make_page({"delay_minutes": 0})
+        self.assertEqual(page.status_title.text(), "Config problem")
+        self.assertIn("Config problem", page.result_label.text())
+        self.assertEqual(saved, [])
+
+    def test_legacy_admin_settings_are_shown_and_imported_on_request(self):
+        legacy = {"enabled": True, "guild_id": "1", "channel_id": "2", "delay_minutes": 9}
+        admin_root = self.data_root / "instances" / "admin-main" / "data"
+        admin_root.mkdir(parents=True)
+        admin_state = {"version": 1, "guilds": {"1": {"game_presence": {"muted": {str(A): 1.0}}, "role_menus": {"x": 1}}}}
+        (admin_root / "admin_features.json").write_text(json.dumps(admin_state), encoding="utf-8")
+        page, saved, _ = self.make_page(state="STOPPED", admin_overrides={"game_presence": legacy})
+        self.assertFalse(page.legacy_panel.isHidden())
+        self.assertIn("Main · Admin", page.legacy_label.text())
+        self.assertEqual(saved, [])  # nothing happens without the user's click
+
+        self.assertTrue(page.import_legacy())
+        self.assertEqual(saved[-1][0], "gp-main")
+        self.assertEqual(saved[-1][1]["delay_minutes"], 9)
+        target = json.loads((self.data_root / "instances" / "gp-main" / "data" / "game_presence_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(target["guilds"]["1"]["game_presence"], {"muted": {str(A): 1.0}})
+        self.assertNotIn("role_menus", target["guilds"]["1"])  # only Game Presence state moves
+        self.assertEqual(json.loads((admin_root / "admin_features.json").read_text(encoding="utf-8")), admin_state)  # untouched
+
+    def test_import_never_overwrites_state_and_skips_state_while_running(self):
+        legacy = {"enabled": True, "guild_id": "1", "channel_id": "2"}
+        admin_root = self.data_root / "instances" / "admin-main" / "data"
+        admin_root.mkdir(parents=True)
+        (admin_root / "admin_features.json").write_text(json.dumps({"guilds": {"1": {"game_presence": {"muted": {"1": 1.0}}}}}), encoding="utf-8")
+        gp_state = self.data_root / "instances" / "gp-main" / "data" / "game_presence_state.json"
+        gp_state.parent.mkdir(parents=True)
+        own = {"version": 1, "guilds": {"1": {"game_presence": {"muted": {"2": 5.0}}}}}
+        gp_state.write_text(json.dumps(own), encoding="utf-8")
+
+        page, _saved, _ = self.make_page(state="RUNNING", admin_overrides={"game_presence": legacy})
+        self.assertTrue(page.import_legacy())
+        self.assertIn("not copied because the Game Presence bot is running", page.result_label.text())
+        self.assertEqual(json.loads(gp_state.read_text(encoding="utf-8")), own)
+
+        page, _saved, _ = self.make_page(state="STOPPED", admin_overrides={"game_presence": legacy})
+        self.assertTrue(page.import_legacy())
+        self.assertEqual(json.loads(gp_state.read_text(encoding="utf-8")), own)  # existing state wins
 
 
 if __name__ == "__main__":

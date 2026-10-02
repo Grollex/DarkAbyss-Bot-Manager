@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 
 import admin_instance
 import ai_platform
+import ai_storage
 import app_paths
 import manager_dashboard as dash
 import manager_game_presence
@@ -110,6 +111,16 @@ DISCORD_PERMISSION_BITS = {
     "Pin Messages": 1 << 51,
 }
 DISCORD_ADMIN_BOT_PERMISSIONS = sum(DISCORD_PERMISSION_BITS.values())
+ADMIN_BOT_TYPE_ID = "admin"
+GAME_PRESENCE_BOT_TYPE_ID = "game_presence"
+# Game Presence only reads presence/voice and posts suggestions with buttons.
+DISCORD_GAME_PRESENCE_PERMISSIONS = DISCORD_PERMISSION_BITS["View Channels"] | DISCORD_PERMISSION_BITS["Send Messages"]
+GAME_PRESENCE_INVITE_SCOPES = ("bot",)
+# What each bot type can do (shown on the dashboard instead of module toggles).
+BOT_TYPE_CAPABILITIES: dict[str, str] = {
+    ADMIN_BOT_TYPE_ID: "Slash commands · AI assistant · AI terminal · @mentions",
+    GAME_PRESENCE_BOT_TYPE_ID: "Game suggestions · Mute/Allow buttons · AI wording (optional)",
+}
 
 SETUP_HELP_TEXT: dict[str, tuple[str, str]] = {
     "display_name": (
@@ -173,6 +184,13 @@ SETUP_HELP_TEXT: dict[str, tuple[str, str]] = {
         "1) В Discord включи Developer Mode.\n"
         "2) Правый клик по каналу → Copy Channel ID.\n"
         "3) Поле можно оставить пустым, если audit-канал не нужен.",
+    ),
+    "gp_intents": (
+        "Presence Intent + Server Members Intent",
+        "The Game Presence bot reads who plays what (Presence Intent) and the members of your server (Server Members "
+        "Intent). Both are privileged: enable them in Discord Developer Portal -> your Game Presence application -> Bot "
+        "-> Privileged Gateway Intents. Message Content Intent is NOT needed.\n\n"
+        "Manager cannot verify these Discord-side toggles. If one is missing the bot stops with a message naming it.",
     ),
     "intent": (
         "Server Members Intent",
@@ -331,13 +349,14 @@ def validate_application_id(text: str) -> str:
     return value
 
 
-def build_discord_invite_url(application_id: str) -> str:
+def build_discord_invite_url(application_id: str, bot_type: str = ADMIN_BOT_TYPE_ID) -> str:
     client_id = validate_application_id(application_id)
+    game_presence = bot_type == GAME_PRESENCE_BOT_TYPE_ID
     query = urlencode(
         {
             "client_id": client_id,
-            "permissions": str(DISCORD_ADMIN_BOT_PERMISSIONS),
-            "scope": " ".join(DISCORD_BOT_INVITE_SCOPES),
+            "permissions": str(DISCORD_GAME_PRESENCE_PERMISSIONS if game_presence else DISCORD_ADMIN_BOT_PERMISSIONS),
+            "scope": " ".join(GAME_PRESENCE_INVITE_SCOPES if game_presence else DISCORD_BOT_INVITE_SCOPES),
             "integration_type": "0",
         }
     )
@@ -540,11 +559,16 @@ class AIProviderSettingsDialog(QDialog):
         provider_factory: Callable[[ai_platform.CredentialStore], object] = create_groq_provider,
         gemini_provider_factory: Callable[[ai_platform.CredentialStore], object] = create_gemini_provider,
         parent: QWidget | None = None,
+        bot_label: str | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("AI Providers")
-        self._settings_store = settings_store or ai_platform.AISettingsStore()
-        self._credential_store = credential_store or ai_platform.CredentialStore()
+        # Keys, models and routing belong to ONE bot instance (ai_storage);
+        # there is no global store to fall back to.
+        if settings_store is None or credential_store is None:
+            raise ValueError("AIProviderSettingsDialog needs the selected bot instance's AI stores.")
+        self.setWindowTitle(f"AI Providers — {bot_label}" if bot_label else "AI Providers")
+        self._settings_store = settings_store
+        self._credential_store = credential_store
         self._provider_factory = provider_factory
         self._gemini_provider_factory = gemini_provider_factory
         self._worker_handles: list[_WorkerHandle] = []
@@ -652,7 +676,14 @@ class AIProviderSettingsDialog(QDialog):
         self.provider_tabs.addTab(gemini_tab, "Gemini")
         self.provider_tabs.addTab(routing_tab, "Routing")
 
+        self.bot_label = QLabel(
+            f"These keys, models and routing are used only by: {bot_label}" if bot_label else ""
+        )
+        self.bot_label.setWordWrap(True)
+        self.bot_label.setVisible(bool(bot_label))
+
         layout = QVBoxLayout()
+        layout.addWidget(self.bot_label)
         layout.addWidget(self.provider_tabs)
         layout.addWidget(self.close_button)
         self.setLayout(layout)
@@ -1105,14 +1136,44 @@ class AIProviderSettingsDialog(QDialog):
         self._worker_handles = [handle for handle in self._worker_handles if handle.bridge is not bridge]
 
 
-class CreateAdminInstanceDialog(QDialog):
+def creatable_bot_types() -> list[tuple[str, str]]:
+    """(id, display name) of every registered bot type; Admin first."""
+    try:
+        types = bot_registry.discover_bot_types()
+    except (bot_registry.BotRegistryError, OSError):
+        return [(ADMIN_BOT_TYPE_ID, "Admin Bot")]
+    ordered = sorted(types.values(), key=lambda item: (item.id != ADMIN_BOT_TYPE_ID, item.display_name))
+    return [(item.id, item.display_name) for item in ordered]
+
+
+BOT_TYPE_HINTS = {
+    ADMIN_BOT_TYPE_ID: "Server administration with slash commands and the AI assistant.",
+    GAME_PRESENCE_BOT_TYPE_ID: (
+        "Suggests that members playing the same game get together. Needs its OWN Discord application and "
+        "token (create a second application in the Developer Portal) and its own optional AI keys."
+    ),
+}
+
+
+class CreateBotInstanceDialog(QDialog):
+    """New bot instance: bot type + instance ID + optional display name."""
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Create Admin Instance")
+        self.setWindowTitle("Add Bot")
+        self.type_combo = QComboBox()
+        for type_id, display_name in creatable_bot_types():
+            self.type_combo.addItem(display_name, type_id)
+        self.type_hint = QLabel("")
+        self.type_hint.setWordWrap(True)
+        self.type_combo.currentIndexChanged.connect(lambda _index: self._update_hint())
         self.instance_id_edit = QLineEdit()
+        self.instance_id_edit.setPlaceholderText("lowercase letters, digits, - or _ (e.g. game-presence)")
         self.display_name_edit = QLineEdit()
 
         form = QFormLayout()
+        form.addRow("Bot type", self.type_combo)
+        form.addRow("", self.type_hint)
         form.addRow("Instance ID", self.instance_id_edit)
         form.addRow("Display name (optional)", self.display_name_edit)
 
@@ -1125,9 +1186,15 @@ class CreateAdminInstanceDialog(QDialog):
         layout.addWidget(self.buttons)
         self.setLayout(layout)
 
-    def values(self) -> tuple[str, str | None]:
+        self._update_hint()
+
+    def _update_hint(self) -> None:
+        self.type_hint.setText(BOT_TYPE_HINTS.get(self.type_combo.currentData(), ""))
+
+    def values(self) -> tuple[str, str, str | None]:
         display_name = self.display_name_edit.text().strip()
-        return self.instance_id_edit.text().strip(), display_name or None
+        bot_type = self.type_combo.currentData() or ADMIN_BOT_TYPE_ID
+        return bot_type, self.instance_id_edit.text().strip(), display_name or None
 
 
 
@@ -1147,15 +1214,32 @@ class BotSetupDialog(QDialog):
         self.start_requested = False
         self.setWindowTitle(f"Setup Bot: {instance_id}")
         self.resize(760, 540)
+        # Steps depend on the bot type: a Game Presence bot has no admin access
+        # settings (its options live on the Game Presence page).
+        try:
+            loaded_type = getattr(instance_api.load_instance(instance_id), "bot_type", ADMIN_BOT_TYPE_ID)
+        except Exception:
+            loaded_type = ADMIN_BOT_TYPE_ID
+        self.bot_type = loaded_type if loaded_type == GAME_PRESENCE_BOT_TYPE_ID else ADMIN_BOT_TYPE_ID
+        self.is_game_presence = self.bot_type == GAME_PRESENCE_BOT_TYPE_ID
 
-        self.step_names = [
-            "Manager Name",
-            "Discord Application / Token",
-            "Server Members Intent",
-            "Access Settings",
-            "Invite Bot",
-            "Ready",
-        ]
+        if self.is_game_presence:
+            self.step_names = [
+                "Manager Name",
+                "Discord Application / Token",
+                "Presence + Server Members Intents",
+                "Invite Bot",
+                "Ready",
+            ]
+        else:
+            self.step_names = [
+                "Manager Name",
+                "Discord Application / Token",
+                "Server Members Intent",
+                "Access Settings",
+                "Invite Bot",
+                "Ready",
+            ]
         self.current_step_label = QLabel("")
         self.current_step_label.setWordWrap(True)
         self.instructions_label = QLabel("Follow the steps. Use the round i buttons for help on each setting.")
@@ -1182,8 +1266,12 @@ class BotSetupDialog(QDialog):
         self.open_installation_button = QPushButton("Open Installation Settings")
         self.open_installation_button.clicked.connect(self.open_application_installation_page)
 
-        self.intent_help_button = self._create_help_button("intent")
-        self.intent_ack_checkbox = QCheckBox("I enabled Server Members Intent in Discord Developer Portal")
+        self.intent_help_button = self._create_help_button("gp_intents" if self.is_game_presence else "intent")
+        self.intent_ack_checkbox = QCheckBox(
+            "I enabled Presence Intent and Server Members Intent in Discord Developer Portal"
+            if self.is_game_presence
+            else "I enabled Server Members Intent in Discord Developer Portal"
+        )
         self.open_intent_portal_button = QPushButton("Open Developer Portal")
         self.open_intent_portal_button.clicked.connect(self.open_application_bot_page)
 
@@ -1237,8 +1325,10 @@ class BotSetupDialog(QDialog):
         self.pages.addWidget(self._build_display_name_page())
         self.pages.addWidget(self._build_token_page())
         self.pages.addWidget(self._build_intent_page())
-        self.pages.addWidget(self._build_access_page())
-        self.pages.addWidget(self._build_invite_page())
+        if not self.is_game_presence:
+            self.pages.addWidget(self._build_access_page())
+        self.invite_page = self._build_invite_page()
+        self.pages.addWidget(self.invite_page)
         self.pages.addWidget(self._build_ready_page())
         self.pages.currentChanged.connect(self._on_page_changed)
 
@@ -1317,14 +1407,25 @@ class BotSetupDialog(QDialog):
 
     def _build_intent_page(self) -> QWidget:
         page = QWidget()
-        description = QLabel(
-            "The Admin bot needs Discord's privileged Server Members Intent because it reads member information.\n"
-            "Manager cannot verify this Discord-side toggle locally, so confirm it only after enabling it in the portal."
-        )
+        if self.is_game_presence:
+            description = QLabel(
+                "The Game Presence bot needs two privileged intents of ITS OWN Discord application: Presence Intent "
+                "(who plays what) and Server Members Intent. Message Content Intent is not needed.\n"
+                "Manager cannot verify these Discord-side toggles locally, so confirm them only after enabling them."
+            )
+            steps = QLabel(
+                "Discord Developer Portal -> your Game Presence application -> Bot -> Privileged Gateway Intents -> "
+                "enable Presence Intent and Server Members Intent."
+            )
+        else:
+            description = QLabel(
+                "The Admin bot needs Discord's privileged Server Members Intent because it reads member information.\n"
+                "Manager cannot verify this Discord-side toggle locally, so confirm it only after enabling it in the portal."
+            )
+            steps = QLabel(
+                "Discord Developer Portal -> Application -> Bot -> Privileged Gateway Intents -> enable Server Members Intent."
+            )
         description.setWordWrap(True)
-        steps = QLabel(
-            "Discord Developer Portal -> Application -> Bot -> Privileged Gateway Intents -> enable Server Members Intent."
-        )
         steps.setWordWrap(True)
         layout = QVBoxLayout()
         layout.addWidget(description)
@@ -1367,9 +1468,15 @@ class BotSetupDialog(QDialog):
 
     def _build_invite_page(self) -> QWidget:
         page = QWidget()
+        permissions_text = (
+            "The Game Presence invite asks only for View Channels and Send Messages (no slash commands, no "
+            "moderation permissions).\n"
+            if self.is_game_presence
+            else "Manager generates the invite link with the required granular permissions. It does not request Administrator permission.\n"
+        )
         description = QLabel(
-            "Manager generates the invite link with the required granular permissions. It does not request Administrator permission.\n"
-            "It targets Discord Guild Install. Private applications may require Installation -> Install Link = None; shareable installs may use Public Bot = ON.\n"
+            permissions_text
+            + "It targets Discord Guild Install. Private applications may require Installation -> Install Link = None; shareable installs may use Public Bot = ON.\n"
             "Click Open Invite Page, choose your server, review permissions, authorize, then return here."
         )
         description.setWordWrap(True)
@@ -1412,6 +1519,11 @@ class BotSetupDialog(QDialog):
         self.display_name_edit.setText(instance.display_name)
         self.token_edit.clear()
         self.token_status_label.setText(token_status_text(instance.paths.token))
+        if self.is_game_presence:
+            self._update_invite_preview()
+            self._update_ready_summary()
+            self._set_status("Loaded setup.")
+            return
         self.allow_admins_checkbox.setChecked(bool(effective.get("allow_server_administrators", True)))
         self.allowed_users_edit.setText(", ".join(str(value) for value in effective.get("allowed_user_ids", [])))
         self.allowed_roles_edit.setText(", ".join(str(value) for value in effective.get("allowed_role_ids", [])))
@@ -1431,6 +1543,8 @@ class BotSetupDialog(QDialog):
         self._set_status("Loaded setup.")
 
     def save_setup(self) -> bool:
+        if self.is_game_presence:
+            return self._save_name_and_token()
         try:
             instance = self._instance_api.load_instance(self._instance_id)
             display_name = self.display_name_edit.text().strip()
@@ -1482,6 +1596,21 @@ class BotSetupDialog(QDialog):
         self.load_setup()
         return True
 
+    def _save_name_and_token(self) -> bool:
+        """Game Presence setup writes only the display name and THIS bot's token."""
+        try:
+            instance = self._instance_api.load_instance(self._instance_id)
+            token = self.token_edit.text().strip()
+            self._instance_api.update_instance_display_name(self._instance_id, self.display_name_edit.text().strip())
+            if token:
+                _atomic_write_text(_ensure_safe_token_path(instance), f"{token}\n")
+        except (ValueError, OSError, instance_store.InstanceStoreError, config_store.ConfigStoreError) as exc:
+            self._set_error(str(exc))
+            return False
+        self._set_status("Setup saved. Choose the server and channel on the Game Presence page.")
+        self.load_setup()
+        return True
+
     def save_and_start(self) -> None:
         if not self.save_setup():
             return
@@ -1526,7 +1655,7 @@ class BotSetupDialog(QDialog):
 
     def copy_invite_link(self) -> None:
         try:
-            invite_url = build_discord_invite_url(self.application_id_edit.text())
+            invite_url = build_discord_invite_url(self.application_id_edit.text(), self.bot_type)
         except ValueError as exc:
             self._set_error(str(exc))
             return
@@ -1535,7 +1664,7 @@ class BotSetupDialog(QDialog):
 
     def open_invite_page(self) -> None:
         try:
-            invite_url = build_discord_invite_url(self.application_id_edit.text())
+            invite_url = build_discord_invite_url(self.application_id_edit.text(), self.bot_type)
         except ValueError as exc:
             self._set_error(str(exc))
             return
@@ -1590,14 +1719,14 @@ class BotSetupDialog(QDialog):
         self.finish_button.setEnabled(final_page)
         self.start_button.setVisible(final_page)
         self.start_button.setEnabled(final_page)
-        if index == 4:
+        if self.pages.widget(index) is self.invite_page:
             self._update_invite_preview()
         if final_page:
             self._update_ready_summary()
 
     def _update_invite_preview(self) -> None:
         try:
-            invite_url = build_discord_invite_url(self.application_id_edit.text())
+            invite_url = build_discord_invite_url(self.application_id_edit.text(), self.bot_type)
         except ValueError as exc:
             self.invite_link_edit.setText(f"Incomplete: {exc}")
             return
@@ -1625,10 +1754,17 @@ class BotSetupDialog(QDialog):
             f"{'[OK]' if token_configured else '[MISSING]'} Token configured locally" + ("" if token_configured else " - paste token before starting"),
             f"{'[OK]' if application_id_valid else '[MISSING]'} Application ID entered" + ("" if application_id_valid else " - required for invite link"),
             f"{'[OK]' if invite_ready else '[MISSING]'} Invite link ready" + ("" if invite_ready else " - enter Application ID"),
-            "[OK] Access settings are edited in this wizard and saved locally when you click Save",
+            (
+                "[NEXT] Server, channel, delays and cooldowns: Manager -> Game Presence page"
+                if self.is_game_presence
+                else "[OK] Access settings are edited in this wizard and saved locally when you click Save"
+            ),
             "",
             "USER-CONFIRMED DISCORD STEPS:",
-            f"{'[OK]' if self.intent_ack_checkbox.isChecked() else '[ACTION]'} Server Members Intent user-confirmed external step" + ("" if self.intent_ack_checkbox.isChecked() else " - Manager cannot verify this automatically"),
+            f"{'[OK]' if self.intent_ack_checkbox.isChecked() else '[ACTION]'} "
+            + ("Presence Intent + Server Members Intent" if self.is_game_presence else "Server Members Intent")
+            + " user-confirmed external step"
+            + ("" if self.intent_ack_checkbox.isChecked() else " - Manager cannot verify this automatically"),
             f"{'[OK]' if self.invited_ack_checkbox.isChecked() else '[ACTION]'} Bot invited user-confirmed external step" + ("" if self.invited_ack_checkbox.isChecked() else " - open invite page and authorize the bot"),
         ]
         self.ready_summary_label.setText("\n".join(lines))
@@ -1661,8 +1797,12 @@ class ManagerMainWindow(QMainWindow):
         self._allow_close = False
         self._shutdown_in_progress = False
 
-        self._provider_tests: dict[str, tuple[bool, str]] = {}
-        self._provider_tests_running: set[str] = set()
+        # Keyed by (bot instance ID, provider ID): every bot has its own keys.
+        self._provider_tests: dict[tuple[str, str], tuple[bool, str]] = {}
+        self._provider_tests_running: set[tuple[str, str]] = set()
+        self.ai_bot_combo = QComboBox()
+        self.ai_bot_combo.setMinimumWidth(260)
+        self.ai_bot_combo.currentIndexChanged.connect(lambda _index: self.refresh_ai_overview())
         self._previous_states: dict[str, str] = {}
         self.group_store = manager_groups.GroupStore(app_paths.CONFIG_DIR / manager_groups.FILE_NAME)
         self.group_tabs = QTabBar()
@@ -1708,7 +1848,7 @@ class ManagerMainWindow(QMainWindow):
         self.restart_button.clicked.connect(self.restart_selected)
         self.setup_button.clicked.connect(self.setup_selected_bot)
         self.edit_config_button.clicked.connect(self.edit_selected_config)
-        self.create_admin_button.clicked.connect(self.create_admin_instance)
+        self.create_admin_button.clicked.connect(self.create_bot_instance)
         self.ai_providers_button.clicked.connect(self.open_ai_providers)
 
         self.pages = QStackedWidget()
@@ -1879,6 +2019,7 @@ class ManagerMainWindow(QMainWindow):
         state_row.addWidget(self.bot_state_label)
         state_row.addStretch(1)
         self.bot_facts_label = dash.muted("")
+        self.bot_facts_label.setWordWrap(True)
         self.bot_facts_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         bot_text = QVBoxLayout()
         bot_text.setSpacing(4)
@@ -1915,6 +2056,9 @@ class ManagerMainWindow(QMainWindow):
         providers_panel = dash.Panel("\U0001f9e0", "AI Providers")
         configure = providers_panel.add_header_button("Configure")
         configure.clicked.connect(lambda: self.open_ai_providers())
+        self.dashboard_ai_bot_label = dash.muted("")
+        self.dashboard_ai_bot_label.setWordWrap(True)
+        providers_panel.body.addWidget(self.dashboard_ai_bot_label)
         self.provider_rows: list[dash.ProviderRow] = []
         for row in self._make_provider_rows():
             providers_panel.body.addWidget(row)
@@ -1965,17 +2109,12 @@ class ManagerMainWindow(QMainWindow):
         return self.terminal_panel
 
     def _build_presence_page(self) -> QWidget:
+        # The panel lists only Game Presence bot instances; Admin instances are
+        # used just to detect settings left over from the old Admin module.
         self.presence_panel = manager_game_presence.GamePresencePanel(
-            self._terminal_bots, self._config_api, self.restart_instance
+            self._all_bots, self._config_api, self.restart_instance
         )
         return self.presence_panel
-
-    def _presence_enabled(self, instance_id: str) -> bool:
-        try:
-            section = self._config_api.get_config_snapshot(instance_id).effective.get("game_presence")
-        except Exception:
-            return False
-        return isinstance(section, dict) and section.get("enabled") is True
 
     def restart_instance(self, instance_id: str) -> None:
         """Restart one bot through the normal lifecycle path (used by module pages)."""
@@ -1986,12 +2125,16 @@ class ManagerMainWindow(QMainWindow):
         if self._select_instance_by_id(instance_id):
             self.restart_selected()
 
-    def _terminal_bots(self) -> list[tuple[str, str, manager_core.InstanceInfo]]:
+    def _all_bots(self) -> list[tuple[str, str, manager_core.InstanceInfo]]:
         bots = []
         for info in self._last_infos:
             group = self.group_store.group_of(info.instance_id)
             bots.append((info.instance_id, f"{group} · {info.display_name}", info))
         return bots
+
+    def _terminal_bots(self) -> list[tuple[str, str, manager_core.InstanceInfo]]:
+        """The AI terminal talks to Admin bots only (Game Presence has no AI tools)."""
+        return [bot for bot in self._all_bots() if bot[2].bot_type == ADMIN_BOT_TYPE_ID]
 
     # -- bot groups (tabs) -----------------------------------------------------
 
@@ -2135,10 +2278,16 @@ class ManagerMainWindow(QMainWindow):
         title = QLabel("AI Providers")
         title.setObjectName("heroSubtitle")
         description = dash.muted(
-            "Keys stay on this PC. The planning engine reads a short tool catalog and writes the plan; "
-            "the execution engine runs it with only the planned tools."
+            "Every bot has its OWN AI keys, models and routing (separate quotas). Choose the bot first. Keys stay "
+            "on this PC. The planning engine reads a short tool catalog and writes the plan; the execution engine "
+            "runs it with only the planned tools. A Game Presence bot uses AI only to vary message wording."
         )
         description.setWordWrap(True)
+        bot_row = QHBoxLayout()
+        bot_row.addWidget(QLabel("Bot:"))
+        bot_row.addWidget(self.ai_bot_combo, 1)
+        self.ai_bot_hint = dash.muted("")
+        self.ai_bot_hint.setWordWrap(True)
         routing_panel = dash.Panel("\U0001f500", "Routing")
         routing_button = routing_panel.add_header_button("Change Routing")
         routing_button.clicked.connect(lambda: self.open_ai_providers("Routing"))
@@ -2166,6 +2315,8 @@ class ManagerMainWindow(QMainWindow):
         layout.setSpacing(14)
         layout.addWidget(title)
         layout.addWidget(description)
+        layout.addLayout(bot_row)
+        layout.addWidget(self.ai_bot_hint)
         layout.addWidget(routing_panel)
         layout.addWidget(providers_panel)
         layout.addWidget(safety_panel)
@@ -2316,9 +2467,12 @@ class ManagerMainWindow(QMainWindow):
             facts = [
                 f"ID: {info.instance_id}",
                 f"Type: {info.bot_type_display_name} {info.bot_version}",
-                f"Commands: {len(dash.SLASH_COMMANDS)} slash · {self.tool_count} AI tools",
             ]
-            facts.append(f"Modules: AI assistant · Game Presence {'on' if self._presence_enabled(info.instance_id) else 'off'}")
+            if info.bot_type == ADMIN_BOT_TYPE_ID:
+                facts.append(f"Commands: {len(dash.SLASH_COMMANDS)} slash · {self.tool_count} AI tools")
+            capabilities = BOT_TYPE_CAPABILITIES.get(info.bot_type)
+            if capabilities:
+                facts.append(f"Can do: {capabilities}")
             if info.pid is not None:
                 facts.append(f"PID: {info.pid}")
             if info.uptime_seconds is not None:
@@ -2332,10 +2486,66 @@ class ManagerMainWindow(QMainWindow):
         self.side_uptime_label.setText(f"Uptime: {uptime}")
         self._refresh_log_choices()
 
+    # -- per-bot AI storage ----------------------------------------------------
+
+    def _refresh_ai_choices(self) -> None:
+        current = self.ai_bot_combo.currentData()
+        wanted = [(info.instance_id, f"{info.display_name} ({info.instance_id}) · {info.bot_type_display_name}") for info in self._last_infos]
+        existing = [(self.ai_bot_combo.itemData(index), self.ai_bot_combo.itemText(index)) for index in range(self.ai_bot_combo.count())]
+        if existing == wanted:
+            return
+        self.ai_bot_combo.blockSignals(True)
+        self.ai_bot_combo.clear()
+        for instance_id, label in wanted:
+            self.ai_bot_combo.addItem(label, instance_id)
+        index = self.ai_bot_combo.findData(current)
+        if index < 0:
+            # Default: the first Admin bot (the one that uses AI the most).
+            index = next((i for i, info in enumerate(self._last_infos) if info.bot_type == ADMIN_BOT_TYPE_ID), 0)
+        self.ai_bot_combo.setCurrentIndex(index if self.ai_bot_combo.count() else -1)
+        self.ai_bot_combo.blockSignals(False)
+        self.refresh_ai_overview()
+
+    def _ai_info(self) -> manager_core.InstanceInfo | None:
+        instance_id = self.ai_bot_combo.currentData()
+        return next((info for info in self._last_infos if info.instance_id == instance_id), None)
+
+    def ai_stores_for(self, instance_id: str) -> ai_storage.InstanceAIStores:
+        """AI settings + keys of ONE bot instance (never another bot's files)."""
+        return ai_storage.for_instance_id(instance_id, must_exist=False)
+
+    def _ai_stores(self) -> ai_storage.InstanceAIStores | None:
+        info = self._ai_info()
+        if info is None:
+            return None
+        try:
+            return self.ai_stores_for(info.instance_id)
+        except (ai_storage.AIStorageError, instance_store.InstanceStoreError):
+            return None
+
     def refresh_ai_overview(self) -> None:
+        info = self._ai_info()
+        stores = self._ai_stores()
+        bot_text = f"Showing AI of: {info.display_name} ({info.instance_id})" if info is not None else "Add a bot first."
+        self.dashboard_ai_bot_label.setText(bot_text)
+        if info is not None and info.bot_type == GAME_PRESENCE_BOT_TYPE_ID:
+            self.ai_bot_hint.setText(
+                "This Game Presence bot uses its own keys only to vary suggestion wording (execution engine, no tools). "
+                "Without keys it posts the built-in templates."
+            )
+        else:
+            self.ai_bot_hint.setText("")
+        if stores is None:
+            for row in self.provider_rows:
+                row.set_state("No bot selected", "muted", None, [])
+                row.test_button.setEnabled(False)
+            self.ai_card.update_card("No bot", "muted", "Add a bot first")
+            self.routing_card.update_card("plan: not set", "muted", "run: not set", "muted")
+            self.ai_routing_label.setText("Add a bot first; AI keys and routing are stored per bot.")
+            return
         overview = dash.provider_overview(
-            ai_platform.AISettingsStore(),
-            ai_platform.CredentialStore(),
+            stores.settings,
+            stores.credentials,
             (
                 (GROQ_PROVIDER_ID, GROQ_PROFILE_ID, GROQ_CREDENTIAL_REF),
                 (GEMINI_PROVIDER_ID, GEMINI_PROFILE_ID, GEMINI_CREDENTIAL_REF),
@@ -2346,8 +2556,9 @@ class ManagerMainWindow(QMainWindow):
         configured = [name for pid, name in ((GROQ_PROVIDER_ID, "Groq"), (GEMINI_PROVIDER_ID, "Gemini")) if providers[pid]["configured"]]
         for row in self.provider_rows:
             facts = providers[row.provider_id]
-            tested = self._provider_tests.get(row.provider_id)
-            if row.provider_id in self._provider_tests_running:
+            test_key = (stores.instance_id, row.provider_id)
+            tested = self._provider_tests.get(test_key)
+            if test_key in self._provider_tests_running:
                 text, color = "Testing...", "warn"
             elif tested is not None:
                 text, color = (tested[1], "ok") if tested[0] else (tested[1], "bad")
@@ -2356,7 +2567,7 @@ class ManagerMainWindow(QMainWindow):
             else:
                 text, color = "Not configured", "muted"
             row.set_state(text, color, facts["model"], facts["roles"])
-            row.test_button.setEnabled(facts["configured"] and row.provider_id not in self._provider_tests_running)
+            row.test_button.setEnabled(facts["configured"] and test_key not in self._provider_tests_running)
         if not overview["valid"]:
             self.ai_card.update_card("Settings invalid", "bad", "Open AI Providers to fix")
         else:
@@ -2375,16 +2586,22 @@ class ManagerMainWindow(QMainWindow):
     # -- AI provider tests ---------------------------------------------------
 
     def test_provider(self, provider_id: str) -> None:
-        if provider_id in self._provider_tests_running:
+        stores = self._ai_stores()
+        name = "Groq" if provider_id == GROQ_PROVIDER_ID else "Gemini"
+        if stores is None:
+            self._set_light_error(f"{name}: add a bot first; AI keys are stored per bot.")
+            return
+        test_key = (stores.instance_id, provider_id)
+        if test_key in self._provider_tests_running:
             return
         credential_ref = GROQ_CREDENTIAL_REF if provider_id == GROQ_PROVIDER_ID else GEMINI_CREDENTIAL_REF
         factory = create_groq_provider if provider_id == GROQ_PROVIDER_ID else create_gemini_provider
-        name = "Groq" if provider_id == GROQ_PROVIDER_ID else "Gemini"
-        credential_store = ai_platform.CredentialStore()
+        # The selected bot's own key; another bot's key is never used.
+        credential_store = stores.credentials
         if not credential_store.exists(provider_id, credential_ref):
-            self._set_light_error(f"{name}: no API key saved. Open AI Providers to add one.")
+            self._set_light_error(f"{name}: no API key saved for this bot. Open AI Providers to add one.")
             return
-        self._provider_tests_running.add(provider_id)
+        self._provider_tests_running.add(test_key)
         self.refresh_ai_overview()
 
         def run_action() -> ai_platform.Availability:
@@ -2392,23 +2609,27 @@ class ManagerMainWindow(QMainWindow):
 
             return asyncio.run(factory(credential_store).test_connection(credential_ref))
 
-        self._start_worker(run_action, lambda result: self._finish_provider_test(provider_id, name, result))
+        self._start_worker(run_action, lambda result: self._finish_provider_test(test_key, name, result))
 
     def test_all_providers(self) -> None:
-        credential_store = ai_platform.CredentialStore()
+        stores = self._ai_stores()
+        if stores is None:
+            self._set_light_error("Add a bot first; AI keys are stored per bot.")
+            return
+        credential_store = stores.credentials
         started = False
         for provider_id, credential_ref in ((GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF), (GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF)):
             if credential_store.exists(provider_id, credential_ref):
                 self.test_provider(provider_id)
                 started = True
         if not started:
-            self._set_light_error("No AI provider key is saved yet. Open AI Providers to add one.")
+            self._set_light_error("No AI provider key is saved for this bot yet. Open AI Providers to add one.")
 
-    def _finish_provider_test(self, provider_id: str, name: str, result: ActionResult) -> None:
-        self._provider_tests_running.discard(provider_id)
+    def _finish_provider_test(self, test_key: tuple[str, str], name: str, result: ActionResult) -> None:
+        self._provider_tests_running.discard(test_key)
         availability = result.value if result.ok else None
         if isinstance(availability, ai_platform.Availability) and availability.ok:
-            self._provider_tests[provider_id] = (True, "Connected")
+            self._provider_tests[test_key] = (True, "Connected")
             self.activity.add("AI", f"{name} connection test successful.")
         else:
             state = getattr(availability, "state", None)
@@ -2417,7 +2638,7 @@ class ManagerMainWindow(QMainWindow):
                 ai_platform.AvailabilityState.ACCESS_FORBIDDEN: "Access forbidden",
                 ai_platform.AvailabilityState.CREDENTIAL_MISSING: "No key saved",
             }.get(state, "Unavailable")
-            self._provider_tests[provider_id] = (False, reason)
+            self._provider_tests[test_key] = (False, reason)
             self.activity.add("Error", f"{name} connection test failed: {reason}.")
         self.refresh_ai_overview()
 
@@ -2491,6 +2712,7 @@ class ManagerMainWindow(QMainWindow):
         self._set_status(f"Loaded {len(infos)} instance(s).")
         self._update_selected_details()
         self._refresh_dashboard()
+        self._refresh_ai_choices()
 
     def start_selected(self) -> None:
         self._dispatch_lifecycle_action("start", lambda instance_id: self.manager.start(instance_id))
@@ -2522,13 +2744,14 @@ class ManagerMainWindow(QMainWindow):
             self._select_instance_by_id(instance_id)
             self.start_selected()
 
-    def create_admin_instance(self) -> None:
-        dialog = CreateAdminInstanceDialog(self)
+    def create_bot_instance(self) -> None:
+        """New bot instance of any registered type (own token, config, keys, data)."""
+        dialog = CreateBotInstanceDialog(self)
         if dialog.exec() != QDialog.Accepted:
             return
-        instance_id, display_name = dialog.values()
+        bot_type, instance_id, display_name = dialog.values()
         try:
-            self._instance_api.create_instance("admin", instance_id, display_name=display_name)
+            self._instance_api.create_instance(bot_type, instance_id, display_name=display_name)
         except (instance_store.InstanceStoreError, bot_registry.BotRegistryError, OSError) as exc:
             self._show_error(str(exc))
             return
@@ -2544,7 +2767,17 @@ class ManagerMainWindow(QMainWindow):
         self.setup_selected_bot()
 
     def open_ai_providers(self, tab: str | None = None) -> None:
-        dialog = AIProviderSettingsDialog(parent=self)
+        info = self._ai_info()
+        stores = self._ai_stores()
+        if info is None or stores is None:
+            self._show_error("Add a bot first. AI keys, models and routing are stored per bot.")
+            return
+        dialog = AIProviderSettingsDialog(
+            settings_store=stores.settings,
+            credential_store=stores.credentials,
+            parent=self,
+            bot_label=f"{info.display_name} ({info.instance_id})",
+        )
         if tab:
             tabs = getattr(dialog, "provider_tabs", None)
             if isinstance(tabs, QTabWidget):
@@ -2718,6 +2951,11 @@ class ManagerMainWindow(QMainWindow):
 def bootstrap_for_gui() -> None:
     app_paths.ensure_user_data()
     admin_instance.ensure_admin_instance()
+    # One-time copy of the old global AI keys/settings into the single Admin
+    # bot (never into a Game Presence bot); safe to run on every start.
+    result = ai_storage.migrate_legacy_global_ai()
+    if result.status in ("migrated", "ambiguous", "failed"):
+        print(result.message)
 
 
 def main(manager: manager_core.BotProcessManager | None = None) -> int:
