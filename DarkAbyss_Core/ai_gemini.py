@@ -25,7 +25,9 @@ ALLOWED_REASONING_EFFORT = {"low", "medium", "high"}
 ALLOWED_OPTIONS = {"reasoning_effort", "max_output_tokens"}
 # Same retry contract as the Groq adapter: off by default, enabled by the bot's
 # provider registry; a RetryInfo.retryDelay hint is honoured up to the cap.
-DEFAULT_RETRY_DELAYS = (3.0, 8.0)
+# Gemini answers 503 "high demand" for tool-calling requests in bursts; three
+# spaced retries ride out most spikes before the fallback profile takes over.
+DEFAULT_RETRY_DELAYS = (2.0, 5.0, 10.0)
 MAX_RETRY_WAIT_SECONDS = 30.0
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 

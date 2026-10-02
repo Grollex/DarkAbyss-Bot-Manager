@@ -456,25 +456,17 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             "primary",
             responses=[
                 ai_platform.AIResponse(
-                    tool_calls=(ai_platform.AIToolCall(call_id="call-1", tool_name="list_channels", arguments={}),)
+                    tool_calls=(
+                        ai_platform.AIToolCall(
+                            call_id="call-1", tool_name="send_message", arguments={"channel_id": "100", "content": "hi"}
+                        ),
+                    )
                 ),
                 RuntimeError("after side effect"),
             ],
         )
         fallback = FakeProvider(ai_platform, "fallback", responses=[ai_platform.AIResponse(content="fallback")])
-        settings = ai_platform.AISettings(
-            profiles=(self.profile(ai_platform, "primary", "primary"), self.profile(ai_platform, "fallback", "fallback")),
-            routing=ai_platform.RoutingConfig(
-                routine_profile_id="primary",
-                routine_fallback_profile_ids=("fallback",),
-            ),
-        )
-        orchestrator = self.make_orchestrator(
-            ai_platform,
-            ai_orchestrator,
-            settings,
-            {"primary": primary, "fallback": fallback},
-        )
+        orchestrator = self.read_fallback_orchestrator(ai_platform, ai_orchestrator, primary, fallback)
 
         result = await orchestrator.orchestrate(
             ai_orchestrator.OrchestratorRequest(messages=(self.user_message(ai_platform),), task_class="ROUTINE"),
@@ -482,8 +474,49 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.UNAVAILABLE)
-        self.assertEqual(result.executed_tools[0].tool_name, "list_channels")
+        self.assertEqual(result.executed_tools[0].tool_name, "send_message")
         self.assertEqual(fallback.requests, [])
+
+    async def test_provider_failure_after_only_read_tools_falls_back_from_scratch(self):
+        ai_platform, ai_orchestrator, admin_tools = load_modules()
+        primary = FakeProvider(
+            ai_platform,
+            "primary",
+            responses=[
+                ai_platform.AIResponse(
+                    tool_calls=(ai_platform.AIToolCall(call_id="call-1", tool_name="list_channels", arguments={}),)
+                ),
+                RuntimeError("503 high demand"),
+            ],
+        )
+        fallback = FakeProvider(ai_platform, "fallback", responses=[ai_platform.AIResponse(content="fallback done")])
+        orchestrator = self.read_fallback_orchestrator(ai_platform, ai_orchestrator, primary, fallback)
+
+        result = await orchestrator.orchestrate(
+            ai_orchestrator.OrchestratorRequest(messages=(self.user_message(ai_platform),), task_class="ROUTINE"),
+            executor=FakeExecutor(admin_tools),
+        )
+
+        self.assertEqual(result.status, ai_orchestrator.OrchestratorStatus.COMPLETED)
+        self.assertEqual(result.content, "fallback done")
+        self.assertTrue(result.fallback_used)
+        # The fallback starts over from the original messages only.
+        self.assertFalse(any(m.role.value == "tool" for m in fallback.requests[0][0].messages))
+
+    def read_fallback_orchestrator(self, ai_platform, ai_orchestrator, primary, fallback):
+        settings = ai_platform.AISettings(
+            profiles=(self.profile(ai_platform, "primary", "primary"), self.profile(ai_platform, "fallback", "fallback")),
+            routing=ai_platform.RoutingConfig(
+                routine_profile_id="primary",
+                routine_fallback_profile_ids=("fallback",),
+            ),
+        )
+        return self.make_orchestrator(
+            ai_platform,
+            ai_orchestrator,
+            settings,
+            {"primary": primary, "fallback": fallback},
+        )
 
     async def test_limits_stop_unbounded_tool_loops_and_large_batches(self):
         ai_platform, ai_orchestrator, admin_tools = load_modules()

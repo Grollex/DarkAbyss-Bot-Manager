@@ -489,8 +489,9 @@ class AIOrchestrator:
             )
             if result.status is not OrchestratorStatus.UNAVAILABLE:
                 return result
-            if result.executed_tools:
-                # Never fall back after any side effect.
+            if _has_side_effects(result.executed_tools):
+                # Never fall back after any side effect. Read-only tools change
+                # nothing, so a fallback profile may start the request over.
                 return result
             attempts = result.attempts
             last_result = result
@@ -1049,6 +1050,17 @@ async def _execute_tool_batch(tool_plan: tuple[ValidatedToolCall, ...], executor
             fatal = isinstance(data, dict) and data.get("fatal") is True
             return _ExecutionBatch(tuple(summaries), tuple(tool_messages), f"Tool failed: {call.tool_name}", fatal=fatal)
     return _ExecutionBatch(tuple(summaries), tuple(tool_messages))
+
+
+def _has_side_effects(executed_tools: tuple[ExecutedToolSummary, ...]) -> bool:
+    """True if any executed tool is not a registered READ tool (unknown = side effect)."""
+    for tool in executed_tools:
+        try:
+            if admin_tools.get_tool_definition(tool.tool_name).kind != "read":
+                return True
+        except admin_tools.AdminToolError:
+            return True
+    return False
 
 
 def _can_recover(context: _RunContext, executed: _ExecutionBatch, tool_errors_used: int) -> bool:
