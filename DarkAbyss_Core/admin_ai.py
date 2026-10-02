@@ -1,7 +1,9 @@
-"""Discord /ai transport for the Admin bot (AI-4).
+"""Discord AI transport for the Admin bot (AI-4 /ai, AI-5 control channel).
 
 This module adapts the provider-neutral AI-3A orchestrator to Discord without
-coupling ``ai_orchestrator`` to Discord. It owns everything transport-specific:
+coupling ``ai_orchestrator`` to Discord. Slash /ai (ephemeral) and natural
+messages in one configured control channel (public) share one code path. It
+owns everything transport-specific:
 
 * explicit AI whitelist authorization (separate from /execute),
 * confirmation ownership (requesting user + guild + channel),
@@ -18,7 +20,9 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Awaitable, Callable
 
 import discord
@@ -334,6 +338,40 @@ def render_executed_tools(executed_tools: Any) -> str:
     return clip_text("\n".join(lines), 900)
 
 
+PROVIDER_DISPLAY_NAMES = {"groq": "Groq", "gemini": "Gemini"}
+AI_ENGINE_FOOTER_CHARS = 90
+
+
+def render_engine_footer(result: Any) -> str:
+    """Compact "which engine answered" line from public OrchestratorResult fields.
+
+    Uses only provider_id / profile_id / model_id / fallback_used; never
+    credential refs, attempts, errors or provider payloads. Empty if absent.
+    """
+    provider_id = getattr(result, "provider_id", None)
+    profile_id = getattr(result, "profile_id", None)
+    model_id = getattr(result, "model_id", None)
+    parts = []
+    if isinstance(provider_id, str) and provider_id:
+        parts.append(PROVIDER_DISPLAY_NAMES.get(provider_id, provider_id))
+    for value in (profile_id, model_id):
+        if isinstance(value, str) and value:
+            parts.append(value)
+    if not parts:
+        return ""
+    if getattr(result, "fallback_used", False) is True:
+        parts.append("fallback")
+    text = " · ".join(_code_safe(part) for part in parts)
+    text = "".join(char for char in text if char.isprintable())
+    return "-# " + clip_text(text, AI_ENGINE_FOOTER_CHARS)
+
+
+def with_footer(text: str, footer: str) -> str:
+    if not footer:
+        return text
+    return f"{clip_text(text, AI_MESSAGE_CHUNK_CHARS)}\n{footer}"
+
+
 def render_result_messages(result: Any) -> list[str]:
     """Render a non-confirmation orchestrator result into safe Discord texts."""
     status = getattr(getattr(result, "status", None), "value", None)
@@ -391,6 +429,8 @@ class PendingConfirmation:
     binding: RequestBinding
     summary: str
     resolved: bool = False
+    # "ephemeral" (slash /ai) or "public" (control channel); kept across approval.
+    delivery_mode: Any = "ephemeral"
 
 
 class ConfirmationView(discord.ui.View):
@@ -438,6 +478,80 @@ def _default_orchestrator_factory() -> Any:
 AuditFn = Callable[[Any, dict, str, str], Awaitable[str | None]]
 
 
+class DeliveryMode(str, Enum):
+    """Where the AI control plane of one request is shown."""
+
+    EPHEMERAL = "ephemeral"  # slash /ai
+    PUBLIC = "public"  # natural messages in the configured control channel
+
+
+class InteractionDelivery:
+    """Sends through an interaction's follow-up webhook (ephemeral or public)."""
+
+    def __init__(self, interaction: Any, mode: Any) -> None:
+        self.interaction = interaction
+        self.mode = DeliveryMode(mode)
+
+    async def send(self, content: str, *, view: Any = None) -> Any:
+        kwargs: dict[str, Any] = {
+            "ephemeral": self.mode is DeliveryMode.EPHEMERAL,
+            "allowed_mentions": no_mentions(),
+        }
+        if view is not None:
+            kwargs["view"] = view
+            kwargs["wait"] = True
+        return await self.interaction.followup.send(clip_text(content, DISCORD_MESSAGE_LIMIT), **kwargs)
+
+
+class ChannelDelivery:
+    """Public delivery into the control channel; first message replies to the request."""
+
+    mode = DeliveryMode.PUBLIC
+
+    def __init__(self, channel: Any, reply_to: Any = None) -> None:
+        self.channel = channel
+        self.reply_to = reply_to
+
+    async def send(self, content: str, *, view: Any = None) -> Any:
+        kwargs: dict[str, Any] = {"allowed_mentions": no_mentions()}
+        if view is not None:
+            kwargs["view"] = view
+        content = clip_text(content, DISCORD_MESSAGE_LIMIT)
+        reply_to, self.reply_to = self.reply_to, None
+        if reply_to is not None:
+            try:
+                return await reply_to.reply(content, mention_author=False, **kwargs)
+            except Exception:
+                pass
+        return await self.channel.send(content, **kwargs)
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    """Minimal guild + user pair for executor/audit when there is no interaction."""
+
+    guild: Any
+    user: Any
+
+
+@asynccontextmanager
+async def _maybe_typing(channel: Any):
+    manager = None
+    try:
+        manager = channel.typing()
+        await manager.__aenter__()
+    except Exception:
+        manager = None
+    try:
+        yield
+    finally:
+        if manager is not None:
+            try:
+                await manager.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
 class AITransport:
     def __init__(
         self,
@@ -454,11 +568,14 @@ class AITransport:
         self._orchestrator_factory = orchestrator_factory or _default_orchestrator_factory
         self._view_factory = view_factory or ConfirmationView
         self._orchestrator: Any = None
+        # Natural-message listener gate, fixed at startup together with the
+        # Message Content Intent decision. None = natural AI disabled.
+        self.control_channel_id: int | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
     def get_orchestrator(self) -> Any:
-        """Lazy per-process orchestrator; a failure is not cached (retry later)."""
+        """Lazy per-process orchestrator shared by /ai and the control channel."""
         if self._orchestrator is None:
             try:
                 self._orchestrator = self._orchestrator_factory()
@@ -466,6 +583,9 @@ class AITransport:
                 print(f"AI orchestrator unavailable: {type(exc).__name__}")
                 return None
         return self._orchestrator
+
+    def set_control_channel(self, channel_id: Any) -> None:
+        self.control_channel_id = channel_id if isinstance(channel_id, int) and not isinstance(channel_id, bool) else None
 
     def _try_load_config(self) -> dict | None:
         try:
@@ -478,18 +598,20 @@ class AITransport:
 
     @staticmethod
     async def _respond(interaction: Any, content: str) -> None:
+        """Ephemeral reply to one interaction (denials, validation errors)."""
         content = clip_text(content, AI_MESSAGE_CHUNK_CHARS)
         if interaction.response.is_done():
             await interaction.followup.send(content, ephemeral=True, allowed_mentions=no_mentions())
         else:
             await interaction.response.send_message(content, ephemeral=True, allowed_mentions=no_mentions())
 
-    async def _send_result(self, interaction: Any, result: Any, binding: RequestBinding) -> None:
+    async def _send_result(self, delivery: Any, result: Any, binding: RequestBinding) -> None:
         status = getattr(getattr(result, "status", None), "value", None)
+        footer = render_engine_footer(result)
         if status == "NEEDS_CONFIRMATION" and getattr(result, "confirmation_id", None):
             executed = render_executed_tools(getattr(result, "executed_tools", ()))
             if executed:
-                await interaction.followup.send(executed, ephemeral=True, allowed_mentions=no_mentions())
+                await delivery.send(executed)
             tool_plan = getattr(result, "tool_plan", ())
             try:
                 pages = render_tool_plan_pages(tool_plan)
@@ -500,30 +622,34 @@ class AITransport:
                 if not too_large:
                     print(f"/ai plan preview failed: {type(exc).__name__}")
                 cancelled = await self._cancel_unreviewable(result.confirmation_id)
-                await interaction.followup.send(
-                    unreviewable_plan_message(too_large=too_large, cancelled=cancelled, earlier_actions=bool(executed)),
-                    ephemeral=True,
-                    allowed_mentions=no_mentions(),
+                await delivery.send(
+                    with_footer(
+                        unreviewable_plan_message(too_large=too_large, cancelled=cancelled, earlier_actions=bool(executed)),
+                        footer,
+                    )
                 )
                 return
             for page in pages:
-                await interaction.followup.send(page, ephemeral=True, allowed_mentions=no_mentions())
-            state = PendingConfirmation(confirmation_id=result.confirmation_id, binding=binding, summary=summary)
-            view = self._view_factory(self, state)
-            message = await interaction.followup.send(
-                summary,
-                ephemeral=True,
-                allowed_mentions=no_mentions(),
-                view=view,
-                wait=True,
+                await delivery.send(page)
+            state = PendingConfirmation(
+                confirmation_id=result.confirmation_id,
+                binding=binding,
+                summary=with_footer(summary, footer),
+                delivery_mode=delivery.mode,
             )
+            view = self._view_factory(self, state)
+            message = await delivery.send(state.summary, view=view)
             try:
                 view.message = message
             except Exception:
                 pass
             return
-        for text in render_result_messages(result):
-            await interaction.followup.send(text, ephemeral=True, allowed_mentions=no_mentions())
+        texts = render_result_messages(result)
+        if footer and texts:
+            # Attach the engine indicator to the primary answer message.
+            texts[0] = with_footer(texts[0], footer)
+        for text in texts:
+            await delivery.send(text)
 
     async def _cancel_unreviewable(self, confirmation_id: str) -> bool:
         """Reject a pending core confirmation whose plan cannot be reviewed.
@@ -550,15 +676,19 @@ class AITransport:
 
     # -- executor ----------------------------------------------------------
 
-    def build_executor(self, interaction: Any, binding: RequestBinding) -> Callable[[str, dict], Awaitable[Any]]:
-        """Executor bound to ONE Discord interaction (fresh per approval)."""
+    def build_executor(self, source: Any, binding: RequestBinding) -> Callable[[str, dict], Awaitable[Any]]:
+        """Executor bound to ONE requester context (interaction or control message).
+
+        ``source`` provides ``.guild`` and ``.user``; for approvals it is the fresh
+        button interaction.
+        """
 
         async def executor(tool_name: str, arguments: dict) -> admin_tools.ToolResult:
             config = self._try_load_config()
-            guild = getattr(interaction, "guild", None)
+            guild = getattr(source, "guild", None)
             if config is None or guild is None or getattr(guild, "id", None) != binding.guild_id:
                 return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE)
-            if getattr(getattr(interaction, "user", None), "id", None) != binding.user_id:
+            if getattr(getattr(source, "user", None), "id", None) != binding.user_id:
                 return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE)
             # Fresh member state (current roles), fail closed if not resolvable.
             member = guild.get_member(binding.user_id) if hasattr(guild, "get_member") else None
@@ -573,7 +703,7 @@ class AITransport:
                 suppress_mentions=True,
             )
             result = await admin_tools.execute_tool(context, tool_name, arguments)
-            audit_failure = await self._safe_audit(interaction, config, tool_name, result.message)
+            audit_failure = await self._safe_audit(source, config, tool_name, result.message)
             if result.ok and audit_failure:
                 result = admin_tools.ToolResult(
                     True,
@@ -585,13 +715,54 @@ class AITransport:
 
         return executor
 
-    async def _safe_audit(self, interaction: Any, config: dict, tool_name: str, message: str) -> str | None:
+    async def _safe_audit(self, source: Any, config: dict, tool_name: str, message: str) -> str | None:
         if self._audit is None:
             return None
         try:
-            return await self._audit(interaction, config, f"{AI_SOURCE} {tool_name}", clip_text(message, 1000))
+            return await self._audit(source, config, f"{AI_SOURCE} {tool_name}", clip_text(message, 1000))
         except Exception as exc:
             return f"Audit logging failed: {type(exc).__name__}"
+
+    # -- shared orchestration ---------------------------------------------
+
+    async def _run_request(
+        self,
+        *,
+        delivery: Any,
+        source: Any,
+        binding: RequestBinding,
+        prompt: str,
+        task_mode: str,
+    ) -> None:
+        """One independent request (no cross-message memory): one USER message."""
+        try:
+            ai_platform, ai_orchestrator = _import_ai_modules()
+            orchestrator = self.get_orchestrator()
+            if orchestrator is None:
+                await delivery.send(UNAVAILABLE_MESSAGE)
+                return
+            request = ai_orchestrator.OrchestratorRequest(
+                messages=(ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=prompt),),
+                task_class=ai_platform.TaskClass(TASK_MODES[task_mode]),
+            )
+            policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=True)
+        except Exception as exc:
+            print(f"/ai request failed: {type(exc).__name__}")
+            await delivery.send(UNAVAILABLE_MESSAGE)
+            return
+        try:
+            result = await orchestrator.orchestrate(
+                request,
+                executor=self.build_executor(source, binding),
+                confirmation_policy=policy,
+            )
+        except Exception as exc:
+            # The core contains provider/executor failures; reaching this means an
+            # unexpected error after tools may have run. Do not claim nothing ran.
+            print(f"/ai request failed: {type(exc).__name__}")
+            await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
+            return
+        await self._send_result(delivery, result, binding)
 
     # -- /ai ---------------------------------------------------------------
 
@@ -620,34 +791,68 @@ class AITransport:
             guild_id=interaction.guild.id,
             channel_id=getattr(interaction, "channel_id", None),
         )
-        try:
-            ai_platform, ai_orchestrator = _import_ai_modules()
-            orchestrator = self.get_orchestrator()
-            if orchestrator is None:
-                await self._respond(interaction, UNAVAILABLE_MESSAGE)
-                return
-            request = ai_orchestrator.OrchestratorRequest(
-                messages=(ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=prompt),),
-                task_class=ai_platform.TaskClass(TASK_MODES[selected_mode]),
-            )
-            policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=True)
-        except Exception as exc:
-            print(f"/ai request failed: {type(exc).__name__}")
-            await self._respond(interaction, UNAVAILABLE_MESSAGE)
+        await self._run_request(
+            delivery=InteractionDelivery(interaction, DeliveryMode.EPHEMERAL),
+            source=interaction,
+            binding=binding,
+            prompt=prompt,
+            task_mode=selected_mode,
+        )
+
+    # -- natural control channel (AI-5) -------------------------------------
+
+    def is_control_message_candidate(self, message: Any) -> bool:
+        """Cheap pre-filter before any config load, provider or reply.
+
+        Only real member messages with text, in a guild, in exactly the control
+        channel configured at startup, are candidates. Bots (including this
+        bot), webhooks, DMs and every other channel are ignored completely.
+        """
+        channel_id = self.control_channel_id
+        if channel_id is None:
+            return False
+        guild = getattr(message, "guild", None)
+        channel = getattr(message, "channel", None)
+        author = getattr(message, "author", None)
+        if guild is None or channel is None or author is None:
+            return False
+        if getattr(channel, "id", None) != channel_id:
+            return False
+        if getattr(message, "webhook_id", None) is not None:
+            return False
+        if getattr(author, "bot", False) is not False:
+            return False
+        if not isinstance(author, MEMBER_TYPES):
+            return False
+        content = getattr(message, "content", None)
+        return isinstance(content, str) and bool(content.strip())
+
+    async def handle_control_message(self, message: Any) -> None:
+        if not self.is_control_message_candidate(message):
             return
-        try:
-            result = await orchestrator.orchestrate(
-                request,
-                executor=self.build_executor(interaction, binding),
-                confirmation_policy=policy,
-            )
-        except Exception as exc:
-            # The core contains provider/executor failures; reaching this means an
-            # unexpected error after tools may have run. Do not claim nothing ran.
-            print(f"/ai request failed: {type(exc).__name__}")
-            await self._respond(interaction, UNEXPECTED_FAILURE_MESSAGE)
+        config = self._try_load_config()
+        if config is None:
             return
-        await self._send_result(interaction, result, binding)
+        # The live config must still name this channel (no restart needed to
+        # switch the feature off) and the author must be AI-whitelisted now.
+        if config.get("ai_control_channel_id") != message.channel.id:
+            return
+        if not actor_has_ai_access(message.author, message.guild, config):
+            return  # silently ignored: no provider call, no public reply
+        delivery = ChannelDelivery(message.channel, reply_to=message)
+        prompt = message.content
+        if len(prompt) > AI_PROMPT_MAX_CHARS:
+            await delivery.send(f"Message must be {AI_PROMPT_MAX_CHARS} characters or fewer for AI requests.")
+            return
+        binding = RequestBinding(user_id=message.author.id, guild_id=message.guild.id, channel_id=message.channel.id)
+        async with _maybe_typing(message.channel):
+            await self._run_request(
+                delivery=delivery,
+                source=RequestContext(guild=message.guild, user=message.author),
+                binding=binding,
+                prompt=prompt,
+                task_mode=DEFAULT_TASK_MODE,
+            )
 
     # -- confirmation buttons ---------------------------------------------
 
@@ -678,6 +883,7 @@ class AITransport:
             return
         # Ownership and fresh authorization are checked BEFORE the core is
         # called, so a failed check never consumes the pending confirmation.
+        # Denials are always ephemeral, even under a public control-channel plan.
         if not self._binding_matches(interaction, state.binding):
             await self._respond(interaction, NOT_OWNER_MESSAGE)
             return
@@ -710,8 +916,11 @@ class AITransport:
             )
         except Exception:
             if not interaction.response.is_done():
-                await interaction.response.defer(ephemeral=True, thinking=True)
+                await interaction.response.defer(ephemeral=DeliveryMode(state.delivery_mode) == DeliveryMode.EPHEMERAL, thinking=True)
 
+        # The continuation keeps the delivery mode of the original request:
+        # slash /ai stays ephemeral, the control channel stays public.
+        delivery = InteractionDelivery(interaction, state.delivery_mode)
         try:
             result = await orchestrator.approve_confirmation(
                 state.confirmation_id,
@@ -720,6 +929,6 @@ class AITransport:
             )
         except Exception as exc:
             print(f"/ai confirmation failed: {type(exc).__name__}")
-            await self._respond(interaction, UNEXPECTED_FAILURE_MESSAGE)
+            await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
             return
-        await self._send_result(interaction, result, state.binding)
+        await self._send_result(delivery, result, state.binding)

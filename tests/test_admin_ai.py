@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import importlib
+import io
 import json
 import re
 import sys
@@ -45,6 +47,14 @@ def import_admin_module():
     finally:
         if inserted:
             sys.modules.pop("msvcrt", None)
+
+
+def strip_engine_footer(text):
+    """Remove the trailing "-# provider · profile · model" engine line, if any."""
+    lines = text.split("\n")
+    if lines and lines[-1].startswith("-# "):
+        lines = lines[:-1]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +431,7 @@ class LazyAITests(AdminAITestBase):
         self.assertEqual(first.followup.sent[-1][0], self.admin_ai.UNAVAILABLE_MESSAGE)
         self.assertNotIn("secret-construction-detail", " ".join(first.all_texts()))
         second = await self.start(transport)
-        self.assertEqual(second.followup.sent[-1][0], "hello")
+        self.assertEqual(strip_engine_footer(second.followup.sent[-1][0]), "hello")
         self.assertEqual(len(attempts), 2)
 
     async def test_broken_ai_module_import_is_contained(self):
@@ -569,7 +579,7 @@ class ConfirmationTests(AdminAITestBase):
         self.assertTrue(view.stopped)
         self.assertIsNone(approval.response.edited[0]["view"])
         followup_texts = [content for content, _ in approval.followup.sent]
-        self.assertEqual(followup_texts[0], "sent it")
+        self.assertEqual(strip_engine_footer(followup_texts[0]), "sent it")
         self.assertIn("send_message", followup_texts[-1])
         self.assertIn("ok", followup_texts[-1])
         self.assertEqual(self.audits[0][0], "/ai send_message")
@@ -597,7 +607,7 @@ class ConfirmationTests(AdminAITestBase):
         transport = self.make_transport(self.make_orchestrator(provider))
         interaction = await self.start(transport)
         self.assertEqual(self.views(interaction), [])
-        self.assertEqual(interaction.followup.sent[0][0], "1 channel")
+        self.assertEqual(strip_engine_footer(interaction.followup.sent[0][0]), "1 channel")
         self.assertEqual(self.audits[0][0], "/ai list_channels")
 
     async def test_destructive_requires_confirmation_and_multi_round_confirmations(self):
@@ -626,7 +636,7 @@ class ConfirmationTests(AdminAITestBase):
 
         second_approval = await self.decide(transport, second_view.state, approved=True, view=second_view)
         self.assertEqual(len(self.target.calls), 1)
-        self.assertEqual(second_approval.followup.sent[0][0], "all done")
+        self.assertEqual(strip_engine_footer(second_approval.followup.sent[0][0]), "all done")
         self.assertEqual(len(self.guild.text_channel.sent), 1)
 
     async def test_real_confirmation_view_has_buttons_and_bounded_timeout(self):
@@ -754,7 +764,7 @@ class ConfirmationPreviewTests(AdminAITestBase):
         self.assertEqual(self.views(interaction), [])
         self.assertEqual(self.preview_pages(interaction), [])
         self.assertEqual(
-            interaction.followup.sent[-1][0],
+            strip_engine_footer(interaction.followup.sent[-1][0]),
             self.admin_ai.unreviewable_plan_message(too_large=True, cancelled=True, earlier_actions=False),
         )
         self.assertEqual(orchestrator._pending_confirmations, {})
@@ -787,7 +797,7 @@ class ConfirmationPreviewTests(AdminAITestBase):
         texts = " ".join(interaction.all_texts())
         self.assertEqual(self.views(interaction), [])
         self.assertEqual(
-            interaction.followup.sent[-1][0],
+            strip_engine_footer(interaction.followup.sent[-1][0]),
             self.admin_ai.unreviewable_plan_message(too_large=False, cancelled=True, earlier_actions=False),
         )
         self.assertNotIn("secret-render-detail", texts)
@@ -1026,7 +1036,7 @@ class StrictDecisionTests(AdminAITestBase):
 
         approved = await self.decide(transport, view.state, approved=True, view=view)
         self.assertEqual(len(self.guild.text_channel.sent), 1)
-        self.assertEqual(approved.followup.sent[0][0], "ok")
+        self.assertEqual(strip_engine_footer(approved.followup.sent[0][0]), "ok")
         again = await self.decide(transport, view.state, approved=True, view=view)
         self.assertEqual(again.response.sent[0][0], self.admin_ai.INACTIVE_MESSAGE)
         self.assertEqual(len(self.guild.text_channel.sent), 1)
@@ -1067,7 +1077,7 @@ class OwnershipTests(AdminAITestBase):
 
         owner = await self.decide(transport, view.state, view=view)
         self.assertEqual(len(self.guild.text_channel.sent), 1)
-        self.assertEqual(owner.followup.sent[0][0], "ok")
+        self.assertEqual(strip_engine_footer(owner.followup.sent[0][0]), "ok")
 
     async def test_removed_whitelist_denies_without_consuming(self):
         transport, orchestrator, view = await self.pending()
@@ -1229,6 +1239,430 @@ class AdminConfigValidationTests(unittest.TestCase):
         manifest = json.loads((PROJECT_ROOT / "bots" / "admin" / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["config_version"], 1)
 
+
+# ===========================================================================
+# AI-5: natural control channel
+# ===========================================================================
+
+CONTROL_CHANNEL_ID = 555
+
+
+class FakeChatMessage:
+    _next_id = 9000
+
+    def __init__(self, author, guild, channel, content, *, webhook_id=None):
+        FakeChatMessage._next_id += 1
+        self.id = FakeChatMessage._next_id
+        self.author = author
+        self.guild = guild
+        self.channel = channel
+        self.content = content
+        self.webhook_id = webhook_id
+        self.replies = []
+
+    async def reply(self, content, **kwargs):
+        self.replies.append((content, kwargs))
+        self.channel.sent.append((content, dict(kwargs, _reply_to=self.id)))
+        return FakeChatMessage(None, self.guild, self.channel, content)
+
+
+class ControlChannelTestBase(AdminAITestBase):
+    def setUp(self):
+        super().setUp()
+        self.control = FakeChannel(CONTROL_CHANNEL_ID, "kairo-control")
+        self.guild.channels.append(self.control)
+        self.config["ai_control_channel_id"] = CONTROL_CHANNEL_ID
+
+    def natural_transport(self, orchestrator=None, *, factory=None):
+        transport = self.make_transport(orchestrator, factory=factory)
+        transport.set_control_channel(CONTROL_CHANNEL_ID)
+        return transport
+
+    async def say(self, transport, content, *, author=None, channel=None, guild=None, webhook_id=None):
+        message = FakeChatMessage(
+            author or self.owner,
+            self.guild if guild is None else guild,
+            channel or self.control,
+            content,
+            webhook_id=webhook_id,
+        )
+        await transport.handle_control_message(message)
+        return message
+
+    def public_sends(self):
+        return list(self.control.sent)
+
+    def assert_public_no_mentions(self):
+        for _content, kwargs in self.control.sent:
+            self.assertNotIn("ephemeral", kwargs)
+            self.assert_mentions_none(kwargs.get("allowed_mentions"))
+            if "_reply_to" in kwargs:
+                self.assertIs(kwargs.get("mention_author"), False)
+
+
+class ControlChannelConfigTests(unittest.TestCase):
+    def test_control_channel_config_default_valid_and_invalid(self):
+        admin = import_admin_module()
+        base = {
+            "allow_server_administrators": True,
+            "allowed_user_ids": [],
+            "allowed_role_ids": [],
+            "audit_channel_id": None,
+        }
+        self.assertIsNone(admin.validate_config(dict(base))["ai_control_channel_id"])
+        self.assertIsNone(admin.validate_config({**base, "ai_control_channel_id": None})["ai_control_channel_id"])
+        self.assertEqual(admin.validate_config({**base, "ai_control_channel_id": "123"})["ai_control_channel_id"], 123)
+        self.assertEqual(admin.validate_config({**base, "ai_control_channel_id": 456})["ai_control_channel_id"], 456)
+        for bad in ("abc", True, 0, -5, [], "12a", 1.5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                admin.validate_config({**base, "ai_control_channel_id": bad})
+
+        defaults = json.loads((CORE_ROOT / "defaults" / "admin_config.json").read_text(encoding="utf-8"))
+        self.assertIn("ai_control_channel_id", defaults)
+        self.assertIsNone(defaults["ai_control_channel_id"])
+        schema = json.loads((PROJECT_ROOT / "bots" / "admin" / "config.schema.json").read_text(encoding="utf-8"))
+        self.assertIn("ai_control_channel_id", schema["properties"])
+        self.assertNotIn("ai_control_channel_id", schema["required"])
+
+
+class MessageContentIntentTests(unittest.TestCase):
+    def run_main(self, admin, config, run_side_effect=None):
+        seen = {}
+
+        def fake_run(token):
+            seen["message_content"] = admin.bot.intents.message_content
+            seen["members"] = admin.bot.intents.members
+            seen["control_channel"] = admin.ai_transport.control_channel_id
+            if run_side_effect is not None:
+                raise run_side_effect
+
+        runtime = types.SimpleNamespace(instance_id="admin-main", config_path=Path("x"), token_path=Path("y"), lock_path=Path("z"))
+        patches = {
+            "resolve_runtime": lambda instance_id: runtime,
+            "load_config": lambda runtime=None: admin.validate_config(dict(config)),
+            "load_token": lambda runtime=None: "not-a-real-token",
+            "acquire_single_instance_lock": lambda runtime=None: True,
+        }
+        originals = {name: getattr(admin, name) for name in patches}
+        original_run = admin.bot.run
+        for name, value in patches.items():
+            setattr(admin, name, value)
+        admin.bot.run = fake_run
+        try:
+            code = admin.main(["--instance", "admin-main"])
+        finally:
+            for name, value in originals.items():
+                setattr(admin, name, value)
+            admin.bot.run = original_run
+        return code, seen
+
+    def base_config(self, **extra):
+        return {
+            "allow_server_administrators": True,
+            "allowed_user_ids": [],
+            "allowed_role_ids": [],
+            "audit_channel_id": None,
+            **extra,
+        }
+
+    def test_intent_off_without_control_channel_and_on_with_it(self):
+        admin = import_admin_module()
+        self.assertFalse(admin.bot.intents.message_content)
+        code, seen = self.run_main(admin, self.base_config())
+        self.assertEqual(code, 0)
+        self.assertFalse(seen["message_content"])
+        self.assertTrue(seen["members"])
+        self.assertIsNone(seen["control_channel"])
+
+        code, seen = self.run_main(admin, self.base_config(ai_control_channel_id="777"))
+        self.assertEqual(code, 0)
+        self.assertTrue(seen["message_content"])
+        self.assertTrue(seen["members"])
+        self.assertEqual(seen["control_channel"], 777)
+
+        code, seen = self.run_main(admin, self.base_config(ai_control_channel_id=None))
+        self.assertFalse(seen["message_content"])
+        self.assertIsNone(seen["control_channel"])
+        # /execute and /ai stay registered regardless of the intent.
+        self.assertIsNotNone(admin.bot.tree.get_command("execute"))
+        self.assertIsNotNone(admin.bot.tree.get_command("ai"))
+
+    def test_privileged_intent_rejection_is_actionable_only_for_natural_ai(self):
+        import discord
+
+        admin = import_admin_module()
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            code, _seen = self.run_main(
+                admin,
+                self.base_config(ai_control_channel_id="777"),
+                run_side_effect=discord.PrivilegedIntentsRequired(None),
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("Message Content Intent", captured.getvalue())
+        self.assertIn("AI control channel ID", captured.getvalue())
+        with self.assertRaises(discord.PrivilegedIntentsRequired):
+            self.run_main(admin, self.base_config(), run_side_effect=discord.PrivilegedIntentsRequired(None))
+
+
+class ControlMessageFilterTests(ControlChannelTestBase):
+    async def test_allowed_user_and_role_reach_provider_publicly(self):
+        provider = FakeProvider(self.ai_platform, responses=[self.ai_platform.AIResponse(content="hi there")] * 2)
+        transport = self.natural_transport(self.make_orchestrator(provider))
+        await self.say(transport, "hello kairo")
+        self.assertEqual(len(provider.requests), 1)
+
+        user = self.guild.add_member(FakeMember(AI_USER_ID, "listed-user"))
+        self.config["ai_allowed_user_ids"] = [AI_USER_ID]
+        await self.say(transport, "hello again", author=user)
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(len(self.control.sent), 2)
+        self.assert_public_no_mentions()
+
+    async def test_ignored_categories_never_construct_or_call_provider(self):
+        provider = FakeProvider(self.ai_platform, responses=[self.ai_platform.AIResponse(content="x")])
+        transport = self.natural_transport(self.make_orchestrator(provider))
+        admin_only = self.guild.add_member(FakeMember(9, "admin", administrator=True))
+        exec_only = self.guild.add_member(FakeMember(55, "exec", roles=[FakeRole(66)]))
+        self.config["allowed_user_ids"] = [55]
+        self.config["allowed_role_ids"] = [66]
+        bot_member = self.guild.add_member(FakeMember(4321, "Kairo", roles=[self.ai_role]))
+        bot_member.bot = True
+        other_bot = self.guild.add_member(FakeMember(4322, "OtherBot", roles=[self.ai_role]))
+        other_bot.bot = True
+        other_channel = FakeChannel(456, "general")
+        self.guild.channels.append(other_channel)
+
+        cases = [
+            ("administrator only", dict(author=admin_only)),
+            ("/execute whitelist only", dict(author=exec_only)),
+            ("wrong channel", dict(channel=other_channel)),
+            ("self (bot)", dict(author=bot_member)),
+            ("other bot", dict(author=other_bot)),
+            ("webhook", dict(webhook_id=1234)),
+            ("not a member", dict(author=types.SimpleNamespace(id=OWNER_ID, roles=[self.ai_role], bot=False))),
+        ]
+        for label, kwargs in cases:
+            with self.subTest(case=label):
+                await self.say(transport, "do something", **kwargs)
+        dm = FakeChatMessage(self.owner, None, self.control, "dm text")
+        await transport.handle_control_message(dm)
+        for empty in ("", "   "):
+            await self.say(transport, empty)
+
+        self.assertEqual(self.factory_calls, 0)
+        self.assertEqual(provider.requests, [])
+        self.assertEqual(self.control.sent, [])
+        self.assertEqual(other_channel.sent, [])
+
+    async def test_disabled_or_reconfigured_channel_is_ignored(self):
+        provider = FakeProvider(self.ai_platform, responses=[self.ai_platform.AIResponse(content="x")])
+        transport = self.make_transport(self.make_orchestrator(provider))
+        await self.say(transport, "hello")  # control_channel_id never set at startup
+        transport.set_control_channel(CONTROL_CHANNEL_ID)
+        self.config["ai_control_channel_id"] = None  # cleared in config after startup
+        await self.say(transport, "hello")
+        self.assertEqual(provider.requests, [])
+        self.assertEqual(self.factory_calls, 0)
+        self.assertEqual(self.control.sent, [])
+
+    async def test_removed_access_takes_effect_immediately(self):
+        provider = FakeProvider(self.ai_platform, responses=[self.ai_platform.AIResponse(content="x")] * 2)
+        transport = self.natural_transport(self.make_orchestrator(provider))
+        await self.say(transport, "first")
+        self.config["ai_allowed_role_ids"] = []
+        await self.say(transport, "second")
+        self.assertEqual(len(provider.requests), 1)
+
+    async def test_overlong_message_is_rejected_without_provider(self):
+        provider = FakeProvider(self.ai_platform)
+        transport = self.natural_transport(self.make_orchestrator(provider))
+        await self.say(transport, "x" * (self.admin_ai.AI_PROMPT_MAX_CHARS + 1))
+        self.assertEqual(provider.requests, [])
+        self.assertEqual(len(self.control.sent), 1)
+        self.assert_public_no_mentions()
+
+
+class ControlMessageResponseTests(ControlChannelTestBase):
+    async def test_routine_single_message_request_public_reply_with_engine_footer(self):
+        class Recording:
+            def __init__(self, result):
+                self.result = result
+                self.calls = []
+
+            async def orchestrate(self, request, *, executor=None, confirmation_policy=None):
+                self.calls.append((request, confirmation_policy))
+                return self.result
+
+        result = self.ai_orchestrator.OrchestratorResult(
+            status=self.ai_orchestrator.OrchestratorStatus.COMPLETED,
+            content="@everyone there are 3 channels",
+            profile_id="groq-default",
+            provider_id="groq",
+            model_id="openai/gpt-oss-120b",
+        )
+        orchestrator = Recording(result)
+        transport = self.natural_transport(orchestrator)
+        message = await self.say(transport, "сколько у нас каналов?")
+
+        request, policy = orchestrator.calls[0]
+        self.assertEqual(request.task_class.value, "ROUTINE")
+        self.assertEqual(len(request.messages), 1)
+        self.assertEqual(request.messages[0].content, "сколько у нас каналов?")
+        self.assertTrue(policy.confirm_normal)
+        self.assertEqual(len(message.replies), 1)
+        content, kwargs = message.replies[0]
+        self.assertTrue(content.startswith("@everyone there are 3 channels"))
+        self.assertTrue(content.endswith("-# Groq · groq-default · openai/gpt-oss-120b"))
+        self.assertIs(kwargs["mention_author"], False)
+        self.assert_public_no_mentions()
+
+    async def test_no_cross_message_memory(self):
+        provider = FakeProvider(
+            self.ai_platform,
+            responses=[self.ai_platform.AIResponse(content="a"), self.ai_platform.AIResponse(content="b")],
+        )
+        transport = self.natural_transport(self.make_orchestrator(provider))
+        await self.say(transport, "SECRET_FIRST_PROMPT_1")
+        await self.say(transport, "second request")
+        second = provider.requests[1]
+        user_messages = [m for m in second.messages if m.role is self.ai_platform.MessageRole.USER]
+        self.assertEqual([m.content for m in user_messages], ["second request"])
+        self.assertNotIn("SECRET_FIRST_PROMPT_1", json.dumps([m.public_dict() for m in second.messages]))
+        self.assertEqual(self.factory_calls, 1)  # same per-process orchestrator
+
+    async def test_provider_failure_is_contained_publicly(self):
+        provider = FakeProvider(self.ai_platform, error=RuntimeError("Authorization: Bearer sk-secret"))
+        transport = self.natural_transport(self.make_orchestrator(provider))
+        await self.say(transport, "hello")
+        text = " ".join(content for content, _ in self.control.sent)
+        self.assertIn("unavailable", text.lower())
+        self.assertNotIn("sk-secret", text)
+        self.assertNotIn("Authorization", text)
+        self.assert_public_no_mentions()
+
+    async def test_read_tool_runs_automatically(self):
+        provider = FakeProvider(
+            self.ai_platform, responses=[self.call("c1", "list_channels"), self.ai_platform.AIResponse(content="2 channels")]
+        )
+        transport = self.natural_transport(self.make_orchestrator(provider))
+        await self.say(transport, "list channels")
+        self.assertEqual(self.audits[0][0], "/ai list_channels")
+        self.assertTrue(self.control.sent[0][0].startswith("2 channels"))
+        self.assertNotIn("view", self.control.sent[0][1])
+
+
+class ControlChannelConfirmationTests(ControlChannelTestBase):
+    async def pending(self, tool_response, extra=()):
+        provider = FakeProvider(self.ai_platform, responses=[tool_response, *extra])
+        orchestrator = self.make_orchestrator(provider)
+        transport = self.natural_transport(orchestrator)
+        await self.say(transport, "please do it")
+        views = [kwargs["view"] for _content, kwargs in self.control.sent if "view" in kwargs]
+        return transport, orchestrator, views
+
+    def button_interaction(self, user=None, channel_id=CONTROL_CHANNEL_ID, guild=None):
+        return self.interaction(user=user, guild=guild, channel_id=channel_id)
+
+    async def test_normal_and_destructive_plans_get_public_preview_and_buttons(self):
+        for response, risk in (
+            (self.call("c1", "send_message", channel_id="100", content="@here hi"), "NORMAL"),
+            (self.call("c2", "ban_member", member_id="777"), "DESTRUCTIVE"),
+        ):
+            with self.subTest(risk=risk):
+                self.control.sent.clear()
+                transport, orchestrator, views = await self.pending(response)
+                self.assertEqual(len(views), 1)
+                pages = [content for content, _ in self.control.sent if "review page" in content]
+                self.assertTrue(pages)
+                self.assertIn(f'risk `"{risk}"`', "\n".join(pages))
+                control = self.control.sent[-1][0]
+                self.assertIn(f"overall risk {risk}", control)
+                self.assertIn("-# fake · routine · fake-model", control)
+                self.assertEqual(self.guild.text_channel.sent, [])
+                self.assertEqual(self.target.calls, [])
+                self.assertEqual(views[0].state.delivery_mode, self.admin_ai.DeliveryMode.PUBLIC)
+                self.assert_public_no_mentions()
+
+    async def test_public_buttons_enforce_ownership_and_continue_publicly(self):
+        transport, orchestrator, views = await self.pending(
+            self.call("c1", "send_message", channel_id="100", content="hi"),
+            extra=(self.ai_platform.AIResponse(content="sent"),),
+        )
+        view = views[0]
+        intruder = self.guild.add_member(FakeMember(888, "intruder", roles=[self.ai_role], administrator=True))
+        denied = self.button_interaction(user=intruder)
+        await transport.handle_decision(denied, view.state, approved=True, view=view)
+        self.assertEqual(denied.response.sent[0][0], self.admin_ai.NOT_OWNER_MESSAGE)
+        self.assertTrue(denied.response.sent[0][1]["ephemeral"])
+        self.assertEqual(denied.response.edited, [])
+        wrong_channel = self.button_interaction(channel_id=999)
+        await transport.handle_decision(wrong_channel, view.state, approved=True, view=view)
+        wrong_guild = self.button_interaction(guild=FakeGuild(guild_id=11))
+        await transport.handle_decision(wrong_guild, view.state, approved=True, view=view)
+        self.config["ai_allowed_role_ids"] = []
+        revoked = self.button_interaction()
+        await transport.handle_decision(revoked, view.state, approved=True, view=view)
+        self.assertEqual(revoked.response.sent[0][0], self.admin_ai.ACCESS_DENIED_MESSAGE)
+        self.assertTrue(revoked.response.sent[0][1]["ephemeral"])
+        self.assertFalse(view.state.resolved)
+        self.assertEqual(len(orchestrator._pending_confirmations), 1)
+        self.assertEqual(self.guild.text_channel.sent, [])
+
+        self.config["ai_allowed_role_ids"] = [AI_ROLE_ID]
+        owner = self.button_interaction()
+        await transport.handle_decision(owner, view.state, approved=True, view=view)
+        self.assertEqual(len(self.guild.text_channel.sent), 1)
+        self.assert_mentions_none(self.guild.text_channel.sent[0][1]["allowed_mentions"])
+        self.assertTrue(owner.followup.sent)
+        for _content, kwargs in owner.followup.sent:
+            self.assertIs(kwargs["ephemeral"], False)
+            self.assert_mentions_none(kwargs["allowed_mentions"])
+        self.assertEqual(strip_engine_footer(owner.followup.sent[0][0]), "sent")
+        self.assertIsNone(owner.response.edited[0]["view"])
+
+    async def test_slash_ai_continuation_stays_ephemeral(self):
+        provider = FakeProvider(
+            self.ai_platform,
+            responses=[self.call("c1", "send_message", channel_id="100", content="hi"), self.ai_platform.AIResponse(content="done")],
+        )
+        transport = self.make_transport(self.make_orchestrator(provider))
+        first = await self.start(transport)
+        view = self.views(first)[0]
+        self.assertEqual(view.state.delivery_mode, self.admin_ai.DeliveryMode.EPHEMERAL)
+        approval = await self.decide(transport, view.state, approved=True, view=view)
+        for _content, kwargs in approval.followup.sent:
+            self.assertIs(kwargs["ephemeral"], True)
+        self.assertEqual(self.control.sent, [])
+
+
+class EngineFooterTests(AdminAITestBase):
+    def result(self, **fields):
+        return self.ai_orchestrator.OrchestratorResult(status=self.ai_orchestrator.OrchestratorStatus.COMPLETED, **fields)
+
+    def test_engine_footer_formats(self):
+        render = self.admin_ai.render_engine_footer
+        self.assertEqual(
+            render(self.result(provider_id="groq", profile_id="groq-default", model_id="llama-x")),
+            "-# Groq · groq-default · llama-x",
+        )
+        self.assertEqual(
+            render(self.result(provider_id="gemini", profile_id="gemini-default", model_id="gemini-2.5-flash", fallback_used=True)),
+            "-# Gemini · gemini-default · gemini-2.5-flash · fallback",
+        )
+        self.assertEqual(render(self.result()), "")
+        self.assertEqual(render(types.SimpleNamespace()), "")
+        footer = render(self.result(provider_id="groq", profile_id="p", model_id="m" * 500))
+        self.assertLessEqual(len(footer), 3 + self.admin_ai.AI_ENGINE_FOOTER_CHARS)
+        long_text = self.admin_ai.with_footer("y" * 5000, footer)
+        self.assertLessEqual(len(long_text), self.admin_ai.DISCORD_MESSAGE_LIMIT)
+
+    def test_engine_footer_never_uses_attempts_or_credentials(self):
+        attempt = self.ai_orchestrator.AttemptRecord("p", "groq", "m", "FAILED", False, "Authorization secret-ish")
+        footer = self.admin_ai.render_engine_footer(
+            self.result(provider_id="groq", profile_id="p", model_id="m", attempts=(attempt,))
+        )
+        self.assertEqual(footer, "-# Groq · p · m")
 
 if __name__ == "__main__":
     unittest.main()

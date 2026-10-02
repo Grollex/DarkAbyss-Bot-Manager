@@ -68,6 +68,20 @@
         ]
       }
     },
+    "ai_control_channel_id": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      ]
+    },
     "audit_channel_id": {
       "anyOf": [
         {

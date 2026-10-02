@@ -129,6 +129,13 @@ def validate_config(config: dict) -> dict:
         "ai_allowed_role_ids",
     )
 
+    # AI-5 natural control channel. Missing/null = natural-message AI disabled
+    # (and Message Content Intent is not requested).
+    ai_control_channel_id = config.get("ai_control_channel_id")
+    config["ai_control_channel_id"] = (
+        None if ai_control_channel_id is None else parse_snowflake(ai_control_channel_id, "ai_control_channel_id")
+    )
+
     return config
 
 
@@ -269,6 +276,29 @@ async def send_audit(
         return failure
 
     return None
+
+
+def natural_ai_enabled(config: dict) -> bool:
+    return config.get("ai_control_channel_id") is not None
+
+
+def configure_message_content_intent(client: discord.Client, enabled: bool) -> None:
+    """Set the Message Content Intent BEFORE the gateway connection.
+
+    discord.py exposes ``Client.intents`` only as a copy, so the IDENTIFY
+    intents held by the connection state are updated directly. Natural AI off
+    keeps the pre-AI-5 behaviour (intent not requested), so /execute and /ai
+    never depend on the privileged Message Content Intent.
+    """
+    client._connection._intents.message_content = bool(enabled)
+
+
+MESSAGE_CONTENT_INTENT_HELP = (
+    "Discord rejected the privileged Message Content Intent requested for the AI control channel. "
+    "Either enable 'Message Content Intent' in Discord Developer Portal -> Application -> Bot -> "
+    "Privileged Gateway Intents, or clear 'AI control channel ID' in Manager Setup Bot to disable "
+    "natural-message AI. /execute and /ai do not need this intent."
+)
 
 
 class AdminBot(commands.Bot):
@@ -412,19 +442,43 @@ async def ai(
     await ai_transport.handle_ai_command(interaction, prompt, mode.value if mode else None)
 
 
+@bot.listen("on_message")
+async def ai_control_channel_listener(message: discord.Message) -> None:
+    # Cheap gate first: nothing happens unless the natural AI channel is enabled.
+    if ai_transport is None or ai_transport.control_channel_id is None:
+        return
+    try:
+        await ai_transport.handle_control_message(message)
+    except Exception as exc:  # pragma: no cover - never let AI break the event loop
+        print(f"AI control channel error: {type(exc).__name__}")
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
         runtime = resolve_runtime(args.instance)
         set_runtime(runtime)
-        load_config(runtime)
+        config = load_config(runtime)
         token = load_token(runtime)
     except RuntimeError as exc:
         print(exc)
         return 1
 
+    natural_ai = natural_ai_enabled(config) and ai_transport is not None
+    configure_message_content_intent(bot, natural_ai)
+    if ai_transport is not None:
+        ai_transport.set_control_channel(config.get("ai_control_channel_id") if natural_ai else None)
+    if natural_ai:
+        print("AI control channel enabled; requesting Discord Message Content Intent.")
+
     if acquire_single_instance_lock(runtime):
-        bot.run(token)
+        try:
+            bot.run(token)
+        except discord.PrivilegedIntentsRequired:
+            if not natural_ai:
+                raise  # unchanged pre-AI-5 behaviour (e.g. Server Members Intent missing)
+            print(MESSAGE_CONTENT_INTENT_HELP)
+            return 1
     return 0
 
 

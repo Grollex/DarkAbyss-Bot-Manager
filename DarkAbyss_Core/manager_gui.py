@@ -148,6 +148,17 @@ SETUP_HELP_TEXT: dict[str, tuple[str, str]] = {
         "Если оба AI-списка пустые, /ai не может использовать никто.\n\n"
         "Рекомендуется выдавать AI-доступ через роль (AI allowed role IDs), а не через отдельных пользователей.",
     ),
+    "ai_channel": (
+        "AI control channel ID",
+        "ID одного текстового канала, где Kairo отвечает на обычные сообщения без /ai.\n\n"
+        "- Работает только для пользователей/ролей из AI allowed user IDs / AI allowed role IDs; остальным доступ не появляется.\n"
+        "- Discord Administrator и списки /execute доступ к AI не дают.\n"
+        "- Если поле заполнено, бот запрашивает Message Content Intent: включи его в Discord Developer Portal "
+        "(Application -> Bot -> Privileged Gateway Intents -> Message Content Intent), иначе бот не подключится.\n"
+        "- После включения/выключения нужно перезапустить бота.\n"
+        "- Пустое поле = обычные сообщения AI не обрабатывает (/ai продолжает работать).\n"
+        "Это не audit channel.",
+    ),
     "ai_roles": (
         "AI allowed role IDs",
         "Discord role IDs, участникам которых разрешена команда /ai.\n\n"
@@ -155,6 +166,21 @@ SETUP_HELP_TEXT: dict[str, tuple[str, str]] = {
         "Как получить role ID: Developer Mode → Server Settings → Roles → правый клик → Copy Role ID.",
     ),
 }
+
+AI_CONTROL_CHANNEL_EXPLANATION = (
+    "AI control channel: Kairo answers normal messages in this one channel (AI whitelist still required). "
+    "Needs Message Content Intent enabled in Discord Developer Portal and a bot restart. Leave empty to disable."
+)
+
+
+def parse_optional_channel_id(text: str, label: str) -> str | None:
+    value = text.strip()
+    if not value:
+        return None
+    if not value.isdigit():
+        raise ValueError(f"{label} must contain digits only.")
+    return value
+
 
 AI_ACCESS_EXPLANATION = (
     "AI access requires an explicit user or role. Discord Administrator alone does not grant /ai access, "
@@ -1023,6 +1049,11 @@ class BotSetupDialog(QDialog):
         self.ai_roles_help_button = self._create_help_button("ai_roles")
         self.ai_access_label = QLabel(AI_ACCESS_EXPLANATION)
         self.ai_access_label.setWordWrap(True)
+        self.ai_control_channel_edit = QLineEdit()
+        self.ai_control_channel_edit.setPlaceholderText("Optional. Channel ID for natural AI messages (empty = off)")
+        self.ai_channel_help_button = self._create_help_button("ai_channel")
+        self.ai_control_channel_label = QLabel(AI_CONTROL_CHANNEL_EXPLANATION)
+        self.ai_control_channel_label.setWordWrap(True)
 
         self.invite_link_edit = QLineEdit()
         self.invite_link_edit.setReadOnly(True)
@@ -1152,11 +1183,13 @@ class BotSetupDialog(QDialog):
         ai_form = QFormLayout()
         ai_form.addRow(self._help_label("AI allowed user IDs", self.ai_users_help_button), self.ai_allowed_users_edit)
         ai_form.addRow(self._help_label("AI allowed role IDs", self.ai_roles_help_button), self.ai_allowed_roles_edit)
+        ai_form.addRow(self._help_label("AI control channel ID", self.ai_channel_help_button), self.ai_control_channel_edit)
         layout = QVBoxLayout()
         layout.addWidget(description)
         layout.addLayout(form)
         layout.addWidget(self.ai_access_label)
         layout.addLayout(ai_form)
+        layout.addWidget(self.ai_control_channel_label)
         layout.addStretch(1)
         page.setLayout(layout)
         return page
@@ -1215,6 +1248,8 @@ class BotSetupDialog(QDialog):
         self.audit_channel_edit.setText("" if audit_channel_id is None else str(audit_channel_id))
         self.ai_allowed_users_edit.setText(", ".join(str(value) for value in effective.get("ai_allowed_user_ids", [])))
         self.ai_allowed_roles_edit.setText(", ".join(str(value) for value in effective.get("ai_allowed_role_ids", [])))
+        ai_control_channel_id = effective.get("ai_control_channel_id")
+        self.ai_control_channel_edit.setText("" if ai_control_channel_id is None else str(ai_control_channel_id))
         self._update_invite_preview()
         self._update_ready_summary()
         self._set_status("Loaded setup.")
@@ -1242,6 +1277,9 @@ class BotSetupDialog(QDialog):
                 ai_ids = parse_id_list(edit_widget.text())
                 if ai_ids or key in overrides:
                     overrides[key] = ai_ids
+            ai_channel = parse_optional_channel_id(self.ai_control_channel_edit.text(), "AI control channel ID")
+            if ai_channel is not None or "ai_control_channel_id" in overrides:
+                overrides["ai_control_channel_id"] = ai_channel
             self._instance_api.update_instance_display_name(self._instance_id, display_name)
             self._config_api.save_config_overrides(self._instance_id, overrides)
             if token:

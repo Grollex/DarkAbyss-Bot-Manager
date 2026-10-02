@@ -475,6 +475,53 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertFalse(dialog.save_setup())
         self.assertIn("digits", dialog.last_error)
 
+    def test_setup_dialog_ai_control_channel_load_save_clear_preserve(self):
+        instance_api = FakeInstanceApi(self.temp_dir.name)
+        config_api = FakeConfigApi()
+        config_api.snapshot = replace(
+            config_api.snapshot,
+            overrides={"allowed_user_ids": ["123"], "audit_channel_id": "444", "unrelated": [1, 2]},
+            effective={
+                "allow_server_administrators": True,
+                "allowed_user_ids": ["123"],
+                "audit_channel_id": "444",
+                "ai_control_channel_id": None,
+            },
+        )
+        dialog = self.manager_gui.BotSetupDialog("admin-main", instance_api, config_api)
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(dialog.ai_control_channel_edit.text(), "")
+        self.assertEqual(dialog.audit_channel_edit.text(), "444")
+        explanation = dialog.ai_control_channel_label.text()
+        self.assertIn("Message Content Intent", explanation)
+        self.assertIn("restart", explanation)
+        self.assertIn("whitelist", explanation)
+        help_text = self.manager_gui.SETUP_HELP_TEXT["ai_channel"][1]
+        self.assertIn("Message Content Intent", help_text)
+        self.assertIn("AI allowed user IDs", help_text)
+        self.assertIn("audit channel", help_text)
+
+        self.assertTrue(dialog.save_setup())
+        self.assertNotIn("ai_control_channel_id", config_api.saved[-1][1])
+
+        dialog.ai_control_channel_edit.setText(" 987654321 ")
+        self.assertTrue(dialog.save_setup())
+        saved = config_api.saved[-1][1]
+        self.assertEqual(saved["ai_control_channel_id"], "987654321")
+        self.assertEqual(saved["audit_channel_id"], "444")
+        self.assertEqual(saved["unrelated"], [1, 2])
+        self.assertEqual(saved["allowed_user_ids"], ["123"])
+        self.assertEqual(dialog.ai_control_channel_edit.text(), "987654321")
+
+        dialog.ai_control_channel_edit.setText("")
+        self.assertTrue(dialog.save_setup())
+        self.assertIsNone(config_api.saved[-1][1]["ai_control_channel_id"])
+
+        dialog.ai_control_channel_edit.setText("chan")
+        self.assertFalse(dialog.save_setup())
+        self.assertIn("AI control channel ID", dialog.last_error)
+
     def test_setup_dialog_does_not_add_empty_ai_fields_to_overrides(self):
         instance_api = FakeInstanceApi(self.temp_dir.name)
         config_api = FakeConfigApi()
@@ -486,6 +533,7 @@ class ManagerGuiTests(unittest.TestCase):
         saved = config_api.saved[-1][1]
         self.assertNotIn("ai_allowed_user_ids", saved)
         self.assertNotIn("ai_allowed_role_ids", saved)
+        self.assertNotIn("ai_control_channel_id", saved)
 
     def test_setup_dialog_rejects_invalid_discord_ids(self):
         instance_api = FakeInstanceApi(self.temp_dir.name)

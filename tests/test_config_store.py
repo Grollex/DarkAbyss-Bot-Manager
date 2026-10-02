@@ -22,6 +22,8 @@ VALID_ADMIN_CONFIG = {
 AI_WHITELIST_DEFAULTS = {
     "ai_allowed_user_ids": [],
     "ai_allowed_role_ids": [],
+    # AI-5: natural control channel disabled by default.
+    "ai_control_channel_id": None,
 }
 
 

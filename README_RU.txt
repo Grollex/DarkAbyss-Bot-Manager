@@ -1,8 +1,9 @@
 Discord Admin Bot, Discord-only edition
 
 Что это:
-- Чистый админ-бот Discord без Gemini, OpenCode, shell, subprocess и чтения чужих файлов.
-- Команда `/execute` сохранена, но выполняет только белый список действий через Discord API.
+- Админ-бот Discord без OpenCode, shell, subprocess и чтения чужих файлов.
+- Команда `/execute` выполняет только белый список действий через Discord API.
+- Опциональный AI-помощник (Groq/Gemini через Manager -> AI Providers): команда `/ai` и, при желании, отдельный AI control channel. AI использует те же белые списки Admin Tool действий и всегда спрашивает подтверждение для изменяющих и опасных действий. Без настроенного AI бот и `/execute` работают как раньше.
 - Бот не умеет запускать команды Windows, читать диск, трогать браузер, ключи, проекты или локальные данные.
 
 ## Быстрый запуск
@@ -19,6 +20,7 @@ Discord Admin Bot, Discord-only edition
    - вставить Discord bot token;
    - включить и отметить Server Members Intent;
    - настроить доступ через administrators, user IDs и role IDs;
+   - отдельно настроить AI-доступ (AI allowed user IDs / AI allowed role IDs) и, при желании, AI control channel ID;
    - сгенерировать invite link с нужными granular permissions;
    - выбрать режим установки Discord application:
      - `Public Bot = OFF`: установить может только owner/developer team;
@@ -220,6 +222,15 @@ DarkAbyss_Core\admin_bot_token.txt
 ```
 
 `config.json` строго валидируется при старте и при reload для `/execute`. Строки `"true"` и `"false"` не принимаются вместо boolean `true`/`false`.
+
+## AI: `/ai` и AI control channel
+
+- AI-доступ отдельный и только явный: `ai_allowed_user_ids` / `ai_allowed_role_ids` (в Manager: Setup Bot -> Access Settings -> AI allowed user IDs / AI allowed role IDs). Discord Administrator и списки `/execute` доступ к AI НЕ дают. Пустые списки = AI не может использовать никто. Рекомендуется выдавать доступ ролью.
+- `/ai prompt:<текст> mode:<routine|planner|creative>` — ответы и подтверждения видны только вызвавшему (ephemeral).
+- AI control channel (необязательно): в Manager -> Setup Bot -> Access Settings -> `AI control channel ID` укажи ID одного текстового канала (`ai_control_channel_id`). В этом канале Kairo отвечает на обычные сообщения пользователей из AI-списков без `/ai`; ответы и кнопки подтверждения публичные в этом канале, но нажать Approve/Cancel может только автор запроса. Каждое сообщение — отдельный запрос (бот не помнит предыдущие сообщения).
+- Для AI control channel нужен Discord Message Content Intent: Developer Portal -> Application -> Bot -> Privileged Gateway Intents -> Message Content Intent. Он запрашивается ТОЛЬКО если `AI control channel ID` заполнен; для `/execute` и `/ai` он не нужен. После включения/выключения канала перезапусти бота. Пустое поле выключает режим канала.
+- Чтение (READ) выполняется сразу; изменяющие (NORMAL) и опасные (DESTRUCTIVE) действия выполняются только после Approve с полным показом плана. AI-сообщения никогда не пингуют @everyone/@here/пользователей/роли.
+- Под ответом AI мелким шрифтом показывается, какой движок ответил: провайдер · профиль · модель.
 
 ## Поддерживаемые действия `/execute`
 
