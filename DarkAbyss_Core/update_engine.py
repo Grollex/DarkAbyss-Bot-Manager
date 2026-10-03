@@ -520,6 +520,8 @@ def _ensure_installed_version_directory(
     try:
         versions_dir = _ensure_structural_directory(root, VERSIONS_DIR_NAME, create=False)
         version_dir = versions_dir / version
+        if version_dir.is_symlink():
+            raise error_type(f"Installed version directory must not be a symlink: {version_dir}")
         _ensure_target_inside(root, version_dir, "version directory")
         if not version_dir.is_dir():
             raise error_type(f"Installed version does not exist: {version}")
@@ -575,10 +577,11 @@ def _ensure_structural_directory(root: Path, *relative_parts: str, create: bool)
     current = root
     for part in relative_parts:
         current = current / part
+        # Symlink first: resolving it would only report "escapes root".
+        if current.is_symlink():
+            raise UpdateEngineError(f"Update structural directory must not be a symlink: {current}")
         _ensure_target_inside(root, current, "update structural directory")
-        if current.exists() or current.is_symlink():
-            if current.is_symlink():
-                raise UpdateEngineError(f"Update structural directory must not be a symlink: {current}")
+        if current.exists():
             if not current.is_dir():
                 raise UpdateEngineError(f"Update structural path must be a directory: {current}")
             _ensure_target_inside(root, current.resolve(), "update structural directory")

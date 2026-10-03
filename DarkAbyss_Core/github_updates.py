@@ -618,10 +618,11 @@ def _ensure_structural_directory(root: Path, *relative_parts: str, create: bool)
     current = root
     for part in relative_parts:
         current = current / part
+        # Symlink first: resolving it would only report "escapes root".
+        if current.is_symlink():
+            raise GitHubUpdateError(f"GitHub update structural directory must not be a symlink: {current}")
         _ensure_target_inside(root, current, "GitHub update structural directory")
-        if current.exists() or current.is_symlink():
-            if current.is_symlink():
-                raise GitHubUpdateError(f"GitHub update structural directory must not be a symlink: {current}")
+        if current.exists():
             if not current.is_dir():
                 raise GitHubUpdateError(f"GitHub update structural path must be a directory: {current}")
             _ensure_target_inside(root, current.resolve(), "GitHub update structural directory")
