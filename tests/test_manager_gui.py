@@ -1745,14 +1745,15 @@ class SelfUpdateUITests(unittest.TestCase):
         order = []
         manager.shutdown_all = lambda: order.append("shutdown") or {}
         with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok) as question, mock.patch.object(
-            self.app_updates, "install_update", side_effect=lambda update, root: order.append(("install", update.version, root))
+            self.app_updates, "install_update", side_effect=lambda update, root, keep_versions: order.append(("install", update.version, root, keep_versions))
         ), mock.patch.object(self.app_updates, "start_launcher", side_effect=lambda installed: order.append("launcher")):
             window.install_available_update()
         prompt = question.call_args[0][2]
         self.assertIn("Install v1.0.1? You have v1.0.0.", prompt)
         self.assertIn("admin-main", prompt)
         self.assertIn(str(self.manager_gui.app_paths.DATA_ROOT), prompt)
-        self.assertEqual(order, [("install", "1.0.1", self.installed.install_root), "shutdown", "launcher"])
+        # The running version is protected from pruning while it still runs.
+        self.assertEqual(order, [("install", "1.0.1", self.installed.install_root, ("1.0.0",)), "shutdown", "launcher"])
         self.assertTrue(window._allow_close)
         self.assertFalse(window.isVisible())
 
@@ -1761,6 +1762,31 @@ class SelfUpdateUITests(unittest.TestCase):
         self.assertEqual(resumed.resume_bots_after_update(), ["admin-main"])
         self.assertIn(("start", "admin-main"), resumed.manager.calls)
         self.assertEqual(resumed.resume_bots_after_update(), [])
+
+    def test_restart_happens_even_when_bots_cannot_be_listed_after_install(self):
+        """Live case (03.10): the new version was active but listing the bots
+        failed, so the Manager stayed on the old version."""
+        manager = FakeManager(self.manager_gui.manager_core)
+        window = self.make_window(manager)
+        window.available_update = self.update
+        calls = {"n": 0}
+        real_list = manager.list_instance_info
+
+        def list_once():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise self.manager_gui.manager_core.ManagerCoreError("Failed to list bot instances: runtime/ missing")
+            return real_list()
+
+        manager.list_instance_info = list_once
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok), mock.patch.object(
+            self.app_updates, "install_update"
+        ), mock.patch.object(self.app_updates, "start_launcher") as launcher, mock.patch.object(self.manager_gui.QMessageBox, "critical") as critical:
+            window.install_available_update()
+        critical.assert_not_called()
+        launcher.assert_called_once_with(self.installed)
+        self.assertEqual(manager.shutdown_calls, 1)
+        self.assertEqual(self.app_updates.take_resume(), ["admin-main"])
 
     def test_cancelled_or_failed_install_keeps_everything_running(self):
         manager = FakeManager(self.manager_gui.manager_core)

@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -41,6 +42,7 @@ UPDATE_OWNER = "Grollex"
 UPDATE_REPO = "DarkAbyss-Bot-Manager"
 RELEASES_URL = f"https://github.com/{UPDATE_OWNER}/{UPDATE_REPO}/releases"
 RESUME_FILE_NAME = "resume_after_update.json"
+TRASH_DIR_NAME = "trash"
 RESUME_MAX_AGE_SECONDS = 15 * 60
 CHECK_INTERVAL_SECONDS = 6 * 3600
 _VERSION_RE = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
@@ -137,23 +139,39 @@ def install_update(
     update: AvailableUpdate,
     install_root: Path | str,
     *,
+    keep_versions: tuple[str, ...] = (),
     transport: github_updates.HttpTransport | None = None,
 ) -> update_engine.ActivationResult:
     """Download, verify, stage and activate ``update``. The running version and
-    DATA_ROOT are not modified; on any failure the current version stays active."""
+    DATA_ROOT are not modified; on any failure the current version stays active.
+    ``keep_versions`` (the running version) are never pruned."""
     root = Path(install_root)
     try:
-        if not (root / update_engine.VERSIONS_DIR_NAME / update.version).is_dir():
-            github_updates.download_and_stage_release(
-                UPDATE_OWNER, UPDATE_REPO, root, tag=update.tag, transport=transport
+        state = update_engine.get_activation_state(root)
+        if state is not None and state.version == update.version:
+            # Activated by an earlier attempt that did not restart: keep the
+            # pointer (and its previous version) as it is.
+            health = update_engine.check_install_health(root)
+            if health.state != update_engine.HEALTHY:
+                raise AppUpdateError(f"Update to {update.version} failed: installed version is {health.state}: {health.error}")
+            result = update_engine.ActivationResult(
+                version=state.version,
+                previous_version=state.previous_version,
+                current_path=root / update_engine.CURRENT_POINTER_NAME,
+                version_dir=root / update_engine.VERSIONS_DIR_NAME / state.version,
             )
-        # Already staged by an earlier attempt: activation re-verifies it.
-        result = update_engine.activate_staged_release(update.version, root)
+        else:
+            if not (root / update_engine.VERSIONS_DIR_NAME / update.version).is_dir():
+                github_updates.download_and_stage_release(
+                    UPDATE_OWNER, UPDATE_REPO, root, tag=update.tag, transport=transport
+                )
+            # Already staged by an earlier attempt: activation re-verifies it.
+            result = update_engine.activate_staged_release(update.version, root)
     except (github_updates.GitHubUpdateError, update_engine.UpdateEngineError, OSError) as exc:
         raise AppUpdateError(f"Update to {update.version} failed: {exc}") from exc
     try:
         clean_update_files(root)
-        prune_old_versions(root)
+        prune_old_versions(root, keep=keep_versions)
     except (update_engine.UpdateEngineError, OSError):
         pass  # housekeeping only; the new version is already active
     return result
@@ -173,22 +191,38 @@ def clean_update_files(install_root: Path | str) -> None:
                 shutil.rmtree(entry, ignore_errors=True)
 
 
-def prune_old_versions(install_root: Path | str) -> list[str]:
-    """Delete installed program versions other than the current and the
-    previous one (the previous stays for rollback). Program files only."""
+def prune_old_versions(install_root: Path | str, keep: tuple[str, ...] = ()) -> list[str]:
+    """Delete installed program versions other than the current, the previous
+    one (rollback) and ``keep`` (the running version). Program files only.
+
+    A version is first renamed out of versions/ and only then deleted: Windows
+    refuses the rename while a program or bot still runs from that folder, so
+    a version in use is skipped instead of being left half deleted."""
     root = Path(install_root)
     state = update_engine.get_activation_state(root)
     if state is None:
         return []
-    keep = {state.version, state.previous_version}
+    keep_set = {state.version, state.previous_version, *keep}
+    trash = root / github_updates.UPDATES_DIR_NAME / TRASH_DIR_NAME
+    if trash.parent.is_symlink() or trash.is_symlink():
+        return []
+    trash.mkdir(parents=True, exist_ok=True)
+    for leftover in trash.iterdir():
+        if leftover.is_dir() and not leftover.is_symlink():
+            shutil.rmtree(leftover, ignore_errors=True)
     removed = []
     for version in update_engine.list_installed_versions(root):
-        if version in keep:
+        if version in keep_set:
             continue
         folder = root / update_engine.VERSIONS_DIR_NAME / version
         if folder.is_symlink() or not folder.is_dir():
             continue
-        shutil.rmtree(folder, ignore_errors=True)
+        target = trash / f"{version}.{uuid.uuid4().hex}"
+        try:
+            folder.rename(target)
+        except OSError:
+            continue  # in use: try again after the next update
+        shutil.rmtree(target, ignore_errors=True)
         removed.append(version)
     return removed
 

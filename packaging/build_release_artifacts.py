@@ -416,7 +416,8 @@ def _sha256_file(path: Path) -> str:
 
 def _write_sha256_file(path: Path) -> Path:
     checksum_path = path.with_name(path.name + ".sha256")
-    checksum_path.write_text(f"{_sha256_file(path)}  {path.name}\n", encoding="utf-8")
+    # LF only: `sha256sum -c` reads "\r" as part of the file name.
+    checksum_path.write_text(f"{_sha256_file(path)}  {path.name}\n", encoding="utf-8", newline="\n")
     return checksum_path
 
 

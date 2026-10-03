@@ -295,6 +295,62 @@ class InstallUpdateTests(unittest.TestCase):
         self.assertEqual((state.version, state.previous_version), ("1.0.1", "1.0.0"))
         self.assert_user_data_untouched()
 
+    def test_second_click_after_an_unfinished_restart_keeps_rollback_and_running_version(self):
+        """Live case (03.10): the switch did not finish, Update was clicked again.
+        Re-activating set previous_version to 1.0.0 and the prune then deleted
+        the running 0.9.9 folder (only locked files survived)."""
+        self.release("1.0.0")
+        running = "0.9.0-ai7-rc4"
+        update = self.app_updates.check_for_update(running, transport=self.github)
+        self.app_updates.install_update(update, self.install_root, keep_versions=(running,), transport=self.github)
+        self.github.requests.clear()
+
+        result = self.app_updates.install_update(update, self.install_root, keep_versions=(running,), transport=self.github)
+
+        self.assertEqual(self.github.requests, [])
+        state = self.update_engine.get_activation_state(self.install_root)
+        self.assertEqual((state.version, state.previous_version), ("1.0.0", running))
+        self.assertEqual((result.version, result.previous_version), ("1.0.0", running))
+        self.assertTrue((self.install_root / "versions" / running / "_internal" / "bots" / "admin" / "manifest.json").is_file())
+
+    def test_running_version_is_never_pruned_and_a_version_in_use_is_left_whole(self):
+        for version in ("1.0.0", "1.0.1"):
+            self.release(version)
+            current = self.update_engine.get_current_version(self.install_root)
+            update = self.app_updates.check_for_update(current, transport=self.github)
+            self.app_updates.install_update(update, self.install_root, keep_versions=("0.9.0-ai7-rc4",), transport=self.github)
+        # The running version is kept even though it is neither current nor previous.
+        self.assertEqual(self.update_engine.list_installed_versions(self.install_root), ["0.9.0-ai7-rc4", "1.0.0", "1.0.1"])
+
+        old = self.install_root / "versions" / "0.9.0-ai7-rc4"
+        files_before = sorted(path.relative_to(old) for path in old.rglob("*"))
+        real_rename = Path.rename
+
+        def locked(path, target):
+            if Path(path) == old:
+                raise PermissionError(32, "The process cannot access the file because it is being used by another process")
+            return real_rename(path, target)
+
+        with mock.patch.object(Path, "rename", locked):
+            self.assertEqual(self.app_updates.prune_old_versions(self.install_root), [])
+        self.assertEqual(sorted(path.relative_to(old) for path in old.rglob("*")), files_before)
+
+        self.assertEqual(self.app_updates.prune_old_versions(self.install_root), ["0.9.0-ai7-rc4"])
+        self.assertFalse(old.exists())
+        self.assertEqual(list((self.install_root / "updates" / "trash").iterdir()), [])
+        self.assert_user_data_untouched()
+
+    def test_empty_user_folders_survive_the_update(self):
+        folders = ["runtime", "logs", "backups", "secrets", "instances/admin-main/runtime", "instances/admin-main/logs"]
+        for folder in folders:
+            (self.data_root / folder).mkdir(parents=True, exist_ok=True)
+        self.release("1.0.0")
+        update = self.app_updates.check_for_update("0.9.0-ai7-rc4", transport=self.github)
+        self.app_updates.install_update(update, self.install_root, keep_versions=("0.9.0-ai7-rc4",), transport=self.github)
+        for folder in folders:
+            self.assertTrue((self.data_root / folder).is_dir(), folder)
+        self.assert_user_data_untouched()
+
     def test_install_root_inside_user_data_is_refused(self):
         self.release("1.0.0")
         update = self.app_updates.check_for_update("0.9.0-ai7-rc4", transport=self.github)

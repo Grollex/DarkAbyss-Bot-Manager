@@ -833,6 +833,11 @@ class PackagedRuntimeTests(unittest.TestCase):
             self.assertEqual(artifacts.fresh_install_zip.name, "DarkAbyssBotManager-1.2.3-windows.zip")
             self.assertTrue(artifacts.update_sha256.is_file())
             self.assertTrue(artifacts.fresh_install_sha256.is_file())
+            # `sha256sum -c` compatible: "<hex>  <name>\n", no CR.
+            self.assertEqual(
+                artifacts.update_sha256.read_bytes(),
+                f"{sha256_bytes(artifacts.update_zip.read_bytes())}  darkabyss-release-1.2.3.zip\n".encode(),
+            )
 
             with zipfile.ZipFile(artifacts.update_zip) as archive:
                 update_members = [info.filename for info in archive.infolist()]

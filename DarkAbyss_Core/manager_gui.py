@@ -3006,8 +3006,11 @@ class ManagerMainWindow(QMainWindow):
         def run_update() -> dict[str, str]:
             # Nothing changes until the new version is verified and active; only
             # then are the bots stopped (they restart under the new version).
-            app_updates.install_update(update, installed.install_root)
-            running_now = self._running_instance_ids()
+            app_updates.install_update(update, installed.install_root, keep_versions=(installed.version,))
+            try:
+                running_now = self._running_instance_ids()
+            except manager_core.ManagerCoreError:
+                running_now = list(running)  # the new version must start regardless
             app_updates.save_resume(running_now, update.version)
             stopped = self.manager.shutdown_all()
             return {instance_id: str(value) for instance_id, value in stopped.items() if isinstance(value, Exception)}
