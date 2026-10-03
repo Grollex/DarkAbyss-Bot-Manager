@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "stream_director",
+  "display_name": "Stream Director Bot",
+  "version": "1.0.0",
+  "entrypoint": "DarkAbyss_Core/StreamDirector.py",
+  "default_config": "DarkAbyss_Core/defaults/stream_director_config.json",
+  "config_schema": "bots/stream_director/config.schema.json",
+  "config_version": 1
+}

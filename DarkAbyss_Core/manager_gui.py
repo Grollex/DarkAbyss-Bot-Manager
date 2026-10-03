@@ -55,9 +55,14 @@ import ai_storage
 import ai_usage
 import app_paths
 import app_updates
+import bot_i18n
 import game_presence
 import manager_dashboard as dash
 import manager_game_presence
+import manager_kairo
+import manager_setup_state
+import manager_stream_director
+import stream_director_config
 import manager_groups
 import manager_terminal
 import runtime_layout
@@ -121,10 +126,62 @@ GAME_PRESENCE_BOT_TYPE_ID = "game_presence"
 # Game Presence only reads presence/voice and posts suggestions with buttons.
 DISCORD_GAME_PRESENCE_PERMISSIONS = DISCORD_PERMISSION_BITS["View Channels"] | DISCORD_PERMISSION_BITS["Send Messages"]
 GAME_PRESENCE_INVITE_SCOPES = ("bot",)
+STREAM_DIRECTOR_BOT_TYPE_ID = "stream_director"
+# Stream Director: its card + thread, slash commands, and Discord events for the next stream.
+DISCORD_STREAM_DIRECTOR_PERMISSIONS = (
+    DISCORD_PERMISSION_BITS["View Channels"]
+    | DISCORD_PERMISSION_BITS["Send Messages"]
+    | DISCORD_PERMISSION_BITS["Embed Links"]
+    | DISCORD_PERMISSION_BITS["Read Message History"]
+    | DISCORD_PERMISSION_BITS["Create Public Threads"]
+    | DISCORD_PERMISSION_BITS["Send Messages in Threads"]
+    | DISCORD_PERMISSION_BITS["Manage Events"]
+)
+# Bot types that use AI connections (the AI page lists only these).
+AI_BOT_TYPES = frozenset({"admin", "game_presence"})
+# Bot types whose setup wizard is only name, token, intents and invite.
+LIGHT_SETUP_BOT_TYPES = frozenset({"game_presence", "stream_director"})
+# Language each type used before languages existed (old configs keep it).
+DEFAULT_BOT_LANGUAGES = {"admin": "en", "game_presence": "ru", "stream_director": "en"}
+LANGUAGE_HELP = (
+    "Everything this bot writes in Discord: replies, errors, confirmations, buttons, automatic posts and AI answers. "
+    "Each bot has its own language."
+)
+
+
+def default_bot_language(bot_type: str) -> str:
+    return DEFAULT_BOT_LANGUAGES.get(bot_type, bot_i18n.DEFAULT_LANGUAGE)
+
+
+def language_combo() -> QComboBox:
+    combo = QComboBox()
+    for code, label in bot_i18n.LANGUAGES.items():
+        combo.addItem(label, code)
+    combo.setToolTip(LANGUAGE_HELP)
+    return combo
+
+
+def select_language(combo: QComboBox, language: str) -> None:
+    index = combo.findData(language)
+    combo.setCurrentIndex(index if index >= 0 else 0)
+
+
+def apply_notes(bot_type: str, *, token_changed: bool, running: bool) -> str:
+    """When the saved setup takes effect (shown after Save)."""
+    if bot_type == ADMIN_BOT_TYPE_ID:
+        notes = ["Access, AI and language settings apply to the next command (no restart); slash command descriptions change after a restart."]
+    elif bot_type == STREAM_DIRECTOR_BOT_TYPE_ID:
+        notes = ["The language applies within 15 s while the bot runs; slash command descriptions change after a restart."]
+    else:
+        notes = ["The language applies within 15 s while the bot runs."]
+    if token_changed:
+        notes.append("Restart required: the bot is still connected with the old token." if running else "The new token is used when the bot starts.")
+    return " ".join(notes)
 # What each bot type can do (shown on the dashboard instead of module toggles).
 BOT_TYPE_CAPABILITIES: dict[str, str] = {
     ADMIN_BOT_TYPE_ID: "Slash commands · AI assistant · AI terminal · @mentions",
     GAME_PRESENCE_BOT_TYPE_ID: "Game suggestions · Mute/Allow buttons · AI wording (optional)",
+    STREAM_DIRECTOR_BOT_TYPE_ID: "Twitch sessions · moments · challenges · polls · inbox · community level · recaps",
 }
 
 SETUP_HELP_TEXT: dict[str, tuple[str, str]] = {
@@ -356,12 +413,15 @@ def validate_application_id(text: str) -> str:
 
 def build_discord_invite_url(application_id: str, bot_type: str = ADMIN_BOT_TYPE_ID) -> str:
     client_id = validate_application_id(application_id)
-    game_presence = bot_type == GAME_PRESENCE_BOT_TYPE_ID
+    permissions, scopes = {
+        GAME_PRESENCE_BOT_TYPE_ID: (DISCORD_GAME_PRESENCE_PERMISSIONS, GAME_PRESENCE_INVITE_SCOPES),
+        STREAM_DIRECTOR_BOT_TYPE_ID: (DISCORD_STREAM_DIRECTOR_PERMISSIONS, DISCORD_BOT_INVITE_SCOPES),
+    }.get(bot_type, (DISCORD_ADMIN_BOT_PERMISSIONS, DISCORD_BOT_INVITE_SCOPES))
     query = urlencode(
         {
             "client_id": client_id,
-            "permissions": str(DISCORD_GAME_PRESENCE_PERMISSIONS if game_presence else DISCORD_ADMIN_BOT_PERMISSIONS),
-            "scope": " ".join(GAME_PRESENCE_INVITE_SCOPES if game_presence else DISCORD_BOT_INVITE_SCOPES),
+            "permissions": str(permissions),
+            "scope": " ".join(scopes),
             "integration_type": "0",
         }
     )
@@ -845,6 +905,11 @@ BOT_TYPE_HINTS = {
         "token (create a second application in the Developer Portal). AI wording is optional: it uses the "
         "Base Set or the bot's own connections (AI Providers)."
     ),
+    STREAM_DIRECTOR_BOT_TYPE_ID: (
+        "Turns every Twitch stream into a Discord community session: live card and thread, moments, challenges, "
+        "polls, streamer inbox, community level and goals, recap. Needs its OWN Discord application and token; "
+        "Twitch is connected on the Stream Director page. No AI and no privileged intents needed."
+    ),
 }
 
 
@@ -898,12 +963,16 @@ class BotSetupDialog(QDialog):
         instance_api=instance_store,
         config_api=config_store,
         parent: QWidget | None = None,
+        is_running: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self._instance_id = instance_id
         self._instance_api = instance_api
         self._config_api = config_api
+        self._is_running = is_running or (lambda: False)
         self._last_error = ""
+        self._saved_form: tuple | None = None
+        self._loading = False
         self.start_requested = False
         self.setWindowTitle(f"Setup Bot: {instance_id}")
         self.resize(760, 540)
@@ -913,10 +982,21 @@ class BotSetupDialog(QDialog):
             loaded_type = getattr(instance_api.load_instance(instance_id), "bot_type", ADMIN_BOT_TYPE_ID)
         except Exception:
             loaded_type = ADMIN_BOT_TYPE_ID
-        self.bot_type = loaded_type if loaded_type == GAME_PRESENCE_BOT_TYPE_ID else ADMIN_BOT_TYPE_ID
+        self.bot_type = loaded_type if loaded_type in LIGHT_SETUP_BOT_TYPES else ADMIN_BOT_TYPE_ID
         self.is_game_presence = self.bot_type == GAME_PRESENCE_BOT_TYPE_ID
+        self.is_stream_director = self.bot_type == STREAM_DIRECTOR_BOT_TYPE_ID
+        # Name, token, intents and invite only; the bot's options live on its own page.
+        self.is_light = self.bot_type in LIGHT_SETUP_BOT_TYPES
 
-        if self.is_game_presence:
+        if self.is_stream_director:
+            self.step_names = [
+                "Manager Name",
+                "Discord Application / Token",
+                "Gateway Intents (none privileged)",
+                "Invite Bot",
+                "Ready",
+            ]
+        elif self.is_game_presence:
             self.step_names = [
                 "Manager Name",
                 "Discord Application / Token",
@@ -939,6 +1019,7 @@ class BotSetupDialog(QDialog):
         self.instructions_label.setWordWrap(True)
 
         self.display_name_edit = QLineEdit()
+        self.language_combo = language_combo()
         self.instance_id_label = QLabel(instance_id)
         self.display_name_help_button = self._create_help_button("display_name")
 
@@ -963,7 +1044,11 @@ class BotSetupDialog(QDialog):
         self.intent_ack_checkbox = QCheckBox(
             "I enabled Presence Intent and Server Members Intent in Discord Developer Portal"
             if self.is_game_presence
-            else "I enabled Server Members Intent in Discord Developer Portal"
+            else (
+                "I understand: no privileged intent is needed for Stream Director"
+                if self.is_stream_director
+                else "I enabled Server Members Intent in Discord Developer Portal"
+            )
         )
         self.open_intent_portal_button = QPushButton("Open Developer Portal")
         self.open_intent_portal_button.clicked.connect(self.open_application_bot_page)
@@ -1013,12 +1098,15 @@ class BotSetupDialog(QDialog):
         self.ready_summary_label = QLabel("")
         self.ready_summary_label.setWordWrap(True)
         self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        # Saved / unsaved changes / just saved (and when it applies) / not saved.
+        self.save_indicator = dash.SaveIndicator()
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_display_name_page())
         self.pages.addWidget(self._build_token_page())
         self.pages.addWidget(self._build_intent_page())
-        if not self.is_game_presence:
+        if not self.is_light:
             self.pages.addWidget(self._build_access_page())
         self.invite_page = self._build_invite_page()
         self.pages.addWidget(self.invite_page)
@@ -1049,11 +1137,35 @@ class BotSetupDialog(QDialog):
         layout.addWidget(self.instructions_label)
         layout.addWidget(self.pages)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.save_indicator)
         layout.addLayout(button_row)
         self.setLayout(layout)
 
         self.load_setup()
         self._on_page_changed(0)
+        for edit in (
+            self.display_name_edit,
+            self.token_edit,
+            self.application_id_edit,
+            self.allowed_users_edit,
+            self.allowed_roles_edit,
+            self.audit_channel_edit,
+            self.ai_allowed_users_edit,
+            self.ai_allowed_roles_edit,
+            self.ai_control_channel_edit,
+            self.ai_mention_channels_edit,
+        ):
+            edit.textChanged.connect(lambda _text: self._update_dirty())
+        for box in (
+            self.intent_ack_checkbox,
+            self.invited_ack_checkbox,
+            self.allow_admins_checkbox,
+            self.ai_read_content_checkbox,
+            self.ai_mention_checkbox,
+        ):
+            box.toggled.connect(lambda _checked: self._update_dirty())
+        for combo in (self.language_combo, self.ai_confirmation_combo):
+            combo.currentIndexChanged.connect(lambda _index: self._update_dirty())
 
     @property
     def last_error(self) -> str:
@@ -1069,6 +1181,10 @@ class BotSetupDialog(QDialog):
         form = QFormLayout()
         form.addRow("Instance ID", self.instance_id_label)
         form.addRow(self._help_label("Manager display name", self.display_name_help_button), self.display_name_edit)
+        form.addRow("Bot language", self.language_combo)
+        language_note = dash.muted(LANGUAGE_HELP)
+        language_note.setWordWrap(True)
+        form.addRow("", language_note)
         layout = QVBoxLayout()
         layout.addWidget(description)
         layout.addLayout(form)
@@ -1100,7 +1216,14 @@ class BotSetupDialog(QDialog):
 
     def _build_intent_page(self) -> QWidget:
         page = QWidget()
-        if self.is_game_presence:
+        if self.is_stream_director:
+            description = QLabel(
+                "Stream Director needs no privileged intent: slash commands and buttons work without intents, and it only "
+                "counts messages in its own session thread (Message Content Intent stays OFF).\n"
+                "Leave Presence, Server Members and Message Content intents disabled for this application."
+            )
+            steps = QLabel("Nothing to enable in the Developer Portal for intents. Continue to the invite step.")
+        elif self.is_game_presence:
             description = QLabel(
                 "The Game Presence bot needs two privileged intents of ITS OWN Discord application: Presence Intent "
                 "(who plays what) and Server Members Intent. Message Content Intent is not needed.\n"
@@ -1161,12 +1284,19 @@ class BotSetupDialog(QDialog):
 
     def _build_invite_page(self) -> QWidget:
         page = QWidget()
-        permissions_text = (
-            "The Game Presence invite asks only for View Channels and Send Messages (no slash commands, no "
-            "moderation permissions).\n"
-            if self.is_game_presence
-            else "Manager generates the invite link with the required granular permissions. It does not request Administrator permission.\n"
-        )
+        if self.is_stream_director:
+            permissions_text = (
+                "The Stream Director invite asks for View Channels, Send Messages, Embed Links, Read Message History, "
+                "Create Public Threads, Send Messages in Threads and Manage Events (for /nextstream), plus slash commands. "
+                "No moderation permissions.\n"
+            )
+        elif self.is_game_presence:
+            permissions_text = (
+                "The Game Presence invite asks only for View Channels and Send Messages (no slash commands, no "
+                "moderation permissions).\n"
+            )
+        else:
+            permissions_text = "Manager generates the invite link with the required granular permissions. It does not request Administrator permission.\n"
         description = QLabel(
             permissions_text
             + "It targets Discord Guild Install. Private applications may require Installation -> Install Link = None; shareable installs may use Public Bot = ON.\n"
@@ -1201,21 +1331,40 @@ class BotSetupDialog(QDialog):
         return page
 
     def load_setup(self) -> None:
+        """Show what is stored now: config, token status and the wizard steps."""
         try:
             instance = self._instance_api.load_instance(self._instance_id)
             snapshot = self._config_api.get_config_snapshot(self._instance_id)
         except (instance_store.InstanceStoreError, config_store.ConfigStoreError) as exc:
             self._set_error(str(exc))
+            self.save_indicator.show_error(f"the saved setup could not be read ({exc}).")
             return
+        self._loading = True
+        try:
+            self._fill_from(instance, snapshot.effective)
+        finally:
+            self._loading = False
+        self._saved_form = self._form_state()
+        self._last_error = ""
+        self.status_label.setText("")
+        self.save_indicator.show_clean()
 
-        effective = snapshot.effective
+    def _fill_from(self, instance: Any, effective: dict[str, Any]) -> None:
         self.display_name_edit.setText(instance.display_name)
         self.token_edit.clear()
         self.token_status_label.setText(token_status_text(instance.paths.token))
-        if self.is_game_presence:
+        try:
+            language = bot_i18n.normalize_language(effective.get("language"), default_bot_language(self.bot_type))
+        except bot_i18n.LanguageError:
+            language = default_bot_language(self.bot_type)
+        select_language(self.language_combo, language)
+        steps = manager_setup_state.load(self._instance_id)
+        self.application_id_edit.setText(steps.application_id)
+        self.intent_ack_checkbox.setChecked(steps.intents_confirmed)
+        self.invited_ack_checkbox.setChecked(steps.invited)
+        if self.is_light:
             self._update_invite_preview()
             self._update_ready_summary()
-            self._set_status("Loaded setup.")
             return
         self.allow_admins_checkbox.setChecked(bool(effective.get("allow_server_administrators", True)))
         self.allowed_users_edit.setText(", ".join(str(value) for value in effective.get("allowed_user_ids", [])))
@@ -1233,10 +1382,70 @@ class BotSetupDialog(QDialog):
         self.ai_mention_channels_edit.setText(", ".join(str(value) for value in effective.get("ai_mention_channel_ids", [])))
         self._update_invite_preview()
         self._update_ready_summary()
-        self._set_status("Loaded setup.")
+
+    def _form_state(self) -> tuple:
+        return (
+            self.display_name_edit.text().strip(),
+            bool(self.token_edit.text().strip()),
+            self.language_combo.currentData(),
+            self.application_id_edit.text().strip(),
+            self.intent_ack_checkbox.isChecked(),
+            self.invited_ack_checkbox.isChecked(),
+            self.allow_admins_checkbox.isChecked(),
+            self.allowed_users_edit.text().strip(),
+            self.allowed_roles_edit.text().strip(),
+            self.audit_channel_edit.text().strip(),
+            self.ai_allowed_users_edit.text().strip(),
+            self.ai_allowed_roles_edit.text().strip(),
+            self.ai_control_channel_edit.text().strip(),
+            self.ai_confirmation_combo.currentData(),
+            self.ai_read_content_checkbox.isChecked(),
+            self.ai_mention_checkbox.isChecked(),
+            self.ai_mention_channels_edit.text().strip(),
+        )
+
+    @property
+    def dirty(self) -> bool:
+        return self._saved_form is not None and self._form_state() != self._saved_form
+
+    def _update_dirty(self) -> None:
+        if self._loading or self._saved_form is None:
+            return
+        if self.dirty:
+            self.save_indicator.show_dirty()
+        elif self.save_indicator.state == "dirty":
+            self.save_indicator.show_clean()
+
+    def _save_steps(self) -> None:
+        manager_setup_state.save(
+            self._instance_id,
+            manager_setup_state.SetupSteps(
+                application_id=self.application_id_edit.text().strip(),
+                intents_confirmed=self.intent_ack_checkbox.isChecked(),
+                invited=self.invited_ack_checkbox.isChecked(),
+            ),
+        )
+
+    def _saved(self, token_changed: bool) -> None:
+        """Reload from storage, then say that it worked and when it applies."""
+        self.load_setup()
+        self.save_indicator.show_saved(apply_notes(self.bot_type, token_changed=token_changed, running=self._is_running()))
+
+    def reject(self) -> None:
+        if self.dirty:
+            answer = QMessageBox.question(
+                self,
+                "Unsaved changes",
+                "This setup has unsaved changes. Close without saving them?",
+                QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Discard:
+                return
+        super().reject()
 
     def save_setup(self) -> bool:
-        if self.is_game_presence:
+        if self.is_light:
             return self._save_name_and_token()
         try:
             instance = self._instance_api.load_instance(self._instance_id)
@@ -1245,6 +1454,7 @@ class BotSetupDialog(QDialog):
             overrides = dict(self._config_api.get_config_snapshot(self._instance_id).overrides)
             overrides.update(
                 {
+                    "language": self.language_combo.currentData() or default_bot_language(self.bot_type),
                     "allow_server_administrators": self.allow_admins_checkbox.isChecked(),
                     "allowed_user_ids": parse_id_list(self.allowed_users_edit.text()),
                     "allowed_role_ids": parse_id_list(self.allowed_roles_edit.text()),
@@ -1282,26 +1492,36 @@ class BotSetupDialog(QDialog):
             if token:
                 token_path = _ensure_safe_token_path(instance)
                 _atomic_write_text(token_path, f"{token}\n")
+            self._save_steps()
         except (ValueError, OSError, instance_store.InstanceStoreError, config_store.ConfigStoreError) as exc:
             self._set_error(str(exc))
+            self.save_indicator.show_error(str(exc))
             return False
-        self._set_status("Setup saved.")
-        self.load_setup()
+        self._saved(token_changed=bool(token))
         return True
 
     def _save_name_and_token(self) -> bool:
-        """Game Presence setup writes only the display name and THIS bot's token."""
+        """Game Presence / Stream Director setup: display name, language and THIS bot's token
+        (their other settings live on their own page)."""
         try:
             instance = self._instance_api.load_instance(self._instance_id)
             token = self.token_edit.text().strip()
+            snapshot = self._config_api.get_config_snapshot(self._instance_id)
+            language = self.language_combo.currentData() or default_bot_language(self.bot_type)
+            current = bot_i18n.normalize_language(snapshot.effective.get("language"), default_bot_language(self.bot_type))
             self._instance_api.update_instance_display_name(self._instance_id, self.display_name_edit.text().strip())
+            if language != current or "language" not in snapshot.overrides:
+                self._config_api.save_config_overrides(self._instance_id, {**snapshot.overrides, "language": language})
             if token:
                 _atomic_write_text(_ensure_safe_token_path(instance), f"{token}\n")
-        except (ValueError, OSError, instance_store.InstanceStoreError, config_store.ConfigStoreError) as exc:
+            self._save_steps()
+        except (ValueError, OSError, instance_store.InstanceStoreError, config_store.ConfigStoreError, bot_i18n.LanguageError) as exc:
             self._set_error(str(exc))
+            self.save_indicator.show_error(str(exc))
             return False
-        self._set_status("Setup saved. Choose the server and channel on the Game Presence page.")
-        self.load_setup()
+        self._saved(token_changed=bool(token))
+        page = "Stream Director" if self.is_stream_director else "Game Presence"
+        self.status_label.setText(f"Server, channel and the other settings of this bot: the {page} page.")
         return True
 
     def save_and_start(self) -> None:
@@ -1450,12 +1670,17 @@ class BotSetupDialog(QDialog):
             (
                 "[NEXT] Server, channel, delays and cooldowns: Manager -> Game Presence page"
                 if self.is_game_presence
-                else "[OK] Access settings are edited in this wizard and saved locally when you click Save"
+                else (
+                    "[NEXT] Stream channel, Twitch account and community options: Manager -> Stream Director page"
+                    if self.is_stream_director
+                    else "[OK] Access settings are edited in this wizard and saved locally when you click Save\n"
+                    "[INFO] Social Awareness (optional): Manager -> Kairo page; asked once when the bot is started"
+                )
             ),
             "",
             "USER-CONFIRMED DISCORD STEPS:",
             f"{'[OK]' if self.intent_ack_checkbox.isChecked() else '[ACTION]'} "
-            + ("Presence Intent + Server Members Intent" if self.is_game_presence else "Server Members Intent")
+            + ("Presence Intent + Server Members Intent" if self.is_game_presence else ("No privileged intent" if self.is_stream_director else "Server Members Intent"))
             + " user-confirmed external step"
             + ("" if self.intent_ack_checkbox.isChecked() else " - Manager cannot verify this automatically"),
             f"{'[OK]' if self.invited_ack_checkbox.isChecked() else '[ACTION]'} Bot invited user-confirmed external step" + ("" if self.invited_ack_checkbox.isChecked() else " - open invite page and authorize the bot"),
@@ -1519,6 +1744,8 @@ class ManagerMainWindow(QMainWindow):
         self.available_update: app_updates.AvailableUpdate | None = None
         self._update_check_running = False
         self._update_installing = False
+        # One-time Social Awareness question when a Kairo bot is started (replaceable in tests).
+        self.ask_social_awareness = manager_kairo.ask_social_awareness
         self._update_error = ""
         self._update_checked_at: datetime | None = None
 
@@ -1563,7 +1790,9 @@ class ManagerMainWindow(QMainWindow):
             ("bots", self._build_bots_page),
             ("ai", self._build_ai_page),
             ("terminal", self._build_terminal_page),
+            ("kairo", self._build_kairo_page),
             ("presence", self._build_presence_page),
+            ("stream", self._build_stream_page),
             ("commands", self._build_commands_page),
             ("logs", self._build_logs_page),
         ):
@@ -1631,7 +1860,9 @@ class ManagerMainWindow(QMainWindow):
             ("bots", "\U0001f916   Bots"),
             ("ai", "\U0001f9e0   AI Providers"),
             ("terminal", "\U0001f4ac   AI Terminal"),
+            ("kairo", "\U0001f9ed   Kairo"),
             ("presence", "\U0001f3ae   Game Presence"),
+            ("stream", "\U0001f3ac   Stream Director"),
             ("commands", "∕   Commands && Tools"),
             ("logs", "\U0001f4c4   Logs"),
         ):
@@ -1842,6 +2073,38 @@ class ManagerMainWindow(QMainWindow):
             self._all_bots, self._config_api, self.restart_instance
         )
         return self.presence_panel
+
+    def _build_kairo_page(self) -> QWidget:
+        # Admin (Kairo) bots: language and Social Awareness.
+        self.kairo_panel = manager_kairo.KairoPanel(self._all_bots, self._config_api, self.restart_instance)
+        return self.kairo_panel
+
+    def _build_stream_page(self) -> QWidget:
+        self.stream_panel = manager_stream_director.StreamDirectorPanel(
+            self._all_bots, self._config_api, self.restart_instance, self._start_worker
+        )
+        return self.stream_panel
+
+    def _stream_summary(self, info: manager_core.InstanceInfo) -> str | None:
+        """One line for the dashboard: what the Stream Director bot is doing."""
+        if info.bot_type != STREAM_DIRECTOR_BOT_TYPE_ID:
+            return None
+        if info.state == manager_core.STATE_RUNNING:
+            status = admin_terminal.read_runtime_json(
+                admin_terminal.runtime_dir_for_logs(info.logs_dir), manager_stream_director.STATUS_FILE_NAME
+            )
+            if isinstance(status, dict):
+                diagnosis = status.get("diagnosis") or {}
+                twitch_title, _color, _details = manager_stream_director.twitch_lines(status.get("twitch"))
+                if diagnosis.get("text"):
+                    return f"{diagnosis['text']} · {twitch_title}"
+        try:
+            data = stream_director_config.normalize_config(self._config_api.get_config_snapshot(info.instance_id).effective)
+        except Exception:
+            return "Config problem: open the Stream Director page."
+        if not stream_director_config.is_configured(data):
+            return "Not configured: choose the stream channel on the Stream Director page."
+        return None if info.state == manager_core.STATE_RUNNING else "Stopped."
 
     def _presence_summary(self, info: manager_core.InstanceInfo) -> str | None:
         """One line for the dashboard: the Game Presence bot's current reason/state."""
@@ -2186,8 +2449,13 @@ class ManagerMainWindow(QMainWindow):
             self.refresh_logs()
         if name == "terminal":
             self.terminal_panel.refresh_targets()
+        # Showing a page again keeps unsaved edits of the same bot (still marked unsaved).
         if name == "presence":
-            self.presence_panel.refresh()
+            self.presence_panel.refresh(keep_edits=True)
+        if name == "stream":
+            self.stream_panel.refresh(keep_edits=True)
+        if name == "kairo":
+            self.kairo_panel.refresh(keep_edits=True)
 
     def _open_setup_from_nav(self) -> None:
         if self.selected_instance_id() is None and self.instance_table.rowCount() > 0:
@@ -2268,6 +2536,9 @@ class ManagerMainWindow(QMainWindow):
             if presence:
                 # "Online" alone said nothing about whether suggestions can happen.
                 facts.append(f"Game Presence: {presence}")
+            stream = self._stream_summary(info)
+            if stream:
+                facts.append(f"Stream Director: {stream}")
             if info.pid is not None:
                 facts.append(f"PID: {info.pid}")
             if info.uptime_seconds is not None:
@@ -2285,7 +2556,8 @@ class ManagerMainWindow(QMainWindow):
 
     def _refresh_ai_choices(self) -> None:
         current = self.ai_bot_combo.currentData()
-        wanted = [(info.instance_id, f"{info.display_name} ({info.instance_id}) · {info.bot_type_display_name}") for info in self._last_infos]
+        ai_infos = self._ai_infos()
+        wanted = [(info.instance_id, f"{info.display_name} ({info.instance_id}) · {info.bot_type_display_name}") for info in ai_infos]
         existing = [(self.ai_bot_combo.itemData(index), self.ai_bot_combo.itemText(index)) for index in range(self.ai_bot_combo.count())]
         if existing == wanted:
             return
@@ -2296,7 +2568,7 @@ class ManagerMainWindow(QMainWindow):
         index = self.ai_bot_combo.findData(current)
         if index < 0:
             # Default: the first Admin bot (the one that uses AI the most).
-            index = next((i for i, info in enumerate(self._last_infos) if info.bot_type == ADMIN_BOT_TYPE_ID), 0)
+            index = next((i for i, info in enumerate(ai_infos) if info.bot_type == ADMIN_BOT_TYPE_ID), 0)
         self.ai_bot_combo.setCurrentIndex(index if self.ai_bot_combo.count() else -1)
         self.ai_bot_combo.blockSignals(False)
         self.refresh_ai_overview()
@@ -2335,7 +2607,7 @@ class ManagerMainWindow(QMainWindow):
     def _usage_stores(self) -> list[ai_usage.AIUsageStore]:
         """Every bot's usage + the Manager's (Test Connection): limits are per key."""
         stores = []
-        for info in self._last_infos:
+        for info in self._ai_infos():
             try:
                 stores.append(self.ai_stores_for(info.instance_id).usage)
             except (ai_storage.AIStorageError, instance_store.InstanceStoreError):
@@ -2343,10 +2615,14 @@ class ManagerMainWindow(QMainWindow):
         stores.append(self.manager_usage)
         return stores
 
+    def _ai_infos(self) -> list[manager_core.InstanceInfo]:
+        """Instances of bot types that use AI connections (Stream Director does not)."""
+        return [info for info in self._last_infos if info.bot_type in AI_BOT_TYPES]
+
     def _bots_using(self, connection_id: str, config: ai_connections.ConnectionsConfig) -> list[str]:
         """Bots whose current route (base set or own choice) includes the connection."""
         names = []
-        for info in self._last_infos:
+        for info in self._ai_infos():
             selection = self._bot_selection(info.instance_id) or ai_connections.BotSelection()
             if connection_id in selection.route(config).connection_ids():
                 names.append(info.display_name)
@@ -2358,7 +2634,7 @@ class ManagerMainWindow(QMainWindow):
         users = []
         base_bots = []
         custom_bots = []
-        for info in self._last_infos:
+        for info in self._ai_infos():
             selection = self._bot_selection(info.instance_id) or ai_connections.BotSelection()
             if selection.mode == ai_connections.MODE_BASE:
                 base_bots.append(info.display_name)
@@ -2870,7 +3146,13 @@ class ManagerMainWindow(QMainWindow):
         if instance_id is None:
             self._show_error("Select an instance first.")
             return
-        dialog = BotSetupDialog(instance_id, self._instance_api, self._config_api, self)
+        dialog = BotSetupDialog(
+            instance_id,
+            self._instance_api,
+            self._config_api,
+            self,
+            is_running=lambda: any(info.instance_id == instance_id and info.state == manager_core.STATE_RUNNING for info in self._last_infos),
+        )
         accepted = dialog.exec()
         self.refresh_instances()
         if accepted == QDialog.Accepted and dialog.start_requested:
@@ -3108,6 +3390,12 @@ class ManagerMainWindow(QMainWindow):
         if instance_id in self._busy_instances:
             self._set_light_error(f"Action already in progress for {instance_id}.")
             return
+        info = next((item for item in self._last_infos if item.instance_id == instance_id), None)
+        if action_name in ("start", "restart") and getattr(info, "bot_type", None) == ADMIN_BOT_TYPE_ID:
+            # Kairo that never saved a Social Awareness choice: ask once, then remember.
+            if not manager_kairo.ensure_social_awareness_choice(self, instance_id, self._config_api, self.ask_social_awareness):
+                self._set_status(f"{action_name.capitalize()} cancelled for {instance_id}.")
+                return
         self._busy_instances.add(instance_id)
         self._update_buttons()
 
@@ -3195,8 +3483,26 @@ class ManagerMainWindow(QMainWindow):
     def _update_selected_details(self) -> None:
         instance_id = self.selected_instance_id()
         info = next((item for item in self._last_infos if item.instance_id == instance_id), None)
-        self.details_view.setPlainText("" if info is None else instance_info_details(info))
+        text = "" if info is None else instance_info_details(info)
+        if info is not None:
+            text += "".join(f"\n{line}" for line in self._saved_bot_settings_lines(info))
+        self.details_view.setPlainText(text)
         self._update_buttons()
+
+    def _saved_bot_settings_lines(self, info: manager_core.InstanceInfo) -> list[str]:
+        """The bot's saved language (and Kairo's Social Awareness choice) for the details view."""
+        try:
+            effective = self._config_api.get_config_snapshot(info.instance_id).effective
+            language = bot_i18n.normalize_language(effective.get("language"), default_bot_language(info.bot_type))
+        except Exception:
+            return ["Bot language: config problem (open Advanced JSON)"]
+        lines = [f"Bot language: {bot_i18n.LANGUAGES.get(language, language)}"]
+        if info.bot_type == ADMIN_BOT_TYPE_ID:
+            choice = effective.get(manager_kairo.sa.CONFIG_ENABLED)
+            lines.append(
+                "Social Awareness: " + ("on" if choice is True else "off" if choice is False else "not chosen yet (asked at start)")
+            )
+        return lines
 
     def _update_buttons(self) -> None:
         instance_id = self.selected_instance_id()

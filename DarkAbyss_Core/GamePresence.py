@@ -10,6 +10,7 @@ lives in its instance folder:
     instances/<id>/data/ai_usage.json     this bot's provider-reported AI usage
     instances/<id>/data/game_presence_state.json   opt-outs, history, cooldowns
     instances/<id>/runtime/               lock, bot_status.json, game_presence_status.json
+    runtime/bot_events/<id>.json          what this bot posted (read by Kairo's Social Awareness)
 
 Gateway intents: guilds, members (privileged), presences (privileged) and
 voice states. No Message Content Intent. Interactions need no intent.
@@ -37,6 +38,7 @@ from discord.ext import tasks
 import admin_features
 import admin_terminal
 import app_paths
+import bot_events
 import bot_registry
 import config_store
 import game_presence
@@ -75,6 +77,7 @@ class GamePresenceRuntimeContext:
     lock_path: Path
     runtime_dir: Path
     data_dir: Path
+    display_name: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -103,6 +106,7 @@ def resolve_runtime(instance_id: str) -> GamePresenceRuntimeContext:
         lock_path=instance.paths.runtime_dir / LOCK_FILE_NAME,
         runtime_dir=instance.paths.runtime_dir,
         data_dir=instance.paths.data_dir,
+        display_name=instance.display_name,
     )
 
 
@@ -224,6 +228,13 @@ class InstanceAI:
             return self._ai
 
 
+def _event_publisher(instance_id: str) -> bot_events.EventPublisher | None:
+    try:
+        return bot_events.EventPublisher(instance_id, BOT_TYPE_ID)
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------
 # the bot
 # --------------------------------------------------------------------------
@@ -242,6 +253,7 @@ class GamePresenceBot(discord.Client):
             rewriter=game_presence_discord.make_ai_rewriter(self.ai.get),
             runtime_dir=runtime.runtime_dir,
             presence_intent=True,
+            events=_event_publisher(runtime.instance_id),
         )
         self._ticks = 0
         self._last_bot_status: str | None = None
@@ -283,8 +295,23 @@ class GamePresenceBot(discord.Client):
         self.presence_runtime.write_status()
         return True
 
+    def heartbeat(self, force: bool = False) -> None:
+        """"Running" for the other DarkAbyss bots (Kairo's awareness); at most once a minute."""
+        events = self.presence_runtime.events
+        if events is None:
+            return
+        user = getattr(self, "user", None)
+        events.heartbeat(
+            display_name=self.context.display_name,
+            discord_user_id=getattr(user, "id", None),
+            discord_name=getattr(user, "display_name", None) or getattr(user, "name", "") or "",
+            guild_ids=[guild.id for guild in getattr(self, "guilds", [])],
+            force=force,
+        )
+
     async def run_tick(self) -> None:
         self._ticks += 1
+        self.heartbeat()
         if self._ticks % STATUS_REFRESH_EVERY_TICKS == 0:
             self.refresh_bot_status()
         self.reload_config()
@@ -315,10 +342,16 @@ class GamePresenceBot(discord.Client):
 
     async def on_ready(self) -> None:
         print(f"Game Presence Bot is online as {self.user}")
+        self.heartbeat(force=True)
         self.refresh_bot_status()
         self.presence_runtime.seed()
         if not self.publish_state_problem():
             self.presence_runtime.write_status()
+
+    async def close(self) -> None:
+        if self.presence_runtime.events is not None:
+            self.presence_runtime.events.stopped()
+        await super().close()
 
     # -- Discord events -----------------------------------------------------------
 
@@ -346,7 +379,7 @@ class GamePresenceBot(discord.Client):
         if interaction.type is not discord.InteractionType.component:
             return
         try:
-            await game_presence_discord.handle_preference_interaction(interaction, self.preferences)
+            await game_presence_discord.handle_preference_interaction(interaction, self.preferences, self.presence_runtime.engine.config.language)
         except Exception as exc:  # pragma: no cover
             print(f"Game Presence button error: {type(exc).__name__}")
 

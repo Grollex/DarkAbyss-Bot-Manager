@@ -42,6 +42,15 @@ def load_gui_module(data_root: Path):
         "app_updates",
         "github_updates",
         "update_engine",
+        "manager_stream_director",
+        "stream_director",
+        "stream_director_config",
+        "stream_director_store",
+        "stream_director_twitch",
+        "manager_setup_state",
+        "manager_kairo",
+        "social_awareness",
+        "social_memory",
     ):
         sys.modules.pop(module_name, None)
     return importlib.import_module("manager_gui")
@@ -297,6 +306,26 @@ class ManagerGuiTests(unittest.TestCase):
         window.start_selected()
 
         self.assertIn(("start", "admin-second"), manager.calls)
+
+    def test_first_kairo_start_asks_about_social_awareness_once(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        config_api = FakeConfigApi()
+        config_api.snapshot.defaults["social_awareness_enabled"] = None
+        config_api.snapshot.effective["social_awareness_enabled"] = None
+        window = self.make_window(manager=manager, config_api=config_api)
+        self.finish_workers_immediately(window)
+        self.select_instance(window, "admin-second")
+        answers = [None, True]
+        window.ask_social_awareness = lambda parent: answers.pop(0)
+        window.start_selected()  # cancelled in the question
+        self.assertNotIn(("start", "admin-second"), manager.calls)
+        self.assertEqual(config_api.saved, [])
+        window.start_selected()
+        self.assertIn(("start", "admin-second"), manager.calls)
+        self.assertIs(config_api.saved[-1][1]["social_awareness_enabled"], True)
+        window.ask_social_awareness = lambda parent: self.fail("asked twice")
+        window.start_selected()
+        self.assertIn("Social Awareness: on", window.details_view.toPlainText())
 
     def test_dashboard_navigation_cards_and_toggle(self):
         manager = FakeManager(self.manager_gui.manager_core)
@@ -594,6 +623,7 @@ class ManagerGuiTests(unittest.TestCase):
                 "admin-main",
                 {
                     "allowed_user_ids": ["111", "222"],
+                    "language": "en",  # the bot's language is saved explicitly
                     "allow_server_administrators": False,
                     "allowed_role_ids": ["333", "444"],
                     "audit_channel_id": "555",
@@ -1221,7 +1251,9 @@ class PerInstanceManagerTests(unittest.TestCase):
         self.assertTrue(dialog.save_setup())
         self.assertEqual(instance_api.token_path.read_text(encoding="utf-8"), "FAKE_GP_TOKEN\n")
         self.assertEqual(instance_api.display_names["gp-main"], "Game Pings")
-        self.assertEqual(config_api.saved, [])  # Game Presence settings live on their own page
+        # Only the bot's language is written here (Game Presence keeps Russian by
+        # default); the other Game Presence settings live on their own page.
+        self.assertEqual(config_api.saved, [("gp-main", {"allowed_user_ids": ["123"], "language": "ru"})])
 
 
 class ConnectionsUITests(unittest.TestCase):
@@ -1811,6 +1843,629 @@ class SelfUpdateUITests(unittest.TestCase):
         self.assertFalse(window._allow_close)
         self.assertTrue(window.update_install_button.isEnabled())
         self.assertFalse(self.app_updates.resume_path().exists())
+
+
+class StreamDirectorUITests(unittest.TestCase):
+    """Manager: Stream Director bot type, setup wizard, its page, Twitch connect, dashboard."""
+
+    CLIENT_ID = "abcdefghijklmnopqrst123456"
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manager_gui = load_gui_module(Path(self.temp_dir.name))
+        self.app = get_qapplication()
+        self.instance_store = self.manager_gui.instance_store
+        self.config_store = self.manager_gui.config_store
+        self.panel_module = self.manager_gui.manager_stream_director
+        self.sdt = self.panel_module.sdt
+        self.instance = self.instance_store.create_instance("stream_director", "stream-main", "Stream Desk")
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def info(self, state=None):
+        core = self.manager_gui.manager_core
+        manager = FakeManager(core)
+        return replace(
+            manager.info("stream-main", "Stream Desk", state or core.STATE_STOPPED, 77 if state == core.STATE_RUNNING else None),
+            bot_type="stream_director",
+            bot_type_display_name="Stream Director Bot",
+            logs_dir=self.instance.paths.logs_dir,
+        )
+
+    def immediate(self, action, finished):
+        try:
+            value = action()
+        except Exception as exc:
+            finished(self.manager_gui.ActionResult(False, str(exc), exc))
+        else:
+            finished(self.manager_gui.ActionResult(True, "OK", value))
+
+    def panel(self, state=None, transport=None):
+        info = self.info(state)
+        restarted = []
+        panel = self.panel_module.StreamDirectorPanel(
+            lambda: [("stream-main", "Main · Stream Desk", info), ("admin-main", "Main · Admin", FakeManager(self.manager_gui.manager_core).infos[1])],
+            self.config_store,
+            restarted.append,
+            self.immediate,
+            transport=transport or (lambda *args: (_ for _ in ()).throw(AssertionError("no network in tests"))),
+        )
+        self.addCleanup(panel.close)
+        return panel, restarted
+
+    def write_bot_status(self):
+        runtime = self.instance.paths.runtime_dir
+        status = {
+            "guilds": [
+                {
+                    "id": "123456789012345678",
+                    "name": "Cozy Corner",
+                    "channels": [{"id": "223456789012345678", "name": "live", "type": "text"}, {"id": "9", "name": "Voice", "type": "voice"}],
+                }
+            ]
+        }
+        (runtime / "bot_status.json").write_text(json.dumps(status), encoding="utf-8")
+
+    def test_bot_type_is_creatable_with_its_own_setup(self):
+        self.assertIn(("stream_director", "Stream Director Bot"), self.manager_gui.creatable_bot_types())
+        dialog = self.manager_gui.CreateBotInstanceDialog()
+        self.addCleanup(dialog.close)
+        dialog.type_combo.setCurrentIndex(dialog.type_combo.findData("stream_director"))
+        self.assertIn("Twitch", dialog.type_hint.text())
+
+        setup = self.manager_gui.BotSetupDialog("stream-main", self.instance_store, self.config_store)
+        self.addCleanup(setup.close)
+        self.assertTrue(setup.is_stream_director and setup.is_light)
+        self.assertEqual(setup.pages.count(), 5)  # no admin access page
+        self.assertIn("no privileged intent", setup.intent_ack_checkbox.text())
+        setup.application_id_edit.setText("1234567890")
+        from urllib.parse import parse_qs, urlparse
+
+        params = parse_qs(urlparse(self.manager_gui.build_discord_invite_url("1234567890", "stream_director")).query)
+        self.assertEqual(params["scope"], ["bot applications.commands"])
+        bits = int(params["permissions"][0])
+        self.assertEqual(bits, self.manager_gui.DISCORD_STREAM_DIRECTOR_PERMISSIONS)
+        self.assertTrue(bits & (1 << 35) and bits & (1 << 38) and bits & (1 << 33))  # threads + events
+        self.assertFalse(bits & ((1 << 2) | (1 << 1) | (1 << 28) | (1 << 3)))  # no ban/kick/roles/admin
+        setup.display_name_edit.setText("Stream Desk")
+        setup.token_edit.setText("FAKE_SD_TOKEN")
+        self.assertTrue(setup.save_setup())
+        self.assertEqual(self.instance.paths.token.read_text(encoding="utf-8"), "FAKE_SD_TOKEN\n")
+        self.assertEqual(self.config_store.get_config_snapshot("stream-main").overrides, {"language": "en"})
+
+    def test_page_lists_only_stream_bots_and_saves_normalized_settings(self):
+        self.write_bot_status()
+        panel, restarted = self.panel()
+        self.assertEqual([panel.bot_combo.itemData(i) for i in range(panel.bot_combo.count())], ["stream-main"])
+        self.assertEqual(panel.status_title.text(), "Stopped")
+        self.assertEqual(panel.guild_combo.itemText(0), self.panel_module.CHOOSE_SERVER)
+        panel.guild_combo.setCurrentIndex(1)
+        self.assertEqual(panel.channel_combo.count(), 2)  # placeholder + the text channel only
+        panel.channel_combo.setCurrentIndex(1)
+        panel.team_roles_edit.setText("555555555, 666666666")
+        panel.feature_boxes["twitch_chat"].setChecked(False)
+        panel.spins["end_grace_minutes"].setValue(10)
+        self.assertTrue(panel.save(restart=True))
+        overrides = self.config_store.get_config_snapshot("stream-main").overrides
+        self.assertEqual(overrides["guild_id"], "123456789012345678")
+        self.assertEqual(overrides["channel_id"], "223456789012345678")
+        self.assertEqual(overrides["team_role_ids"], ["555555555", "666666666"])
+        self.assertFalse(overrides["features"]["twitch_chat"])
+        self.assertEqual(overrides["end_grace_minutes"], 10)
+        self.assertEqual(restarted, [])  # not running: nothing to restart
+        panel.client_id_edit.setText("bad id!")
+        self.assertFalse(panel.save())
+        self.assertIn("Not saved", panel.result_label.text())
+
+    def test_twitch_connect_disconnect_keeps_tokens_out_of_config_and_ui(self):
+        sdt = self.sdt
+        calls = []
+
+        def transport(method, url, headers, data, timeout):
+            calls.append(url)
+            if url.endswith("/oauth2/device"):
+                return 200, json.dumps({"device_code": "dev", "user_code": "WXYZ-1234", "verification_uri": "https://www.twitch.tv/activate?public=true", "expires_in": 1800, "interval": 1}).encode()
+            if url.endswith("/oauth2/token"):
+                return 200, json.dumps({"access_token": "SECRET-ACCESS", "refresh_token": "SECRET-REFRESH", "expires_in": 14000, "scope": list(sdt.SCOPES)}).encode()
+            if url.endswith("/oauth2/validate"):
+                return 200, json.dumps({"login": "cozystreamer", "user_id": "4242", "scopes": list(sdt.SCOPES), "expires_in": 14000}).encode()
+            if url.endswith("/oauth2/revoke"):
+                return 200, b""
+            raise AssertionError(url)
+
+        panel, _restarted = self.panel(transport=transport)
+        panel.client_id_edit.setText("short")
+        with mock.patch.object(self.panel_module.QDesktopServices, "openUrl") as open_url:
+            panel.connect_twitch()
+            self.assertEqual(calls, [])  # invalid Client ID: nothing sent
+            panel.client_id_edit.setText(self.CLIENT_ID)
+            panel.connect_twitch()
+        open_url.assert_called_once()
+        self.assertIn("activate", open_url.call_args[0][0].toString())
+        store = sdt.TokenStore(self.instance.paths.secrets_dir)
+        saved = store.load()
+        self.assertEqual((saved.login, saved.client_id), ("cozystreamer", self.CLIENT_ID))
+        self.assertIn("Connected to Twitch as cozystreamer", panel.device_label.text())
+        effective = self.config_store.load_effective_config("stream-main")
+        self.assertEqual(effective["twitch_client_id"], self.CLIENT_ID)
+        config_text = self.instance.paths.config.read_text(encoding="utf-8")
+        self.assertNotIn("SECRET", config_text)
+        for label in (panel.twitch_title, panel.twitch_details, panel.device_label, panel.status_details):
+            self.assertNotIn("SECRET", label.text())
+        self.assertIn("connected", panel.twitch_title.text())
+        panel.disconnect_twitch()
+        self.assertIsNone(store.load())
+        self.assertTrue(calls[-1].endswith("/oauth2/revoke"))
+
+    def test_status_inbox_recap_and_problems(self):
+        self.write_bot_status()
+        self.config_store.save_config_overrides(
+            "stream-main", self.panel_module.sdc.normalize_config({"guild_id": "123456789012345678", "channel_id": "223456789012345678"})
+        )
+        status = {
+            "diagnosis": {"code": "live", "text": "Stream session running."},
+            "problem": None,
+            "guild_name": "Cozy Corner",
+            "channel_name": "live",
+            "missing_permissions": ["Create Public Threads"],
+            "commands_synced": True,
+            "twitch": {"state": "connected", "account": {"login": "cozy", "display_name": "Cozy", "missing_scopes": ["bits:read"]}, "live": True, "failed_subscriptions": ["channel.cheer"]},
+            "director": {
+                "session": {"id": "4", "status": "live", "source": "twitch", "title": "Road \\[to\\] 100", "started_at": time.time() - 600, "moments": 3},
+                "community": {"level": 2, "level_progress": 40, "level_span": 200, "season": "2026-10", "season_points": 140},
+                "inbox": [{"id": "9", "kind": "game", "text": "Hades", "link": None, "author": "Fan", "platform": "twitch", "supporters": 2}],
+                "accepted_challenges": [{"id": "3", "text": "No healing"}],
+                "last_recap": {"Stream": ["⏱ 2h 00m"], "Challenges": ["🏆 Beat \\*it\\*"]},
+            },
+        }
+        (self.instance.paths.runtime_dir / self.panel_module.STATUS_FILE_NAME).write_text(json.dumps(status), encoding="utf-8")
+        panel, _ = self.panel(state=self.manager_gui.manager_core.STATE_RUNNING)
+        self.assertEqual(panel.status_title.text(), "LIVE — session running")
+        details = panel.status_details.text()
+        self.assertIn("Missing in the stream channel: Create Public Threads", details)
+        self.assertIn("Road [to] 100", details)
+        self.assertIn("Community level 2", details)
+        self.assertIn("connected as Cozy", panel.twitch_title.text())
+        self.assertIn("bits:read", panel.twitch_details.text())
+        self.assertIn("#9 Game suggestion: Hades — Fan (twitch) · 👍 2", panel.inbox_label.text())
+        self.assertIn("Accepted challenges: #3 No healing", panel.inbox_label.text())
+        self.assertIn("🏆 Beat *it*", panel.recap_label.text())
+        # A broken state file wins over everything and is never repaired by the Manager.
+        state_path = self.instance.paths.data_dir / "stream_director_state.json"
+        state_path.write_text("{", encoding="utf-8")
+        panel.refresh()
+        self.assertEqual(panel.status_title.text(), "State file problem")
+        self.assertEqual(state_path.read_text(encoding="utf-8"), "{")
+
+    def test_dashboard_and_ai_page(self):
+        core = self.manager_gui.manager_core
+        manager = FakeManager(core)
+        manager.infos = [*manager.infos, self.info()]
+        window = self.manager_gui.ManagerMainWindow(manager=manager, instance_api=FakeInstanceApi(), config_api=self.config_store, auto_refresh=False)
+
+        def close_without_prompt():
+            window._allow_close = True
+            window.close()
+
+        self.addCleanup(close_without_prompt)
+        sd_info = manager.infos[-1]
+        self.assertEqual(window._stream_summary(sd_info), "Not configured: choose the stream channel on the Stream Director page.")
+        self.assertIsNone(window._stream_summary(manager.infos[0]))
+        self.assertNotIn("stream-main", [info.instance_id for info in window._ai_infos()])
+        combo_ids = [window.ai_bot_combo.itemData(i) for i in range(window.ai_bot_combo.count())]
+        self.assertNotIn("stream-main", combo_ids)
+        self.assertIn("stream", window.nav_buttons)
+        window.show_page("stream")
+        self.assertEqual(window.stream_panel.bot_combo.currentData(), "stream-main")
+
+
+class SettingsRoundTripTests(unittest.TestCase):
+    """UI -> config -> reopened UI with the real instance/config stores (no fakes)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manager_gui = load_gui_module(Path(self.temp_dir.name))
+        self.app = get_qapplication()
+        self.instance_store = self.manager_gui.instance_store
+        self.config_store = self.manager_gui.config_store
+        self.core = self.manager_gui.manager_core
+        for bot_type, instance_id, name in (
+            ("admin", "admin-a", "Admin A"),
+            ("admin", "admin-b", "Admin B"),
+            ("game_presence", "gp-a", "Games A"),
+            ("game_presence", "gp-b", "Games B"),
+            ("stream_director", "sd-a", "Stream A"),
+        ):
+            self.instance_store.create_instance(bot_type, instance_id, name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def wizard(self, instance_id, running=False):
+        dialog = self.manager_gui.BotSetupDialog(instance_id, self.instance_store, self.config_store, is_running=lambda: running)
+        self.addCleanup(dialog.close)
+        return dialog
+
+    def info(self, instance_id, bot_type, state="STOPPED"):
+        manager = FakeManager(self.core)
+        return replace(
+            manager.info(instance_id, instance_id, state, 42 if state == "RUNNING" else None),
+            bot_type=bot_type,
+            logs_dir=self.instance_store.get_instance_paths(instance_id).logs_dir,
+        )
+
+    def gp_page(self, states=None):
+        states = states or {}
+        bots = [(iid, label, self.info(iid, "game_presence", states.get(iid, "STOPPED"))) for iid, label in (("gp-a", "Main · Games A"), ("gp-b", "Main · Games B"))]
+        restarted = []
+        page = self.manager_gui.manager_game_presence.GamePresencePanel(lambda: list(bots), self.config_store, restarted.append)
+        self.addCleanup(page.close)
+        return page, restarted
+
+    def kairo_page(self, states=None):
+        states = states or {}
+        bots = [(iid, label, self.info(iid, "admin", states.get(iid, "STOPPED"))) for iid, label in (("admin-a", "Main · Admin A"), ("admin-b", "Main · Admin B"))]
+        restarted = []
+        page = self.manager_gui.manager_kairo.KairoPanel(lambda: list(bots), self.config_store, restarted.append)
+        self.addCleanup(page.close)
+        return page, restarted
+
+    def sd_page(self, state="STOPPED"):
+        bots = [("sd-a", "Main · Stream A", self.info("sd-a", "stream_director", state))]
+        page = self.manager_gui.manager_stream_director.StreamDirectorPanel(lambda: list(bots), self.config_store, lambda _id: None, lambda action, done: None)
+        self.addCleanup(page.close)
+        return page
+
+    # -- Bot Setup wizard -----------------------------------------------------------
+
+    def test_admin_wizard_round_trips_every_checkbox_both_ways_and_the_language(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                dialog = self.wizard("admin-a")
+                self.assertEqual(dialog.save_indicator.state, "clean")
+                dialog.allow_admins_checkbox.setChecked(value)
+                dialog.ai_read_content_checkbox.setChecked(value)
+                dialog.ai_mention_checkbox.setChecked(value)
+                dialog.intent_ack_checkbox.setChecked(value)
+                dialog.invited_ack_checkbox.setChecked(value)
+                dialog.application_id_edit.setText("123456789" if value else "")
+                select = self.manager_gui.select_language
+                select(dialog.language_combo, "ru" if value else "en")
+                self.assertTrue(dialog.dirty or not value)
+                self.assertTrue(dialog.save_setup())
+                self.assertEqual(dialog.save_indicator.state, "saved")
+                self.assertIn("next command", dialog.save_indicator.text())
+                effective = self.config_store.load_effective_config("admin-a")
+                self.assertEqual(
+                    (effective["allow_server_administrators"], effective["ai_read_message_content"], effective["ai_mention_enabled"], effective["language"]),
+                    (value, value, value, "ru" if value else "en"),
+                )
+                reopened = self.wizard("admin-a")
+                self.assertEqual(
+                    (
+                        reopened.allow_admins_checkbox.isChecked(),
+                        reopened.ai_read_content_checkbox.isChecked(),
+                        reopened.ai_mention_checkbox.isChecked(),
+                        reopened.intent_ack_checkbox.isChecked(),
+                        reopened.invited_ack_checkbox.isChecked(),
+                        reopened.application_id_edit.text(),
+                        reopened.language_combo.currentData(),
+                    ),
+                    (value, value, value, value, value, "123456789" if value else "", "ru" if value else "en"),
+                )
+                self.assertFalse(reopened.dirty)
+
+    def test_wizard_steps_and_invite_survive_reopening(self):
+        dialog = self.wizard("gp-a")
+        dialog.application_id_edit.setText("1234567890")
+        dialog.intent_ack_checkbox.setChecked(True)
+        dialog.invited_ack_checkbox.setChecked(True)
+        self.assertTrue(dialog.save_setup())
+        reopened = self.wizard("gp-a")
+        self.assertEqual(reopened.application_id_edit.text(), "1234567890")
+        self.assertTrue(reopened.intent_ack_checkbox.isChecked())
+        self.assertTrue(reopened.invited_ack_checkbox.isChecked())
+        self.assertIn("client_id=1234567890", reopened.invite_link_edit.text())
+        # Manager-side memory only: nothing of it went into the bot's config.
+        self.assertNotIn("application_id", self.config_store.load_effective_config("gp-a"))
+
+    def test_wizard_feedback_restart_hint_and_unsaved_close(self):
+        dialog = self.wizard("sd-a", running=True)
+        dialog.token_edit.setText("NEW_TOKEN_VALUE")
+        self.assertEqual(dialog.save_indicator.state, "dirty")
+        self.assertTrue(dialog.save_setup())
+        self.assertIn("Restart required", dialog.save_indicator.text())
+        self.assertNotIn("NEW_TOKEN_VALUE", dialog.save_indicator.text() + dialog.status_label.text())
+        dialog.show()
+        dialog.display_name_edit.setText("Renamed but not saved")
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Cancel):
+            dialog.reject()
+        self.assertTrue(dialog.isVisible())  # unsaved changes are not lost by accident
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Discard):
+            dialog.reject()
+        self.assertFalse(dialog.isVisible())
+        self.assertEqual(self.instance_store.load_instance("sd-a").display_name, "Stream A")
+
+    def test_old_configs_show_the_language_the_bot_really_uses(self):
+        import game_presence as gp
+
+        self.config_store.save_config_overrides("gp-a", {key: value for key, value in gp.DEFAULT_CONFIG.items() if key != "language"})
+        self.assertEqual(self.wizard("gp-a").language_combo.currentData(), "ru")
+        self.assertEqual(self.wizard("admin-a").language_combo.currentData(), "en")
+        self.assertEqual(self.wizard("sd-a").language_combo.currentData(), "en")
+        page, _ = self.gp_page()
+        self.assertEqual(page.language_combo.currentData(), "ru")
+
+    # -- Game Presence page ----------------------------------------------------------
+
+    def test_game_presence_checkboxes_round_trip_both_ways(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                page, _ = self.gp_page()
+                page.bot_combo.setCurrentIndex(page.bot_combo.findData("gp-a"))
+                page.enabled_checkbox.setChecked(value)
+                page.voice_checkbox.setChecked(value)
+                page.whole_voice_checkbox.setChecked(not value)
+                page.ai_checkbox.setChecked(value)
+                page.language_combo.setCurrentIndex(page.language_combo.findData("en" if value else "ru"))
+                self.assertTrue(page.save())
+                self.assertEqual(page.result_label.state, "saved")
+                self.assertEqual(self.config_store.load_effective_config("gp-a")["ping_whole_voice"], not value)
+                reopened, _ = self.gp_page()
+                reopened.bot_combo.setCurrentIndex(reopened.bot_combo.findData("gp-a"))
+                self.assertEqual(
+                    (
+                        reopened.enabled_checkbox.isChecked(),
+                        reopened.voice_checkbox.isChecked(),
+                        reopened.whole_voice_checkbox.isChecked(),
+                        reopened.ai_checkbox.isChecked(),
+                        reopened.language_combo.currentData(),
+                    ),
+                    (value, value, not value, value, "en" if value else "ru"),
+                )
+                self.assertFalse(reopened.dirty)
+
+    def test_switching_bots_shows_each_bots_values_and_guards_unsaved_changes(self):
+        import game_presence as gp
+
+        self.config_store.save_config_overrides(
+            "gp-a", {**gp.DEFAULT_CONFIG, "enabled": True, "delay_minutes": 7, "voice_aware": False, "language": "en", "guild_id": "111111", "channel_id": "222222"}
+        )
+        self.config_store.save_config_overrides("gp-b", {**gp.DEFAULT_CONFIG, "enabled": False, "delay_minutes": 20, "voice_aware": True, "language": "ru"})
+        page, _ = self.gp_page({"gp-a": "RUNNING"})
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("gp-a"))
+        self.assertEqual((page.spins["delay_minutes"].value(), page.voice_checkbox.isChecked(), page.language_combo.currentData()), (7, False, "en"))
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("gp-b"))
+        self.assertEqual((page.spins["delay_minutes"].value(), page.voice_checkbox.isChecked(), page.language_combo.currentData()), (20, True, "ru"))
+        self.assertFalse(page.enabled_checkbox.isChecked())
+
+        page.spins["delay_minutes"].setValue(30)
+        self.assertEqual(page.result_label.state, "dirty")
+        with mock.patch.object(self.manager_gui.manager_game_presence.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Cancel):
+            page.bot_combo.setCurrentIndex(page.bot_combo.findData("gp-a"))
+        self.assertEqual(page.bot_combo.currentData(), "gp-b")  # stays, the edit is kept
+        self.assertEqual(page.spins["delay_minutes"].value(), 30)
+        with mock.patch.object(self.manager_gui.manager_game_presence.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Discard):
+            page.bot_combo.setCurrentIndex(page.bot_combo.findData("gp-a"))
+        self.assertEqual(page.spins["delay_minutes"].value(), 7)
+        self.assertEqual(self.config_store.load_effective_config("gp-b")["delay_minutes"], 20)  # never saved
+
+        page.spins["delay_minutes"].setValue(9)
+        self.assertTrue(page.save())
+        self.assertIn("Applied live", page.result_label.text())  # gp-a is running
+        self.assertEqual(page.spins["delay_minutes"].value(), 9)
+        self.assertFalse(page.dirty)
+
+    def test_broken_config_is_not_shown_as_saved_and_not_overwritten(self):
+        path = self.instance_store.get_instance_paths("gp-a").config
+        path.write_text('{"delay_minutes": 0}', encoding="utf-8")
+        page, _ = self.gp_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("gp-a"))
+        self.assertIn("Config problem", page.result_label.text())
+        self.assertFalse(page.save_button.isEnabled())
+        self.assertFalse(page.save())
+        self.assertEqual(path.read_text(encoding="utf-8"), '{"delay_minutes": 0}')
+
+    # -- Stream Director page --------------------------------------------------------------
+
+    def test_stream_director_features_and_language_round_trip(self):
+        import stream_director_config as sdc
+
+        self.config_store.save_config_overrides("sd-a", sdc.normalize_config({"guild_id": "111111", "channel_id": "222222"}))
+        for value in (False, True):
+            with self.subTest(value=value):
+                page = self.sd_page()
+                for box in page.feature_boxes.values():
+                    box.setChecked(value)
+                page.enabled_checkbox.setChecked(value)
+                page.language_combo.setCurrentIndex(page.language_combo.findData("ru" if value else "en"))
+                self.assertEqual(page.result_label.state, "dirty")
+                self.assertTrue(page.save())
+                self.assertIn("starts", page.result_label.text())  # stopped bot: applies on start
+                reopened = self.sd_page()
+                self.assertEqual({name: box.isChecked() for name, box in reopened.feature_boxes.items()}, {name: value for name in reopened.feature_boxes})
+                self.assertEqual((reopened.enabled_checkbox.isChecked(), reopened.language_combo.currentData()), (value, "ru" if value else "en"))
+                self.assertFalse(reopened.dirty)
+
+    # -- Kairo page ------------------------------------------------------------------------
+
+    def test_kairo_page_round_trips_language_and_social_awareness(self):
+        sa = self.manager_gui.manager_kairo.sa
+        page, _ = self.kairo_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        self.assertFalse(page.social_checkbox.isChecked())
+        self.assertIn("Not chosen yet", page.choice_note.text())  # never chosen is not shown as a saved "off"
+        self.assertFalse(page.dirty)
+        for value in (True, False):
+            with self.subTest(value=value):
+                page.language_combo.setCurrentIndex(page.language_combo.findData("ru" if value else "en"))
+                page.social_checkbox.setChecked(value)
+                page.channels_edit.setText("111, 222" if value else "")
+                page.replies_spin.setValue(7 if value else 4)
+                self.assertTrue(page.dirty or not value)
+                self.assertTrue(page.save())
+                self.assertEqual(page.result_label.state, "saved")
+                effective = self.config_store.load_effective_config("admin-a")
+                self.assertEqual(
+                    (effective["language"], effective[sa.CONFIG_ENABLED], effective[sa.CONFIG_CHANNELS], effective[sa.CONFIG_REPLIES]),
+                    ("ru" if value else "en", value, ["111", "222"] if value else [], 7 if value else 4),
+                )
+                self.assertEqual(self.config_store.load_effective_config("admin-b")[sa.CONFIG_ENABLED], None)  # the other bot is untouched
+                reopened, _ = self.kairo_page()
+                reopened.bot_combo.setCurrentIndex(reopened.bot_combo.findData("admin-a"))
+                self.assertEqual(
+                    (reopened.language_combo.currentData(), reopened.social_checkbox.isChecked(), reopened.channels_edit.text(), reopened.replies_spin.value()),
+                    ("ru" if value else "en", value, "111, 222" if value else "", 7 if value else 4),
+                )
+                self.assertEqual(reopened.choice_note.text(), "")  # a real choice now
+                self.assertFalse(reopened.dirty)
+                # The wizard shows the same stored language.
+                self.assertEqual(self.wizard("admin-a").language_combo.currentData(), "ru" if value else "en")
+
+    def test_kairo_page_switching_bots_and_unsaved_edits(self):
+        page, _ = self.kairo_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        page.social_checkbox.setChecked(True)
+        self.assertEqual(page.result_label.state, "dirty")
+        with mock.patch.object(self.manager_gui.manager_kairo.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Cancel):
+            page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-b"))
+        self.assertEqual(page.bot_combo.currentData(), "admin-a")
+        self.assertTrue(page.social_checkbox.isChecked())
+        # Showing the page again keeps the edit; Refresh asks before throwing it away.
+        page.refresh(keep_edits=True)
+        self.assertTrue(page.social_checkbox.isChecked())
+        self.assertEqual(page.result_label.state, "dirty")
+        with mock.patch.object(self.manager_gui.manager_kairo.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Discard):
+            page.refresh()
+        self.assertFalse(page.social_checkbox.isChecked())
+        self.assertFalse(page.dirty)
+        with mock.patch.object(self.manager_gui.manager_kairo.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Discard):
+            page.channels_edit.setText("333")
+            page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-b"))
+        self.assertEqual((page.bot_combo.currentData(), page.channels_edit.text()), ("admin-b", ""))
+        self.assertEqual(self.config_store.load_effective_config("admin-a")["social_awareness_channel_ids"], [])
+
+    def test_kairo_page_says_when_a_restart_is_needed(self):
+        page, restarted = self.kairo_page({"admin-a": "RUNNING"})
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        page.language_combo.setCurrentIndex(page.language_combo.findData("ru"))
+        self.assertTrue(page.save())
+        self.assertIn("Applied live", page.result_label.text())
+        self.assertIn("Slash command descriptions", page.result_label.text())
+        page.social_checkbox.setChecked(True)
+        self.assertTrue(page.save())
+        self.assertIn("Restart required", page.result_label.text())  # the running bot did not request Message Content Intent
+        self.assertEqual(restarted, [])
+        page.replies_spin.setValue(9)
+        self.assertTrue(page.save(restart=True))
+        self.assertEqual(restarted, ["admin-a"])
+        page.channels_edit.setText("not-a-number")
+        self.assertFalse(page.save())
+        self.assertEqual(page.result_label.state, "error")
+        self.assertEqual(self.config_store.load_effective_config("admin-a")["social_awareness_channel_ids"], [])
+
+    def test_kairo_page_locks_on_a_broken_config(self):
+        path = self.instance_store.get_instance_paths("admin-a").config
+        path.write_text('{"social_awareness_replies_per_hour": 999}', encoding="utf-8")
+        page, _ = self.kairo_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        self.assertIn("Config problem", page.result_label.text())
+        self.assertFalse(page.save_button.isEnabled())
+        self.assertFalse(page.save())
+        self.assertEqual(path.read_text(encoding="utf-8"), '{"social_awareness_replies_per_hour": 999}')
+
+    def test_social_awareness_question_is_asked_once_per_bot(self):
+        kairo = self.manager_gui.manager_kairo
+        asked = []
+
+        def answer(value):
+            def ask(parent):
+                asked.append(value)
+                return value
+
+            return ask
+
+        self.assertFalse(kairo.ensure_social_awareness_choice(None, "admin-a", self.config_store, answer(None)))  # cancel: no start
+        self.assertIsNone(self.config_store.load_effective_config("admin-a")["social_awareness_enabled"])
+        self.assertTrue(kairo.ensure_social_awareness_choice(None, "admin-a", self.config_store, answer(True)))
+        self.assertTrue(self.config_store.load_effective_config("admin-a")["social_awareness_enabled"])
+        self.assertTrue(kairo.ensure_social_awareness_choice(None, "admin-a", self.config_store, answer(False)))  # not asked again
+        self.assertEqual(asked, [None, True])
+        self.assertTrue(kairo.ensure_social_awareness_choice(None, "admin-b", self.config_store, answer(False)))
+        self.assertIs(self.config_store.load_effective_config("admin-b")["social_awareness_enabled"], False)
+        self.assertEqual(asked, [None, True, False])
+        # Other bot types are never asked.
+        self.assertFalse(kairo.needs_social_awareness_choice(self.config_store, "gp-a"))
+
+
+
+    def test_kairo_server_memory_can_be_seen_forgotten_and_lifted(self):
+        kairo = self.manager_gui.manager_kairo
+        sm = kairo.sm
+        path = self.instance_store.get_instance_paths("admin-a").data_dir / sm.FILE_NAME
+        moment = [time.time()]
+        memory = sm.SocialMemory(path, clock=lambda: moment[0])
+        captain = "Members call Alice 'the Captain' in raids"
+        memory.propose(111, "remember", kind="nickname", text=captain)
+        moment[0] += sm.CONFIRM_GAP + 1
+        memory.propose(111, "remember", kind="nickname", text=captain)
+        memory.propose(111, "remember", kind="joke", text="Bob always blames the lag when he loses")
+        memory.add_mute(111, "channel", 3600, channel_id=222, by_user_id=333)
+        memory.record_outcome(111, sm.Outcome(moment[0], 222, "reply", "named", "engaged"))
+        page, _ = self.kairo_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        self.assertEqual(page.memory_guild_combo.currentData(), 111)
+        labels = [page.lore_list.item(row).text() for row in range(page.lore_list.count())]
+        self.assertEqual(labels, [f"[nickname] {captain}  (noticed 2×)", "[joke] Bob always blames the lag when he loses  (candidate: noticed once)"])
+        self.assertEqual(page.quiet_list.count(), 1)
+        self.assertIn("channel 222 · asked", page.quiet_list.item(0).text())
+        self.assertIn("1 answered", page.feedback_label.text())
+        # The other Kairo shows its own (empty) memory, not admin-a's.
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-b"))
+        self.assertEqual((page.lore_list.count(), page.quiet_list.count()), (0, 0))
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        page.lore_list.setCurrentRow(1)
+        page.forget_lore_button.click()
+        self.assertEqual([entry.text for entry in memory.guild(111).lore], [captain])
+        with mock.patch.object(kairo.QMessageBox, "question", return_value=kairo.QMessageBox.Cancel):
+            page.clear_lore_button.click()
+        self.assertEqual(len(memory.guild(111).lore), 1)  # asked first
+        with mock.patch.object(kairo.QMessageBox, "question", return_value=kairo.QMessageBox.Yes):
+            page.clear_lore_button.click()
+        self.assertEqual(memory.guild(111).lore, [])
+        page.lift_all_button.click()
+        self.assertEqual(memory.active_mutes(111), [])
+        self.assertEqual(page.quiet_list.count(), 0)
+
+    def test_kairo_broken_memory_is_shown_and_can_be_reset(self):
+        kairo = self.manager_gui.manager_kairo
+        path = self.instance_store.get_instance_paths("admin-a").data_dir / kairo.sm.FILE_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{broken", encoding="utf-8")
+        page, _ = self.kairo_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        self.assertIn("unreadable", page.memory_problem_label.text())
+        self.assertFalse(page.reset_memory_button.isHidden())
+        with mock.patch.object(kairo.QMessageBox, "question", return_value=kairo.QMessageBox.Yes):
+            page.reset_memory_button.click()
+        self.assertEqual(page.memory_problem_label.text(), "")
+        self.assertTrue(page.reset_memory_button.isHidden())
+        self.assertEqual([item.read_text(encoding="utf-8") for item in path.parent.glob("social_memory.corrupt-*.json")], ["{broken"])
+
+    def test_kairo_lore_switch_round_trips(self):
+        sa = self.manager_gui.manager_kairo.sa
+        page, _ = self.kairo_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        self.assertTrue(page.lore_checkbox.isChecked())  # on by default (only used with Social Awareness)
+        page.lore_checkbox.setChecked(False)
+        self.assertEqual(page.result_label.state, "dirty")
+        self.assertTrue(page.save())
+        self.assertIs(self.config_store.load_effective_config("admin-a")[sa.CONFIG_LORE], False)
+        reopened, _ = self.kairo_page()
+        reopened.bot_combo.setCurrentIndex(reopened.bot_combo.findData("admin-a"))
+        self.assertFalse(reopened.lore_checkbox.isChecked())
+        self.assertFalse(reopened.dirty)
 
 
 def replace_namespace(namespace, **changes):

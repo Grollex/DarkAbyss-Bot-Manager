@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import discord
+from bot_i18n import t
 
 C: Any = None  # admin_tools core module, set by build_tools()
 
@@ -320,8 +321,8 @@ async def _check_server_blueprint(context: Any, arguments: dict[str, Any]) -> An
     try:
         plan = build_plan(context, arguments["blueprint"])
     except (BlueprintError, C.AdminToolError, ValueError) as exc:
-        return C.ToolResult(False, "check_server_blueprint", f"Blueprint problem: {exc}")
-    return C.ToolResult(True, "check_server_blueprint", "Blueprint is valid.", summarize_plan(plan))
+        return C.ToolResult(False, "check_server_blueprint", t("Blueprint problem: {exc}", exc=exc))
+    return C.ToolResult(True, "check_server_blueprint", t("Blueprint is valid."), summarize_plan(plan))
 
 
 async def _apply_server_blueprint(context: Any, arguments: dict[str, Any]) -> Any:
@@ -330,7 +331,7 @@ async def _apply_server_blueprint(context: Any, arguments: dict[str, Any]) -> An
     try:
         plan = build_plan(context, arguments["blueprint"])
     except BlueprintError as exc:
-        raise C.AdminToolError(f"Blueprint problem: {exc}") from exc
+        raise C.AdminToolError(t("Blueprint problem: {exc}", exc=exc)) from exc
     reason = C._reason(arguments) or "Server blueprint via Admin bot"
     created: dict[str, list[str]] = {"roles": [], "categories": [], "channels": []}
     created_names: dict[str, str] = {}
@@ -395,8 +396,7 @@ async def _apply_server_blueprint(context: Any, arguments: dict[str, Any]) -> An
         return C.ToolResult(
             False,
             "apply_server_blueprint",
-            f"Blueprint stopped after creating {total} object(s): {detail}. "
-            "Created objects were kept; undo_last_blueprint removes them.",
+            t("Blueprint stopped after creating {total} object(s): {detail}. Created objects were kept; undo_last_blueprint removes them.", total=total, detail=detail),
             {"created": created_names},
         )
     record()
@@ -406,8 +406,7 @@ async def _apply_server_blueprint(context: Any, arguments: dict[str, Any]) -> An
     return C.ToolResult(
         True,
         "apply_server_blueprint",
-        f"Blueprint applied: created {counts['roles']} role(s), {counts['categories']} categor(ies), "
-        f"{counts['channels']} channel(s); reused {summary['reused_existing']} existing.{undo}",
+        t("Blueprint applied: created {roles} role(s), {categories} categor(ies), {channels} channel(s); reused {reused_existing} existing.{undo}", roles=counts['roles'], categories=counts['categories'], channels=counts['channels'], reused_existing=summary['reused_existing'], undo=undo),
         {"created": created_names},
     )
 
@@ -416,10 +415,10 @@ async def _undo_last_blueprint(context: Any, arguments: dict[str, Any]) -> Any:
     guild = C._require_guild(context)
     store = context.feature_store
     if store is None:
-        raise C.AdminToolError("The bot feature store is unavailable; nothing to undo.")
+        raise C.AdminToolError(t("The bot feature store is unavailable; nothing to undo."))
     record = store.get(guild.id, STORE_KEY)
     if not isinstance(record, dict) or not isinstance(record.get("created"), dict):
-        raise C.AdminToolError("There is no recorded blueprint to undo.")
+        raise C.AdminToolError(t("There is no recorded blueprint to undo."))
     reason = C._reason(arguments) or "Undo server blueprint via Admin bot"
     created = record["created"]
     deleted = missing = failed = 0
@@ -446,11 +445,11 @@ async def _undo_last_blueprint(context: Any, arguments: dict[str, Any]) -> Any:
         except (discord.HTTPException, C.AdminToolError):
             failed += 1
     store.set(guild.id, STORE_KEY, None)
-    message = f"Blueprint undone: deleted {deleted} object(s)"
+    message = t("Blueprint undone: deleted {deleted} object(s)", deleted=deleted)
     if missing:
-        message += f", {missing} were already gone"
+        message += t(", {missing} were already gone", missing=missing)
     if failed:
-        message += f", {failed} could not be deleted"
+        message += t(", {failed} could not be deleted", failed=failed)
     return C.ToolResult(failed == 0, "undo_last_blueprint", message + ".")
 
 

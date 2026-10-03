@@ -2,15 +2,21 @@
 
 * member_game / member_voice: read Discord Presence activities and voice state.
 * render_message: deterministic templates; mentions are built ONLY here,
-  from the approved user IDs of a Suggestion.
+  from the approved user IDs of a Suggestion (players and, for Group Up, the
+  rest of the target voice channel decided by the engine).
 * DiscordNotifier: posts one public message with Mute pings / Allow pings
   buttons; allowed_mentions lists exactly the approved users (never
   @everyone, @here or roles), so even generated text cannot ping anyone else.
+  Whole-voice pings are plain user mentions: no role is created, so the bot
+  needs no Manage Roles permission and nothing is left behind after a crash.
 * handle_preference_interaction: persistent buttons; the actor is always
   interaction.user and only their own opt-state changes; replies are ephemeral.
 * make_ai_rewriter: optional wording layer; it may only rephrase a template
-  with fixed placeholders, never choose whom or when to ping. Any failure
-  falls back to the deterministic template.
+  with fixed placeholders, never choose whom or when to ping. It is asked for
+  a fresh tone each time and shown its recent wordings, so messages vary.
+  Any failure falls back to the deterministic template.
+* After a post the bot announces it on the bot event bus (bot_events), so
+  Kairo's Social Awareness knows what Group Up just did.
 * GamePresenceRuntime: wires the engine to bot events and writes a status
   file for the Manager. Used by the dedicated Game Presence bot
   (GamePresence.py), which has its own Discord application and process.
@@ -19,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from datetime import datetime
 from typing import Any, Awaitable, Callable
@@ -26,6 +33,7 @@ from typing import Any, Awaitable, Callable
 import discord
 
 import admin_terminal
+import bot_i18n
 import game_presence as gp
 
 CUSTOM_ID_MUTE = "dab:gp:mute"
@@ -47,20 +55,50 @@ LOGGED_DIAGNOSES = frozenset(
 )
 AI_REWRITE_TIMEOUT_SECONDS = 15.0
 MAX_MESSAGE_CHARS = 1500
+MAX_REWRITE_CHARS = 320
+RECENT_WORDINGS = 6
+EVENT_GROUP_UP = "group_up.suggested"
 
-PREF_MUTED = "Готово: я больше не буду упоминать тебя в игровых предложениях. Включить обратно — кнопка Allow pings."
-PREF_ALREADY_MUTED = "Игровые пинги для тебя уже отключены."
-PREF_ALLOWED = "Готово: игровые пинги снова включены."
-PREF_ALREADY_ALLOWED = "Игровые пинги для тебя уже включены."
-PREF_UNAVAILABLE = "Настройки Game Presence сейчас недоступны. Попробуй позже."
+# Texts are English keys; the bot instance's language picks the wording
+# (bot_i18n, Russian in bot_i18n_ru_game_presence). Game Presence spoke
+# Russian before languages existed, so "ru" is the default everywhere here.
+DEFAULT_LANGUAGE = gp.DEFAULT_CONFIG["language"]
+PREF_MUTED = "Done: I will not mention you in game suggestions any more. To turn it back on, press Allow pings."
+PREF_ALREADY_MUTED = "Game pings are already off for you."
+PREF_ALLOWED = "Done: game pings are on again."
+PREF_ALREADY_ALLOWED = "Game pings are already on for you."
+PREF_UNAVAILABLE = "Game Presence settings are unavailable right now. Try again later."
+BUTTON_MUTE = "Mute pings"
+BUTTON_ALLOW = "Allow pings"
 
-_COUNT_WORDS = {3: "трое", 4: "четверо", 5: "пятеро", 6: "шестеро", 7: "семеро", 8: "восьмеро", 9: "девятеро", 10: "десятеро"}
-TEMPLATE_PAIR = "{targets}, вы оба уже несколько минут в {game} и не в одном войсе. Может, соберётесь?"
-TEMPLATE_GROUP = "{targets}, вас уже {count} в {game}. Может, пора собраться?"
-TEMPLATE_JOIN_ONE = "{targets}, {others} уже играют в {game} и сидят в {channel}. Залетай!"
-TEMPLATE_JOIN_MANY = "{targets}, {others} уже играют в {game} и сидят в {channel}. Залетайте!"
-_PLACEHOLDER_RE = re.compile(r"\{([a-z]+)\}")
+_COUNT_WORDS = {"ru": {3: "трое", 4: "четверо", 5: "пятеро", 6: "шестеро", 7: "семеро", 8: "восьмеро", 9: "девятеро", 10: "десятеро"}}
+TEMPLATE_PAIR = "{targets}, you have both been in {game} for a few minutes. Want to get together in voice?"
+TEMPLATE_GROUP = "{targets}, {count} of you are already in {game}. Time to get together?"
+TEMPLATE_SPLIT_PAIR = "{targets}, you have both been in {game} for a few minutes, but in different voice channels. Want to join up?"
+TEMPLATE_SPLIT_GROUP = "{targets}, {count} of you are in {game}, but in different voice channels. Want to join up?"
+# join: one/several outsiders x one/several players already in the voice channel.
+TEMPLATE_JOIN_ONE = "{targets}, {others} are already playing {game} in {channel}. Jump in!"
+TEMPLATE_JOIN_MANY = "{targets}, {others} are already playing {game} in {channel}. Jump in, all of you!"
+TEMPLATE_JOIN_ONE_SOLO = "{targets}, {others} is already playing {game} in {channel}. Jump in!"
+TEMPLATE_JOIN_MANY_SOLO = "{targets}, {others} is already playing {game} in {channel}. Jump in, all of you!"
+# Added when the rest of the voice channel is told too (whole-voice ping).
+TEMPLATE_CREW = "{crew}, heads up: someone may join you."
+TEMPLATES = (
+    TEMPLATE_PAIR,
+    TEMPLATE_GROUP,
+    TEMPLATE_SPLIT_PAIR,
+    TEMPLATE_SPLIT_GROUP,
+    TEMPLATE_JOIN_ONE,
+    TEMPLATE_JOIN_MANY,
+    TEMPLATE_JOIN_ONE_SOLO,
+    TEMPLATE_JOIN_MANY_SOLO,
+    TEMPLATE_CREW,
+)
+# The AI is asked for one of these tones at random, so wordings do not repeat.
+AI_TONES = ("casual", "playful", "warm", "short and direct", "energetic", "laid-back", "friendly teasing")
+_PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
 _FORBIDDEN_AI_TEXT = re.compile(r"<[@#&!:a]|@everyone|@here|https?://|discord\.gg", re.IGNORECASE)
+_CYRILLIC = re.compile(r"[\u0400-\u04FF]")
 
 
 # --------------------------------------------------------------------------
@@ -103,23 +141,47 @@ def mention(user_id: int) -> str:
     return f"<@{int(user_id)}>"
 
 
-def join_ru(items: list[str]) -> str:
+def join_names(items: list[str], language: str | None = DEFAULT_LANGUAGE) -> str:
     if len(items) <= 1:
         return "".join(items)
-    return ", ".join(items[:-1]) + " и " + items[-1]
+    return ", ".join(items[:-1]) + (" и " if language == "ru" else " and ") + items[-1]
 
 
-def template_for(suggestion: gp.Suggestion) -> str:
+def join_ru(items: list[str]) -> str:
+    return join_names(items, "ru")
+
+
+def template_key(suggestion: gp.Suggestion) -> str:
+    """The English template (translation key) for a suggestion (without the crew sentence)."""
     if suggestion.kind == "join":
-        return TEMPLATE_JOIN_ONE if len(suggestion.outsider_user_ids) == 1 else TEMPLATE_JOIN_MANY
+        one = len(suggestion.outsider_user_ids) == 1
+        if len(suggestion.voice_member_ids) == 1:
+            return TEMPLATE_JOIN_ONE_SOLO if one else TEMPLATE_JOIN_MANY_SOLO
+        return TEMPLATE_JOIN_ONE if one else TEMPLATE_JOIN_MANY
+    if suggestion.kind == "split_voice":
+        return TEMPLATE_SPLIT_PAIR if len(suggestion.target_user_ids) == 2 else TEMPLATE_SPLIT_GROUP
     return TEMPLATE_PAIR if len(suggestion.target_user_ids) == 2 else TEMPLATE_GROUP
 
 
-def fill(template: str, suggestion: gp.Suggestion, channel_name: str | None) -> str:
+def template_for(suggestion: gp.Suggestion, *, language: str | None = DEFAULT_LANGUAGE) -> str:
+    """The template in the bot's language (placeholders stay as they are)."""
+    text = bot_i18n.tr(language, template_key(suggestion))
+    if suggestion.kind == "join" and suggestion.voice_crew_ids:
+        text = f"{text} {bot_i18n.tr(language, TEMPLATE_CREW)}"
+    return text
+
+
+def fill(
+    template: str,
+    suggestion: gp.Suggestion,
+    channel_name: str | None,
+    *,
+    language: str | None = DEFAULT_LANGUAGE,
+) -> str:
     """Substitute placeholders; mentions come only from the suggestion's IDs."""
     if suggestion.kind == "join":
-        targets = join_ru([mention(user) for user in suggestion.outsider_user_ids])
-        others = join_ru([mention(user) for user in suggestion.voice_member_ids])
+        targets = join_names([mention(user) for user in suggestion.outsider_user_ids], language)
+        others = join_names([mention(user) for user in suggestion.voice_member_ids], language)
     else:
         targets = " ".join(mention(user) for user in suggestion.target_user_ids)
         others = ""
@@ -127,74 +189,156 @@ def fill(template: str, suggestion: gp.Suggestion, channel_name: str | None) -> 
     values = {
         "targets": targets,
         "others": others,
+        "crew": join_names([mention(user) for user in suggestion.voice_crew_ids], language),
         "game": f"**{safe_text(suggestion.game_display_name)}**",
-        "channel": f"**{safe_text(channel_name or 'войсе')}**",
-        "count": _COUNT_WORDS.get(count, f"{count} человек"),
+        "channel": f"**{safe_text(channel_name or bot_i18n.tr(language, 'voice'))}**",
+        "count": _COUNT_WORDS.get(language or "", {}).get(count) or bot_i18n.tr(language, "{count}", count=count),
     }
     return _PLACEHOLDER_RE.sub(lambda match: values.get(match.group(1), match.group(0)), template)[:MAX_MESSAGE_CHARS]
 
 
-def render_message(suggestion: gp.Suggestion, channel_name: str | None, rewritten_template: str | None = None) -> str:
-    template = rewritten_template if rewritten_template else template_for(suggestion)
-    return fill(template, suggestion, channel_name)
+def render_message(
+    suggestion: gp.Suggestion,
+    channel_name: str | None,
+    rewritten_template: str | None = None,
+    *,
+    language: str | None = DEFAULT_LANGUAGE,
+) -> str:
+    template = rewritten_template if rewritten_template else template_for(suggestion, language=language)
+    return fill(template, suggestion, channel_name, language=language)
 
 
-def validate_rewrite(candidate: Any, original_template: str) -> str | None:
+def validate_rewrite(candidate: Any, original_template: str, language: str | None = None) -> str | None:
     """Accept an AI rewrite only if it keeps exactly the original placeholders.
 
     The rewrite cannot add or drop people: mentions are inserted afterwards
-    from user IDs, and any raw mention/link syntax rejects the rewrite.
+    from user IDs, and any raw mention/link syntax rejects the rewrite. With
+    ``language`` the wording must also be in that language (Russian text has
+    Cyrillic letters, English text has none); placeholders do not count.
     """
     if not isinstance(candidate, str):
         return None
     text = " ".join(candidate.split())
-    if not text or len(text) > 300 or _FORBIDDEN_AI_TEXT.search(text):
+    if not text or len(text) > MAX_REWRITE_CHARS or _FORBIDDEN_AI_TEXT.search(text):
         return None
     wanted = sorted(_PLACEHOLDER_RE.findall(original_template))
     if sorted(_PLACEHOLDER_RE.findall(text)) != wanted:
         return None
-    if "{" in _PLACEHOLDER_RE.sub("", text) or "}" in _PLACEHOLDER_RE.sub("", text):
+    words = _PLACEHOLDER_RE.sub("", text)
+    if "{" in words or "}" in words:
         return None
-    if not text.startswith("{targets}"):
+    # The people asked to join are addressed first-thing, not buried at the end.
+    if "{targets}" not in text[:60]:
+        return None
+    if language == "ru" and not _CYRILLIC.search(words):
+        return None
+    if language == "en" and _CYRILLIC.search(words):
         return None
     return text
 
 
-Rewriter = Callable[[str, gp.Suggestion], Awaitable[str | None]]
+Rewriter = Callable[..., Awaitable[str | None]]
 
 
-def make_ai_rewriter(get_orchestrator: Callable[[], Any]) -> Rewriter:
-    """Optional: rephrase the template with the configured AI (CREATIVE route, no tools)."""
+def rewrite_context(
+    suggestion: gp.Suggestion,
+    *,
+    language: str,
+    channel_name: str | None,
+    template: str,
+) -> dict[str, Any]:
+    """What the wording AI may know: the situation in numbers, never who."""
+    return {
+        "language": language,
+        "kind": suggestion.kind,
+        "game": suggestion.game_display_name,
+        "target_voice_channel": channel_name,
+        "outsider_count": len(suggestion.outsider_user_ids),
+        "voice_detected_player_count": len(suggestion.voice_member_ids),
+        "total_detected_player_count": len(suggestion.target_user_ids),
+        "notifies_rest_of_voice": bool(suggestion.voice_crew_ids),
+        "rest_of_voice_count": len(suggestion.voice_crew_ids),
+        "required_placeholders": sorted(_PLACEHOLDER_RE.findall(template)),
+        "placeholder_meaning": {
+            "targets": "the people invited (mentions)",
+            "others": "the players already in the voice channel (mentions)",
+            "crew": "everyone else in that voice channel, who may not show the game (mentions)",
+            "game": "the game name",
+            "channel": "the voice channel name",
+            "count": "how many players",
+        },
+        "rules": [
+            "Use placeholders exactly as provided.",
+            "Do not add Discord mentions, role mentions, channel mentions, links, names, IDs, or emojis-only text.",
+            "Do not decide who is pinged; the application inserts mentions after validation.",
+        ],
+    }
 
-    async def rewrite(template: str, suggestion: gp.Suggestion) -> str | None:
+
+def make_ai_rewriter(get_orchestrator: Callable[[], Any], choose: Callable[[tuple[str, ...]], str] | None = None) -> Rewriter:
+    """Optional: rephrase the template with the configured AI (CREATIVE route, no tools).
+
+    Each call asks for a random tone and lists the last accepted wordings of
+    this bot, so the messages stay varied; the result is validated like any
+    other rewrite (placeholders, no mentions/links, language).
+    """
+    import random
+
+    pick = choose or random.choice
+    recent: list[str] = []
+
+    async def rewrite(template: str, suggestion: gp.Suggestion, context: dict[str, Any] | None = None) -> str | None:
+        language = DEFAULT_LANGUAGE
         try:
             import ai_orchestrator
-            import ai_platform
 
+            ai_platform = ai_orchestrator.ai_platform  # the module the orchestrator validates against
             orchestrator = get_orchestrator()
             if orchestrator is None:
                 return None
+            language = bot_i18n.normalize_language((context or {}).get("language"), DEFAULT_LANGUAGE)
+            semantic = context or rewrite_context(suggestion, language=language, channel_name=None, template=template)
             request = ai_orchestrator.OrchestratorRequest(
                 messages=(
                     ai_platform.AIMessage(
                         role="system",
                         content=(
-                            "Rephrase one short friendly Discord message in Russian. Keep every placeholder in "
-                            "curly braces exactly once and unchanged, start with {targets}, add no names, "
-                            "mentions, links or emojis-only text. Reply with the message only."
+                            f"Rewrite a Discord Group Up message in {bot_i18n.LANGUAGE_NAMES_EN[language]} so it sounds "
+                            "natural and human, like a friend in the server, not like a bot notification. Keep it to one or "
+                            "two short sentences. Use only the provided placeholders, each exactly once and unchanged; put "
+                            "{targets} near the start. Add no names, IDs, mentions, roles, channels, links, or emojis-only text. "
+                            "AI controls wording only; the application controls game, recipients, voice target, timing, "
+                            "cooldowns, opt-outs, and allowed mentions. Reply with the message template only."
                         ),
                     ),
-                    ai_platform.AIMessage(role="user", content=template),
+                    ai_platform.AIMessage(
+                        role="user",
+                        content=json.dumps(
+                            {
+                                "template": template,
+                                "tone": pick(AI_TONES),
+                                "avoid_these_recent_wordings": list(recent[-RECENT_WORDINGS:]),
+                                "semantic_context": semantic,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    ),
                 ),
                 task_class="CREATIVE",
                 allowed_tool_names=(),
+                response_language=language,
             )
             result = await asyncio.wait_for(orchestrator.orchestrate(request), AI_REWRITE_TIMEOUT_SECONDS)
         except Exception:
             return None
         if getattr(getattr(result, "status", None), "value", None) != "COMPLETED":
             return None
-        return validate_rewrite(getattr(result, "content", None), template)
+        accepted = validate_rewrite(getattr(result, "content", None), template, language)
+        if accepted is not None:
+            recent.append(accepted)
+            del recent[:-RECENT_WORDINGS]
+        return accepted
 
     return rewrite
 
@@ -204,11 +348,11 @@ def make_ai_rewriter(get_orchestrator: Callable[[], Any]) -> Rewriter:
 # --------------------------------------------------------------------------
 
 
-def preference_view() -> discord.ui.View:
+def preference_view(language: str | None = DEFAULT_LANGUAGE) -> discord.ui.View:
     """Persistent public buttons; clicks are handled by the bot's on_interaction listener."""
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Mute pings", style=discord.ButtonStyle.secondary, custom_id=CUSTOM_ID_MUTE))
-    view.add_item(discord.ui.Button(label="Allow pings", style=discord.ButtonStyle.secondary, custom_id=CUSTOM_ID_ALLOW))
+    view.add_item(discord.ui.Button(label=bot_i18n.tr(language, BUTTON_MUTE), style=discord.ButtonStyle.secondary, custom_id=CUSTOM_ID_MUTE))
+    view.add_item(discord.ui.Button(label=bot_i18n.tr(language, BUTTON_ALLOW), style=discord.ButtonStyle.secondary, custom_id=CUSTOM_ID_ALLOW))
     return view
 
 
@@ -224,14 +368,17 @@ def allowed_mentions_for(user_ids: tuple[int, ...]) -> discord.AllowedMentions:
 class DiscordNotifier:
     """Posts suggestions. Holds no cooldown or policy logic."""
 
+    def __init__(self, language: Callable[[], str] | None = None) -> None:
+        self._language = language or (lambda: DEFAULT_LANGUAGE)
+
     async def send(self, channel: Any, content: str, target_user_ids: tuple[int, ...]) -> Any:
-        view = preference_view()
+        view = preference_view(self._language())
         message = await channel.send(content, view=view, allowed_mentions=allowed_mentions_for(target_user_ids))
         view.stop()  # clicks go through the global listener (works after restarts)
         return message
 
 
-async def handle_preference_interaction(interaction: Any, preferences: gp.PreferenceBook | None) -> bool:
+async def handle_preference_interaction(interaction: Any, preferences: gp.PreferenceBook | None, language: str | None = DEFAULT_LANGUAGE) -> bool:
     """Mute/Allow pings. Returns True if the click was ours.
 
     Only interaction.user's own setting changes; the message text, button
@@ -256,7 +403,7 @@ async def handle_preference_interaction(interaction: Any, preferences: gp.Prefer
             else:
                 text = PREF_ALLOWED if changed else PREF_ALREADY_ALLOWED
     try:
-        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.response.send_message(bot_i18n.tr(language, text), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         pass
     return True
@@ -280,11 +427,14 @@ class GamePresenceRuntime:
         runtime_dir: Any = None,
         presence_intent: bool = False,
         log: Callable[[str], None] | None = None,
+        events: Any = None,
     ) -> None:
         self.client = client
         self.engine = engine
-        self.notifier = notifier or DiscordNotifier()
+        self.notifier = notifier or DiscordNotifier(lambda: self.engine.config.language)
         self.rewriter = rewriter
+        # bot_events.EventPublisher of this instance (None: nothing announced).
+        self.events = events
         self.runtime_dir = runtime_dir
         self.presence_intent = presence_intent
         self.log = log or (lambda text: print(text, flush=True))
@@ -442,17 +592,54 @@ class GamePresenceRuntime:
 
     async def _publish(self, channel: Any, guild: Any, suggestion: gp.Suggestion) -> None:
         voice = guild.get_channel(suggestion.voice_channel_id) if suggestion.voice_channel_id else None
-        template = template_for(suggestion)
+        language = self.engine.config.language
+        template = template_for(suggestion, language=language)
         rewritten = None
         if self.engine.config.ai_rewrite and self.rewriter is not None:
             try:
                 # Validated here as well: no rewriter is trusted to keep the rules.
-                rewritten = validate_rewrite(await self.rewriter(template, suggestion), template)
+                context = rewrite_context(suggestion, language=language, channel_name=getattr(voice, "name", None), template=template)
+                rewritten = validate_rewrite(await self._call_rewriter(template, suggestion, context), template, language)
             except Exception:
                 rewritten = None
-        content = render_message(suggestion, getattr(voice, "name", None), rewritten)
-        await self.notifier.send(channel, content, suggestion.target_user_ids)
+        content = render_message(suggestion, getattr(voice, "name", None), rewritten, language=language)
+        # Exactly the users the engine decided on: players, plus the rest of the
+        # target voice channel for a whole-voice Group Up.
+        message = await self.notifier.send(channel, content, suggestion.mentioned_user_ids)
         self.engine.mark_sent(suggestion)
+        self._announce(channel, suggestion, voice, message, rewritten is not None)
+
+    def _announce(self, channel: Any, suggestion: gp.Suggestion, voice: Any, message: Any, ai_worded: bool) -> None:
+        """Tell the other DarkAbyss bots (Kairo's Social Awareness) what was just posted."""
+        if self.events is None:
+            return
+        try:
+            self.events.publish(
+                EVENT_GROUP_UP,
+                suggestion.guild_id,
+                channel_id=getattr(channel, "id", None),
+                message_id=getattr(message, "id", None),
+                data={
+                    "kind": suggestion.kind,
+                    "game": suggestion.game_display_name,
+                    "invited_user_ids": [str(user) for user in (suggestion.outsider_user_ids if suggestion.kind == "join" else suggestion.target_user_ids)],
+                    "voice_player_ids": [str(user) for user in suggestion.voice_member_ids],
+                    "voice_crew_ids": [str(user) for user in suggestion.voice_crew_ids],
+                    "voice_channel_id": None if suggestion.voice_channel_id is None else str(suggestion.voice_channel_id),
+                    "voice_channel_name": getattr(voice, "name", None),
+                    "ai_worded": ai_worded,
+                },
+            )
+        except Exception:
+            pass
+
+    async def _call_rewriter(self, template: str, suggestion: gp.Suggestion, context: dict[str, Any]) -> str | None:
+        if self.rewriter is None:
+            return None
+        try:
+            return await self.rewriter(template, suggestion, context)
+        except TypeError:
+            return await self.rewriter(template, suggestion)
 
     # -- status for the Manager -----------------------------------------------------
 

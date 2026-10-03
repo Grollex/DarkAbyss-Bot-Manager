@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "type": "object",
+  "required": [
+    "enabled",
+    "language",
+    "guild_id",
+    "channel_id",
+    "twitch_client_id",
+    "team_role_ids",
+    "go_live_role_id",
+    "features",
+    "moment_cooldown_seconds",
+    "suggestion_cooldown_seconds",
+    "max_open_challenges_per_user",
+    "moment_cluster_seconds",
+    "moment_reaction_lag_seconds",
+    "notable_moment_min_users",
+    "poll_default_minutes",
+    "end_grace_minutes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "enabled": {
+      "type": "boolean"
+    },
+    "guild_id": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]{5,25}$"
+        }
+      ]
+    },
+    "channel_id": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]{5,25}$"
+        }
+      ]
+    },
+    "go_live_role_id": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]{5,25}$"
+        }
+      ]
+    },
+    "twitch_client_id": {
+      "type": "string",
+      "pattern": "^([a-z0-9]{20,40})?$"
+    },
+    "team_role_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9]{5,25}$"
+      }
+    },
+    "features": {
+      "type": "object",
+      "required": [
+        "moments",
+        "challenges",
+        "polls",
+        "inbox",
+        "progression",
+        "twitch_chat",
+        "next_stream_poll"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "moments": {
+          "type": "boolean"
+        },
+        "challenges": {
+          "type": "boolean"
+        },
+        "polls": {
+          "type": "boolean"
+        },
+        "inbox": {
+          "type": "boolean"
+        },
+        "progression": {
+          "type": "boolean"
+        },
+        "twitch_chat": {
+          "type": "boolean"
+        },
+        "next_stream_poll": {
+          "type": "boolean"
+        }
+      }
+    },
+    "moment_cooldown_seconds": {
+      "type": "integer"
+    },
+    "suggestion_cooldown_seconds": {
+      "type": "integer"
+    },
+    "max_open_challenges_per_user": {
+      "type": "integer"
+    },
+    "moment_cluster_seconds": {
+      "type": "integer"
+    },
+    "moment_reaction_lag_seconds": {
+      "type": "integer"
+    },
+    "notable_moment_min_users": {
+      "type": "integer"
+    },
+    "poll_default_minutes": {
+      "type": "integer"
+    },
+    "end_grace_minutes": {
+      "type": "integer"
+    },
+    "language": {
+      "type": "string",
+      "pattern": "^(en|ru)$"
+    }
+  }
+}

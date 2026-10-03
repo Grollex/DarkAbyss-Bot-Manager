@@ -9,5 +9,10 @@
   "ai_confirmation_mode": "plan",
   "ai_read_message_content": false,
   "ai_mention_enabled": false,
-  "ai_mention_channel_ids": []
+  "ai_mention_channel_ids": [],
+  "language": "en",
+  "social_awareness_enabled": null,
+  "social_awareness_channel_ids": [],
+  "social_awareness_replies_per_hour": 4,
+  "social_awareness_lore_enabled": true
 }

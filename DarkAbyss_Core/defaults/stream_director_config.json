@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "language": "en",
+  "guild_id": null,
+  "channel_id": null,
+  "twitch_client_id": "",
+  "team_role_ids": [],
+  "go_live_role_id": null,
+  "features": {
+    "moments": true,
+    "challenges": true,
+    "polls": true,
+    "inbox": true,
+    "progression": true,
+    "twitch_chat": true,
+    "next_stream_poll": true
+  },
+  "moment_cooldown_seconds": 30,
+  "suggestion_cooldown_seconds": 60,
+  "max_open_challenges_per_user": 3,
+  "moment_cluster_seconds": 90,
+  "moment_reaction_lag_seconds": 15,
+  "notable_moment_min_users": 2,
+  "poll_default_minutes": 3,
+  "end_grace_minutes": 5
+}

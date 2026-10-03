@@ -15,10 +15,17 @@ import admin_terminal
 import admin_tools
 import admin_features  # after admin_tools (it loads the tool extensions)
 import app_paths
+import bot_events
+import bot_i18n
 import bot_registry
 import config_store
 import instance_store
 import runtime_layout
+import social_awareness
+import social_memory
+from bot_i18n import t
+
+ADMIN_DEFAULT_LANGUAGE = "en"
 
 try:
     # /ai transport. It imports no AI/provider module at import time; even if
@@ -110,7 +117,7 @@ def parse_snowflake_list(value: object, field_name: str) -> list[int]:
 
 def validate_config(config: dict) -> dict:
     if not isinstance(config.get("allow_server_administrators"), bool):
-        raise ValueError('"allow_server_administrators" must be a boolean.')
+        raise ValueError(t("\"allow_server_administrators\" must be a boolean."))
 
     config["allowed_user_ids"] = parse_snowflake_list(
         config.get("allowed_user_ids"),
@@ -147,26 +154,35 @@ def validate_config(config: dict) -> dict:
     # confirmed one by one with exact arguments); "strict" = approve every change.
     confirmation_mode = config.get("ai_confirmation_mode", "plan")
     if confirmation_mode not in ("plan", "strict"):
-        raise ValueError('"ai_confirmation_mode" must be "plan" or "strict".')
+        raise ValueError(t("\"ai_confirmation_mode\" must be \"plan\" or \"strict\"."))
     config["ai_confirmation_mode"] = confirmation_mode
 
     # Lets AI tools read message text (purge filters, summaries) without the
     # control channel. Requires the privileged Message Content Intent.
     read_content = config.get("ai_read_message_content", False)
     if not isinstance(read_content, bool):
-        raise ValueError('"ai_read_message_content" must be a boolean.')
+        raise ValueError(t("\"ai_read_message_content\" must be a boolean."))
     config["ai_read_message_content"] = read_content
 
     # @Kairo mentions (bot user or its role) start AI requests; an empty
     # channel list means every channel the bot can read.
     mention_enabled = config.get("ai_mention_enabled", False)
     if not isinstance(mention_enabled, bool):
-        raise ValueError('"ai_mention_enabled" must be a boolean.')
+        raise ValueError(t("\"ai_mention_enabled\" must be a boolean."))
     config["ai_mention_enabled"] = mention_enabled
     config["ai_mention_channel_ids"] = parse_snowflake_list(
         config.get("ai_mention_channel_ids", []),
         "ai_mention_channel_ids",
     )
+
+    # Language of everything this bot writes in Discord (older configs: English).
+    try:
+        config["language"] = bot_i18n.normalize_language(config.get("language"), ADMIN_DEFAULT_LANGUAGE)
+    except bot_i18n.LanguageError as exc:
+        raise ValueError(t("\"language\" {exc}", exc=exc)) from exc
+
+    # Social Awareness (optional): null = never chosen (off; the Manager asks once).
+    social_awareness.validate_config_fields(config, parse_snowflake_list)
 
     return config
 
@@ -180,9 +196,11 @@ def load_config(runtime: AdminRuntime | None = None) -> dict:
         raise RuntimeError(f"Invalid admin config {selected_runtime.config_path}: {exc}") from exc
 
     try:
-        return validate_config(loaded)
+        config = validate_config(loaded)
     except ValueError as exc:
         raise RuntimeError(f"Invalid admin config {selected_runtime.config_path}: {exc}") from exc
+    bot_i18n.set_bot_language(config["language"])
+    return config
 
 
 def acquire_single_instance_lock(runtime: AdminRuntime | None = None) -> bool:
@@ -247,7 +265,7 @@ def build_execute_tool_arguments(
 
     if action_name in {"rename_channel", "delete_channel"}:
         if channel is not None and voice_channel is not None:
-            raise ValueError(f"{action_name} requires only one of channel or voice_channel.")
+            raise ValueError(t("{action_name} requires only one of channel or voice_channel.", action_name=action_name))
         selected_channel = channel or voice_channel
         channel_id = _snowflake_argument(selected_channel)
         if channel_id is not None:
@@ -299,13 +317,13 @@ async def send_audit(
 
     try:
         embed = discord.Embed(
-            title="Admin action",
+            title=t("Admin action"),
             color=0x2F80ED,
             timestamp=datetime.now(timezone.utc),
         )
-        embed.add_field(name="Action", value=action, inline=False)
-        embed.add_field(name="By", value=f"{interaction.user} ({interaction.user.id})", inline=False)
-        embed.add_field(name="Result", value=clip_discord_message(result, 1024), inline=False)
+        embed.add_field(name=t("Action"), value=action, inline=False)
+        embed.add_field(name=t("By"), value=f"{interaction.user} ({interaction.user.id})", inline=False)
+        embed.add_field(name=t("Result"), value=clip_discord_message(result, 1024), inline=False)
         await channel.send(embed=embed)
     except Exception as exc:
         failure = f"Audit logging failed: {type(exc).__name__}: {exc}"
@@ -338,25 +356,47 @@ LOGIN_FAILURE_HELP = (
 
 
 def message_content_requested(config: dict) -> bool:
-    """Message Content Intent is needed by the control channel or by AI message reading."""
+    """Message Content Intent is needed by the control channel, AI message reading,
+    @mention requests and Social Awareness."""
     # Role pings (@Kairo role) arrive without text unless the intent is on.
     return (
         natural_ai_enabled(config)
         or config.get("ai_read_message_content") is True
         or config.get("ai_mention_enabled") is True
+        or config.get(social_awareness.CONFIG_ENABLED) is True
     )
 
 
 PRIVILEGED_INTENTS_HELP = (
-    "Discord refused a privileged gateway intent. With the AI control channel, @mention requests or "
-    "'AI can read message text' enabled this bot requires BOTH privileged intents: 'Server Members "
-    "Intent' (always required by the Admin bot) and 'Message Content Intent' (required only for the AI "
-    "control channel, @mention requests and AI message reading). Enable the missing one(s) in Discord "
-    "Developer Portal -> Application -> Bot -> Privileged Gateway Intents. To run without Message "
-    "Content Intent, clear 'AI control channel ID' and turn off '@mention requests' and 'AI can read "
-    "message text' in Manager Setup Bot (Server Members Intent is still required). /execute and /ai do "
-    "not need Message Content Intent."
+    "Discord refused a privileged gateway intent. With the AI control channel, @mention requests, "
+    "'AI can read message text' or Social Awareness enabled this bot requires BOTH privileged intents: "
+    "'Server Members Intent' (always required by the Admin bot) and 'Message Content Intent' (required "
+    "only for the AI control channel, @mention requests, AI message reading and Social Awareness). Enable "
+    "the missing one(s) in Discord Developer Portal -> Application -> Bot -> Privileged Gateway Intents. "
+    "To run without Message Content Intent, clear 'AI control channel ID' and turn off '@mention requests' "
+    "and 'AI can read message text' in Manager Setup Bot and Social Awareness on the Kairo page (Server "
+    "Members Intent is still required). /execute and /ai do not need Message Content Intent."
 )
+
+
+class BotLanguageTranslator(app_commands.Translator):
+    """Slash command and parameter descriptions in THIS bot's language for every
+    Discord locale (names and choice values stay as they are). Applied when the
+    commands are synced at start, so a language change needs a restart here."""
+
+    DESCRIPTIONS = frozenset(
+        {
+            app_commands.TranslationContextLocation.command_description,
+            app_commands.TranslationContextLocation.group_description,
+            app_commands.TranslationContextLocation.parameter_description,
+        }
+    )
+
+    async def translate(self, string: app_commands.locale_str, locale: discord.Locale, context: app_commands.TranslationContext) -> str | None:
+        if context.location not in self.DESCRIPTIONS or bot_i18n.bot_language() == "en":
+            return None
+        text = bot_i18n.t(string.message)
+        return text[:100] if text != string.message else None
 
 
 class AdminBot(commands.Bot):
@@ -366,15 +406,30 @@ class AdminBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
+        await self.tree.set_translator(BotLanguageTranslator())
         await self.tree.sync()
         if feature_store is not None and not scheduled_messages_loop.is_running():
             scheduled_messages_loop.start()
         if terminal is not None and not terminal_loop.is_running():
             terminal_loop.start()
+        if not config_refresh_loop.is_running():
+            config_refresh_loop.start()
+        if social is not None and not social_loop.is_running():
+            social_loop.start()
 
     async def on_ready(self) -> None:
         print(f"Discord-only Admin Bot is online as {self.user}")
         refresh_terminal_status()
+        if social is not None:
+            names = [getattr(self.user, "name", ""), getattr(self.user, "global_name", None) or ""]
+            names += [getattr(getattr(guild, "me", None), "display_name", "") for guild in self.guilds]
+            social.set_identity(getattr(self.user, "id", None), names)
+        send_heartbeat(force=True)
+
+    async def close(self) -> None:
+        if events_publisher is not None:
+            events_publisher.stopped()  # the other DarkAbyss bots see "not running" at once
+        await super().close()
 
 
 bot = AdminBot()
@@ -382,6 +437,27 @@ bot = AdminBot()
 # AI-6 persistent bot features (role menus, verification, welcome, schedules).
 # Set in main() from the instance data folder; None disables them.
 feature_store: admin_features.FeatureStore | None = None
+
+# Kairo Social Awareness (social_awareness.py). Set in main() when the AI
+# transport exists; it stays silent while switched off in the config.
+social: social_awareness.SocialAwareness | None = None
+
+# This bot on the DarkAbyss bot event bus (heartbeat: "Kairo is running"). Set in main().
+events_publisher: bot_events.EventPublisher | None = None
+instance_display_name = ""
+
+
+def send_heartbeat(force: bool = False) -> None:
+    if events_publisher is None:
+        return
+    user = getattr(bot, "user", None)
+    events_publisher.heartbeat(
+        display_name=instance_display_name,
+        discord_user_id=getattr(user, "id", None),
+        discord_name=getattr(user, "display_name", None) or getattr(user, "name", "") or "",
+        guild_ids=[guild.id for guild in getattr(bot, "guilds", [])],
+        force=force,
+    )
 
 # Manager request terminal (file mailbox in the instance runtime folder).
 # Set in main(); None disables it.
@@ -435,6 +511,47 @@ async def feature_member_join_listener(member: discord.Member) -> None:
         await admin_features.handle_member_join(member, feature_store)
     except Exception as exc:  # pragma: no cover
         print(f"Welcome feature error: {type(exc).__name__}")
+
+
+CONFIG_REFRESH_SECONDS = 15
+
+
+def refresh_live_config() -> dict | None:
+    """Live settings without a command: the bot language (role menu, welcome and
+    schedule texts too) and Social Awareness pick up a saved change within 15 s."""
+    try:
+        config = load_config()
+    except RuntimeError:
+        config = None  # invalid config: keep the language, Social Awareness fails closed
+    if social is not None:
+        social.apply_config(config)
+    return config
+
+
+@tasks.loop(seconds=CONFIG_REFRESH_SECONDS)
+async def config_refresh_loop() -> None:
+    refresh_live_config()
+    send_heartbeat()  # at most once a minute (bot_events.HEARTBEAT_SECONDS)
+
+
+@config_refresh_loop.before_loop
+async def _config_refresh_wait() -> None:
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=5)
+async def social_loop() -> None:
+    if social is None:
+        return
+    try:
+        await social.tick()
+    except Exception as exc:  # pragma: no cover - never stop the loop
+        print(f"Social Awareness error: {type(exc).__name__}")
+
+
+@social_loop.before_loop
+async def _social_wait() -> None:
+    await bot.wait_until_ready()
 
 
 @tasks.loop(seconds=60)
@@ -492,16 +609,16 @@ async def execute(
         return
 
     if not actor_has_access(interaction, config):
-        await interaction.response.send_message("Access denied.", ephemeral=True)
+        await interaction.response.send_message(t("Access denied."), ephemeral=True)
         return
 
     if not interaction.guild:
-        await interaction.response.send_message("This command works only inside a Discord server.", ephemeral=True)
+        await interaction.response.send_message(t("This command works only inside a Discord server."), ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
     action_name = action.value
-    reason_text = reason or f"Requested by {interaction.user} via /execute"
+    reason_text = reason or t("Requested by {user} via /execute", user=interaction.user)
     context = admin_tools.AdminToolContext(
         guild=interaction.guild,
         fetch_user=bot.fetch_user,
@@ -534,7 +651,7 @@ async def execute(
 
     audit_failure = await send_audit(interaction, config, action_name, result)
     if tool_result.ok and audit_failure:
-        result = f"{result}\n\nAction completed, but audit logging failed."
+        result = f"{result}\n\n" + t("Action completed, but audit logging failed.")
 
     await interaction.followup.send(clip_discord_message(result), ephemeral=True)
 
@@ -575,7 +692,7 @@ async def ai(
 ) -> None:
     if ai_transport is None:
         await interaction.response.send_message(
-            "AI is currently unavailable.",
+            t("AI is currently unavailable."),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -589,12 +706,24 @@ async def ai(
 async def ai_reset(interaction: discord.Interaction) -> None:
     if ai_transport is None:
         await interaction.response.send_message(
-            "AI is currently unavailable.",
+            t("AI is currently unavailable."),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
     await ai_transport.handle_reset_command(interaction)
+
+
+@bot.listen("on_raw_reaction_add")
+async def social_reaction_listener(payload: discord.RawReactionActionEvent) -> None:
+    # How people react to Kairo's own autonomous messages (feedback for Social Awareness).
+    if social is None:
+        return
+    try:
+        member = getattr(payload, "member", None)
+        social.observe_reaction(payload.guild_id, payload.channel_id, payload.message_id, payload.user_id, str(payload.emoji), bool(getattr(member, "bot", False)))
+    except Exception as exc:  # pragma: no cover
+        print(f"Social Awareness error: {type(exc).__name__}")
 
 
 @bot.listen("on_message")
@@ -603,6 +732,11 @@ async def ai_control_channel_listener(message: discord.Message) -> None:
     # @mention requests are enabled.
     if ai_transport is None:
         return
+    if social is not None:
+        try:
+            social.observe_message(message)  # RAM only; does nothing while switched off
+        except Exception as exc:  # pragma: no cover
+            print(f"Social Awareness error: {type(exc).__name__}")
     try:
         if ai_transport.control_channel_id is not None:
             await ai_transport.handle_control_message(message)
@@ -610,6 +744,108 @@ async def ai_control_channel_listener(message: discord.Message) -> None:
             await ai_transport.handle_mention_message(message)
     except Exception as exc:  # pragma: no cover - never let AI break the event loop
         print(f"AI message error: {type(exc).__name__}")
+
+
+def is_normal_ai_request(message: Any) -> bool:
+    """Messages the normal AI flow answers (control channel, @mention requests)."""
+    if ai_transport is None:
+        return False
+    channel_id = getattr(getattr(message, "channel", None), "id", None)
+    if ai_transport.control_channel_id is not None and channel_id == ai_transport.control_channel_id:
+        return True
+    return ai_transport.mention_enabled and ai_transport.mention_prompt(message) is not None
+
+
+async def social_send(guild_id: int, channel_id: int, content: str, reply_to: int | None) -> int | None:
+    """Post one Social Awareness message: never pings anyone (no mentions at all)."""
+    guild = bot.get_guild(guild_id)
+    lookup = getattr(guild, "get_channel_or_thread", None) or getattr(guild, "get_channel", None)
+    channel = lookup(channel_id) if callable(lookup) else None
+    if guild is None or channel is None or not hasattr(channel, "send"):
+        return None
+    permissions = channel.permissions_for(guild.me)
+    in_thread = isinstance(channel, discord.Thread)
+    if not permissions.view_channel or not (permissions.send_messages_in_threads if in_thread else permissions.send_messages):
+        return None
+    kwargs: dict[str, Any] = {"allowed_mentions": discord.AllowedMentions.none()}
+    if reply_to is not None:
+        kwargs["reference"] = discord.MessageReference(message_id=reply_to, channel_id=channel_id, guild_id=guild_id, fail_if_not_exists=False)
+        kwargs["mention_author"] = False
+    message = await channel.send(content, **kwargs)
+    return getattr(message, "id", None)
+
+
+async def social_react(guild_id: int, channel_id: int, message_id: int, emoji: str) -> bool:
+    """One Social Awareness reaction (or the 🤐 nod to a quiet wish), only where the bot may react."""
+    guild = bot.get_guild(guild_id)
+    lookup = getattr(guild, "get_channel_or_thread", None) or getattr(guild, "get_channel", None)
+    channel = lookup(channel_id) if callable(lookup) else None
+    if guild is None or channel is None or not hasattr(channel, "get_partial_message"):
+        return False
+    permissions = channel.permissions_for(guild.me)
+    if not permissions.view_channel or not permissions.add_reactions or not permissions.read_message_history:
+        return False
+    await channel.get_partial_message(message_id).add_reaction(emoji)
+    return True
+
+
+_instances_cache: tuple[float, list[tuple[str, str, str]]] = (0.0, [])
+
+
+def _darkabyss_instances() -> list[tuple[str, str, str]]:
+    """(instance id, bot type, Manager name) of every DarkAbyss bot (metadata only, no secrets)."""
+    global _instances_cache
+    import time as _time
+
+    now = _time.monotonic()
+    if now - _instances_cache[0] < 300 and _instances_cache[1]:
+        return _instances_cache[1]
+    try:
+        listed = [(item.id, item.bot_type, item.display_name) for item in instance_store.list_instances()]
+    except Exception:
+        listed = _instances_cache[1]
+    _instances_cache = (now, listed)
+    return listed
+
+
+def _member_name(guild_id: int, user_id: int) -> str | None:
+    guild = bot.get_guild(guild_id)
+    member = guild.get_member(user_id) if guild is not None else None
+    return getattr(member, "display_name", None)
+
+
+def _place(guild_id: int, channel_id: int | None) -> tuple[str, str]:
+    guild = bot.get_guild(guild_id)
+    lookup = getattr(guild, "get_channel_or_thread", None)
+    channel = lookup(channel_id) if callable(lookup) and channel_id is not None else None
+    return getattr(guild, "name", "") or "", f"#{getattr(channel, 'name', '')}" if channel is not None else ""
+
+
+def build_social_awareness(runtime: AdminRuntime, message_content: bool) -> social_awareness.SocialAwareness | None:
+    if ai_transport is None:
+        return None
+    try:
+        events = bot_events.EventReader(own_instance_id=runtime.instance_id)
+    except Exception:
+        events = None
+    data_dir = getattr(runtime, "data_dir", None)
+    return social_awareness.SocialAwareness(
+        get_orchestrator=ai_transport.get_orchestrator,
+        send=social_send,
+        react=social_react,
+        events=events,
+        # Server Lore, feedback and quiet wishes of THIS Kairo instance.
+        memory=social_memory.SocialMemory(Path(data_dir) / social_memory.FILE_NAME) if data_dir is not None else None,
+        instances=_darkabyss_instances,
+        own_instance_id=runtime.instance_id,
+        is_ai_request=is_normal_ai_request,
+        resolve_name=_member_name,
+        describe_place=_place,
+        knows_guild=lambda guild_id: bot.get_guild(guild_id) is not None,
+        message_content=message_content,
+        runtime_dir=Path(runtime.lock_path).parent,
+        write_status=admin_terminal.write_runtime_json,
+    )
 
 
 def resolve_ai_stores(runtime: AdminRuntime) -> Any:
@@ -638,8 +874,13 @@ def main(argv: list[str] | None = None) -> int:
         print(exc)
         return 1
 
-    global feature_store, terminal
+    global feature_store, terminal, social, events_publisher, instance_display_name
     feature_store = admin_features.store_for_data_dir(getattr(runtime, "data_dir", None))
+    try:
+        events_publisher = bot_events.EventPublisher(runtime.instance_id, admin_instance.ADMIN_BOT_TYPE_ID)
+        instance_display_name = instance_store.load_instance(runtime.instance_id).display_name
+    except Exception:
+        instance_display_name = instance_display_name or ""
     if ai_transport is not None:
         ai_transport.feature_store = feature_store
         ai_transport.ai_stores = resolve_ai_stores(runtime)
@@ -658,6 +899,11 @@ def main(argv: list[str] | None = None) -> int:
         print("AI control channel enabled; requesting Discord Message Content Intent.")
     elif read_content:
         print("AI message reading enabled; requesting Discord Message Content Intent.")
+    social = build_social_awareness(runtime, read_content)
+    if social is not None:
+        social.apply_config(config)
+        if social.settings.enabled:
+            print("Social Awareness is on (reads messages in RAM only; usually stays silent).")
 
     if acquire_single_instance_lock(runtime):
         try:

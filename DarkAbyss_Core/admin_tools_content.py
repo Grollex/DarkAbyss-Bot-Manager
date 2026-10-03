@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import discord
+from bot_i18n import t
 
 C: Any = None  # admin_tools core module, set by build_tools()
 
@@ -90,7 +91,7 @@ def resolve_any_channel(context: Any, value: Any, field: str = "channel_id") -> 
 def resolve_messageable(context: Any, value: Any, tool: str) -> Any:
     channel = resolve_any_channel(context, value)
     if C._normalized_channel_type(channel) not in MESSAGEABLE_TYPES:
-        raise ValueError(f"{tool} needs a text, announcement, voice-chat or thread channel.")
+        raise ValueError(t("{tool} needs a text, announcement, voice-chat or thread channel.", tool=tool))
     return channel
 
 
@@ -147,9 +148,9 @@ def build_embed(spec: dict[str, Any]) -> discord.Embed:
     if spec.get("thumbnail_url"):
         embed.set_thumbnail(url=spec["thumbnail_url"])
     if len(embed) == 0 and not spec.get("image_url") and not spec.get("thumbnail_url"):
-        raise ValueError("The embed is empty.")
+        raise ValueError(t("The embed is empty."))
     if len(embed) > MAX_EMBED_TOTAL_CHARS:
-        raise ValueError(f"The embed text exceeds Discord's {MAX_EMBED_TOTAL_CHARS}-character limit.")
+        raise ValueError(t("The embed text exceeds Discord's {max_embed_total_chars}-character limit.", max_embed_total_chars=MAX_EMBED_TOTAL_CHARS))
     return embed
 
 
@@ -163,7 +164,7 @@ async def _send_embed(context: Any, arguments: dict[str, Any]) -> Any:
     embed = build_embed(arguments["embed"])
     content = arguments.get("content") or None
     message = await channel.send(content=content, embed=embed, **_send_kwargs(context))
-    return _ok("send_embed", f"Embed sent to {channel.name}.", {"message_id": _sid(message)})
+    return _ok("send_embed", t("Embed sent to {name}.", name=channel.name), {"message_id": _sid(message)})
 
 
 async def _edit_bot_message(context: Any, arguments: dict[str, Any]) -> Any:
@@ -171,7 +172,7 @@ async def _edit_bot_message(context: Any, arguments: dict[str, Any]) -> Any:
     channel, message = await fetch_channel_message(context, arguments, "edit_bot_message")
     bot = C._bot_member(guild)
     if bot is None or getattr(getattr(message, "author", None), "id", None) != getattr(bot, "id", None):
-        raise C.AdminToolError("Only messages written by this bot can be edited.")
+        raise C.AdminToolError(t("Only messages written by this bot can be edited."))
     options: dict[str, Any] = {}
     if arguments.get("content") is not None:
         options["content"] = arguments["content"] or None
@@ -179,27 +180,27 @@ async def _edit_bot_message(context: Any, arguments: dict[str, Any]) -> Any:
         options["embed"] = build_embed(arguments["embed"])
     if arguments.get("remove_embeds") is True:
         if "embed" in options:
-            raise ValueError("Use either embed or remove_embeds.")
+            raise ValueError(t("Use either embed or remove_embeds."))
         options["embeds"] = []
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     await message.edit(**options, **_send_kwargs(context))
-    return _ok("edit_bot_message", f"Edited the bot message in {channel.name}.")
+    return _ok("edit_bot_message", t("Edited the bot message in {name}.", name=channel.name))
 
 
 async def _delete_message(context: Any, arguments: dict[str, Any]) -> Any:
     channel, message = await fetch_channel_message(context, arguments, "delete_message")
     await message.delete()
-    return _ok("delete_message", f"Deleted a message in {channel.name}.")
+    return _ok("delete_message", t("Deleted a message in {name}.", name=channel.name))
 
 
 async def _pin_message(context: Any, arguments: dict[str, Any]) -> Any:
     channel, message = await fetch_channel_message(context, arguments, "pin_message")
     if arguments.get("unpin") is True:
         await message.unpin(reason=_reason(arguments))
-        return _ok("pin_message", f"Unpinned a message in {channel.name}.")
+        return _ok("pin_message", t("Unpinned a message in {name}.", name=channel.name))
     await message.pin(reason=_reason(arguments))
-    return _ok("pin_message", f"Pinned a message in {channel.name}.")
+    return _ok("pin_message", t("Pinned a message in {name}.", name=channel.name))
 
 
 def _emoji_input(context: Any, value: str) -> Any:
@@ -217,7 +218,7 @@ async def _add_reaction(context: Any, arguments: dict[str, Any]) -> Any:
     for value in arguments["emojis"]:
         await message.add_reaction(_emoji_input(context, value))
         added += 1
-    return _ok("add_reaction", f"Added {added} reaction(s) in {channel.name}.")
+    return _ok("add_reaction", t("Added {added} reaction(s) in {name}.", added=added, name=channel.name))
 
 
 async def _create_poll(context: Any, arguments: dict[str, Any]) -> Any:
@@ -230,15 +231,15 @@ async def _create_poll(context: Any, arguments: dict[str, Any]) -> Any:
     for answer in arguments["answers"]:
         poll.add_answer(text=answer["text"], emoji=answer.get("emoji") or None)
     message = await channel.send(content=arguments.get("content") or None, poll=poll, **_send_kwargs(context))
-    return _ok("create_poll", f"Poll posted in {channel.name}.", {"message_id": _sid(message)})
+    return _ok("create_poll", t("Poll posted in {name}.", name=channel.name), {"message_id": _sid(message)})
 
 
 async def _publish_message(context: Any, arguments: dict[str, Any]) -> Any:
     channel, message = await fetch_channel_message(context, arguments, "publish_message")
     if C._normalized_channel_type(channel) != "news":
-        raise ValueError("Only messages in announcement channels can be published.")
+        raise ValueError(t("Only messages in announcement channels can be published."))
     await message.publish()
-    return _ok("publish_message", f"Published a message from {channel.name} to following servers.")
+    return _ok("publish_message", t("Published a message from {name} to following servers.", name=channel.name))
 
 
 # --------------------------------------------------------------------------
@@ -266,7 +267,7 @@ async def _list_active_threads(context: Any, arguments: dict[str, Any]) -> dict[
 async def _create_thread(context: Any, arguments: dict[str, Any]) -> Any:
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     if C._normalized_channel_type(channel) not in ("text", "news"):
-        raise ValueError("create_thread needs a text or announcement channel; use create_forum_post for forums.")
+        raise ValueError(t("create_thread needs a text or announcement channel; use create_forum_post for forums."))
     options: dict[str, Any] = {"name": C._require_name(arguments.get("name"))}
     if arguments.get("auto_archive_minutes") is not None:
         options["auto_archive_duration"] = arguments["auto_archive_minutes"]
@@ -279,19 +280,19 @@ async def _create_thread(context: Any, arguments: dict[str, Any]) -> Any:
     else:
         options["type"] = discord.ChannelType.public_thread
     thread = await channel.create_thread(reason=_reason(arguments), **options)
-    return _ok("create_thread", f"Created thread {thread.name}.", {"thread_id": _sid(thread)})
+    return _ok("create_thread", t("Created thread {name}.", name=thread.name), {"thread_id": _sid(thread)})
 
 
 async def _create_forum_post(context: Any, arguments: dict[str, Any]) -> Any:
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     if C._normalized_channel_type(channel) not in ("forum", "media"):
-        raise ValueError("create_forum_post needs a forum channel.")
+        raise ValueError(t("create_forum_post needs a forum channel."))
     tags = []
     wanted = [name.lower() for name in arguments.get("tag_names") or []]
     available = {str(getattr(tag, "name", "")).lower(): tag for tag in getattr(channel, "available_tags", None) or []}
     for name in wanted:
         if name not in available:
-            raise ValueError(f"Forum tag {name!r} does not exist in {channel.name}.")
+            raise ValueError(t("Forum tag {name} does not exist in {name2}.", name=repr(name), name2=channel.name))
         tags.append(available[name])
     options: dict[str, Any] = {"name": C._require_name(arguments.get("title"), "title"), "content": arguments["content"]}
     if arguments.get("embed") is not None:
@@ -300,13 +301,13 @@ async def _create_forum_post(context: Any, arguments: dict[str, Any]) -> Any:
         options["applied_tags"] = tags
     created = await channel.create_thread(reason=_reason(arguments), **options, **_send_kwargs(context))
     thread = getattr(created, "thread", created)
-    return _ok("create_forum_post", f"Created forum post {thread.name}.", {"thread_id": _sid(thread)})
+    return _ok("create_forum_post", t("Created forum post {name}.", name=thread.name), {"thread_id": _sid(thread)})
 
 
 async def _edit_thread(context: Any, arguments: dict[str, Any]) -> Any:
     thread = resolve_any_channel(context, arguments.get("thread_id"), "thread_id")
     if not C._normalized_channel_type(thread).endswith("thread"):
-        raise ValueError("thread_id must refer to a thread or forum post.")
+        raise ValueError(t("thread_id must refer to a thread or forum post."))
     options: dict[str, Any] = {}
     if arguments.get("name") is not None:
         options["name"] = C._require_name(arguments["name"])
@@ -320,15 +321,15 @@ async def _edit_thread(context: Any, arguments: dict[str, Any]) -> Any:
         if arguments.get(field) is not None:
             options[target] = arguments[field]
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     await thread.edit(reason=_reason(arguments), **options)
-    return _ok("edit_thread", f"Updated thread {thread.name}.")
+    return _ok("edit_thread", t("Updated thread {name}.", name=thread.name))
 
 
 async def _set_forum_tags(context: Any, arguments: dict[str, Any]) -> Any:
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     if C._normalized_channel_type(channel) not in ("forum", "media"):
-        raise ValueError("set_forum_tags needs a forum channel.")
+        raise ValueError(t("set_forum_tags needs a forum channel."))
     existing = {str(getattr(tag, "name", "")).lower(): tag for tag in getattr(channel, "available_tags", None) or []}
     tags = []
     for item in arguments["tags"]:
@@ -338,7 +339,7 @@ async def _set_forum_tags(context: Any, arguments: dict[str, Any]) -> Any:
             tag.id = old.id  # keep the tag (and posts using it) when only its options change
         tags.append(tag)
     await channel.edit(available_tags=tags, reason=_reason(arguments))
-    return _ok("set_forum_tags", f"Forum {channel.name} now has {len(tags)} tag(s).")
+    return _ok("set_forum_tags", t("Forum {name} now has {count} tag(s).", name=channel.name, count=len(tags)))
 
 
 # --------------------------------------------------------------------------
@@ -370,24 +371,24 @@ async def _find_webhook(context: Any, value: Any) -> Any:
     for hook in await guild.webhooks():
         if getattr(hook, "id", None) == webhook_id:
             return hook
-    raise C.AdminToolError(f"Webhook {webhook_id} was not found.")
+    raise C.AdminToolError(t("Webhook {webhook_id} was not found.", webhook_id=webhook_id))
 
 
 async def _create_webhook(context: Any, arguments: dict[str, Any]) -> Any:
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     if C._normalized_channel_type(channel) not in ("text", "news", "forum", "voice", "stage_voice"):
-        raise ValueError("Webhooks can be created in text, announcement, forum, voice or stage channels.")
+        raise ValueError(t("Webhooks can be created in text, announcement, forum, voice or stage channels."))
     hook = await channel.create_webhook(name=arguments["name"], reason=_reason(arguments))
     # Only the ID is returned; the token/URL stays private (visible to admins in Discord settings).
-    return _ok("create_webhook", f"Created webhook {hook.name} in {channel.name}.", {"webhook_id": _sid(hook)})
+    return _ok("create_webhook", t("Created webhook {name} in {name2}.", name=hook.name, name2=channel.name), {"webhook_id": _sid(hook)})
 
 
 async def _send_webhook_message(context: Any, arguments: dict[str, Any]) -> Any:
     hook = await _find_webhook(context, arguments.get("webhook_id"))
     if not getattr(hook, "token", None):
-        raise C.AdminToolError("This webhook cannot be used by the bot (no token available).")
+        raise C.AdminToolError(t("This webhook cannot be used by the bot (no token available)."))
     if not arguments.get("content") and arguments.get("embed") is None:
-        raise ValueError("Provide content and/or embed.")
+        raise ValueError(t("Provide content and/or embed."))
     options: dict[str, Any] = {"allowed_mentions": discord.AllowedMentions.none(), "wait": True}
     if arguments.get("content"):
         options["content"] = arguments["content"]
@@ -398,14 +399,14 @@ async def _send_webhook_message(context: Any, arguments: dict[str, Any]) -> Any:
     if arguments.get("avatar_url"):
         options["avatar_url"] = arguments["avatar_url"]
     await hook.send(**options)
-    return _ok("send_webhook_message", f"Sent a message through webhook {hook.name}.")
+    return _ok("send_webhook_message", t("Sent a message through webhook {name}.", name=hook.name))
 
 
 async def _delete_webhook(context: Any, arguments: dict[str, Any]) -> Any:
     hook = await _find_webhook(context, arguments.get("webhook_id"))
     name = hook.name
     await hook.delete(reason=_reason(arguments))
-    return _ok("delete_webhook", f"Deleted webhook {name}.")
+    return _ok("delete_webhook", t("Deleted webhook {name}.", name=name))
 
 
 # --------------------------------------------------------------------------
@@ -437,7 +438,7 @@ async def _list_invites(context: Any, arguments: dict[str, Any]) -> dict[str, An
 async def _create_invite(context: Any, arguments: dict[str, Any]) -> Any:
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     if C._normalized_channel_type(channel) in ("category",) or C._normalized_channel_type(channel).endswith("thread"):
-        raise ValueError("Invites need a text, voice, stage or forum channel.")
+        raise ValueError(t("Invites need a text, voice, stage or forum channel."))
     invite = await channel.create_invite(
         max_age=arguments.get("max_age_seconds", 86400),
         max_uses=arguments.get("max_uses", 0),
@@ -445,7 +446,7 @@ async def _create_invite(context: Any, arguments: dict[str, Any]) -> Any:
         unique=arguments.get("unique", True) is not False,
         reason=_reason(arguments),
     )
-    return _ok("create_invite", f"Invite created: {invite.url}", {"url": invite.url, "code": invite.code})
+    return _ok("create_invite", t("Invite created: {url}", url=invite.url), {"url": invite.url, "code": invite.code})
 
 
 async def _revoke_invite(context: Any, arguments: dict[str, Any]) -> Any:
@@ -454,8 +455,8 @@ async def _revoke_invite(context: Any, arguments: dict[str, Any]) -> Any:
     for invite in await guild.invites():
         if getattr(invite, "code", None) == code:
             await invite.delete(reason=_reason(arguments))
-            return _ok("revoke_invite", f"Revoked invite {code}.")
-    raise C.AdminToolError(f"Invite {code} was not found on this server.")
+            return _ok("revoke_invite", t("Revoked invite {code}.", code=code))
+    raise C.AdminToolError(t("Invite {code} was not found on this server.", code=code))
 
 
 # --------------------------------------------------------------------------
@@ -492,21 +493,21 @@ async def _create_emoji(context: Any, arguments: dict[str, Any]) -> Any:
     if roles:
         options["roles"] = roles
     emoji = await guild.create_custom_emoji(**options)
-    return _ok("create_emoji", f"Created emoji :{emoji.name}:.", {"emoji_id": _sid(emoji)})
+    return _ok("create_emoji", t("Created emoji :{name}:.", name=emoji.name), {"emoji_id": _sid(emoji)})
 
 
 async def _rename_emoji(context: Any, arguments: dict[str, Any]) -> Any:
     emoji = _find_emoji(context, arguments.get("emoji_id"))
     old = emoji.name
     await emoji.edit(name=arguments["name"], reason=_reason(arguments))
-    return _ok("rename_emoji", f"Renamed emoji :{old}: to :{arguments['name']}:.")
+    return _ok("rename_emoji", t("Renamed emoji :{old}: to :{name}:.", old=old, name=arguments['name']))
 
 
 async def _delete_emoji(context: Any, arguments: dict[str, Any]) -> Any:
     emoji = _find_emoji(context, arguments.get("emoji_id"))
     name = emoji.name
     await emoji.delete(reason=_reason(arguments))
-    return _ok("delete_emoji", f"Deleted emoji :{name}:.")
+    return _ok("delete_emoji", t("Deleted emoji :{name}:.", name=name))
 
 
 async def _create_sticker(context: Any, arguments: dict[str, Any]) -> Any:
@@ -526,7 +527,7 @@ async def _create_sticker(context: Any, arguments: dict[str, Any]) -> Any:
         file=discord.File(io.BytesIO(data), filename=f"sticker.{extension}"),
         reason=_reason(arguments),
     )
-    return _ok("create_sticker", f"Created sticker {sticker.name}.", {"sticker_id": _sid(sticker)})
+    return _ok("create_sticker", t("Created sticker {name}.", name=sticker.name), {"sticker_id": _sid(sticker)})
 
 
 async def _delete_sticker(context: Any, arguments: dict[str, Any]) -> Any:
@@ -534,7 +535,7 @@ async def _delete_sticker(context: Any, arguments: dict[str, Any]) -> Any:
     sticker = C._find_by_id(getattr(guild, "stickers", None) or [], C.parse_snowflake(arguments.get("sticker_id"), "sticker_id"), "Sticker")
     name = sticker.name
     await sticker.delete(reason=_reason(arguments))
-    return _ok("delete_sticker", f"Deleted sticker {name}.")
+    return _ok("delete_sticker", t("Deleted sticker {name}.", name=name))
 
 
 # --------------------------------------------------------------------------
@@ -544,15 +545,15 @@ async def _delete_sticker(context: Any, arguments: dict[str, Any]) -> Any:
 
 def parse_future_time(value: Any, field: str) -> datetime:
     if not isinstance(value, str):
-        raise ValueError(f"{field} must be an ISO 8601 date-time string.")
+        raise ValueError(t("{field} must be an ISO 8601 date-time string.", field=field))
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise ValueError(f"{field} must be ISO 8601, e.g. 2026-10-05T18:00:00+03:00.") from exc
+        raise ValueError(t("{field} must be ISO 8601, e.g. 2026-10-05T18:00:00+03:00.", field=field)) from exc
     if parsed.tzinfo is None:
-        raise ValueError(f"{field} must include a UTC offset, e.g. 2026-10-05T18:00:00+03:00.")
+        raise ValueError(t("{field} must include a UTC offset, e.g. 2026-10-05T18:00:00+03:00.", field=field))
     if parsed <= datetime.now(timezone.utc):
-        raise ValueError(f"{field} must be in the future.")
+        raise ValueError(t("{field} must be in the future.", field=field))
     return parsed
 
 
@@ -581,21 +582,21 @@ def _event_location(context: Any, arguments: dict[str, Any], *, required: bool) 
     options: dict[str, Any] = {}
     if kind is None:
         if required:
-            raise ValueError("location_type is required.")
+            raise ValueError(t("location_type is required."))
         return options
     if kind == "external":
         if not arguments.get("location"):
-            raise ValueError("External events need location.")
+            raise ValueError(t("External events need location."))
         options["entity_type"] = discord.EntityType.external
         options["location"] = arguments["location"]
         options["channel"] = None
     else:
         if not arguments.get("channel_id"):
-            raise ValueError("Voice/stage events need channel_id.")
+            raise ValueError(t("Voice/stage events need channel_id."))
         channel = resolve_any_channel(context, arguments["channel_id"])
         expected = "voice" if kind == "voice" else "stage_voice"
         if C._normalized_channel_type(channel) != expected:
-            raise ValueError(f"channel_id must be a {kind} channel.")
+            raise ValueError(t("channel_id must be a {kind} channel.", kind=kind))
         options["entity_type"] = discord.EntityType.voice if kind == "voice" else discord.EntityType.stage_instance
         options["channel"] = channel
     return options
@@ -616,14 +617,14 @@ async def _create_scheduled_event(context: Any, arguments: dict[str, Any]) -> An
     if arguments.get("end_time"):
         end = parse_future_time(arguments["end_time"], "end_time")
         if end <= start:
-            raise ValueError("end_time must be after start_time.")
+            raise ValueError(t("end_time must be after start_time."))
         options["end_time"] = end
     elif options.get("entity_type") == discord.EntityType.external:
-        raise ValueError("External events need end_time.")
+        raise ValueError(t("External events need end_time."))
     if arguments.get("description"):
         options["description"] = arguments["description"]
     event = await guild.create_scheduled_event(**options)
-    return _ok("create_scheduled_event", f"Created event {event.name}.", {"event_id": _sid(event)})
+    return _ok("create_scheduled_event", t("Created event {name}.", name=event.name), {"event_id": _sid(event)})
 
 
 async def _find_event(context: Any, value: Any) -> Any:
@@ -635,7 +636,7 @@ async def _find_event(context: Any, value: Any) -> Any:
         for item in await guild.fetch_scheduled_events():
             if getattr(item, "id", None) == event_id:
                 return item
-        raise C.AdminToolError(f"Event {event_id} was not found.")
+        raise C.AdminToolError(t("Event {event_id} was not found.", event_id=event_id))
     return event
 
 
@@ -651,9 +652,9 @@ async def _edit_scheduled_event(context: Any, arguments: dict[str, Any]) -> Any:
         options["end_time"] = parse_future_time(arguments["end_time"], "end_time")
     options.update(_event_location(context, arguments, required=False))
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     await event.edit(reason=_reason(arguments), **options)
-    return _ok("edit_scheduled_event", f"Updated event {event.name}.")
+    return _ok("edit_scheduled_event", t("Updated event {name}.", name=event.name))
 
 
 async def _cancel_scheduled_event(context: Any, arguments: dict[str, Any]) -> Any:
@@ -661,9 +662,9 @@ async def _cancel_scheduled_event(context: Any, arguments: dict[str, Any]) -> An
     name = event.name
     if arguments.get("delete") is True:
         await event.delete(reason=_reason(arguments))
-        return _ok("cancel_scheduled_event", f"Deleted event {name}.")
+        return _ok("cancel_scheduled_event", t("Deleted event {name}.", name=name))
     await event.cancel(reason=_reason(arguments))
-    return _ok("cancel_scheduled_event", f"Cancelled event {name}.")
+    return _ok("cancel_scheduled_event", t("Cancelled event {name}.", name=name))
 
 
 # --------------------------------------------------------------------------

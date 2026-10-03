@@ -29,6 +29,13 @@ AI_WHITELIST_DEFAULTS = {
     "ai_read_message_content": False,
     "ai_mention_enabled": False,
     "ai_mention_channel_ids": [],
+    # Per-bot language of Discord output; older configs get English.
+    "language": "en",
+    # Kairo Social Awareness: never chosen (off) until the user decides.
+    "social_awareness_enabled": None,
+    "social_awareness_channel_ids": [],
+    "social_awareness_replies_per_hour": 4,
+    "social_awareness_lore_enabled": True,
 }
 
 

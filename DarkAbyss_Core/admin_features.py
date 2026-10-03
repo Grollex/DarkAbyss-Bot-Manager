@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import discord
+from bot_i18n import t
 
 C: Any = None  # admin_tools core module, set by build_tools()
 
@@ -62,7 +63,7 @@ class FeatureStore:
                 if isinstance(raw, dict) and isinstance(raw.get("guilds"), dict):
                     data = {"version": STORE_VERSION, "guilds": raw["guilds"]}
                 else:
-                    raise ValueError("bad shape")
+                    raise ValueError(t("bad shape"))
             except (OSError, ValueError):
                 # Keep the unreadable file for inspection instead of overwriting it.
                 try:
@@ -157,22 +158,22 @@ async def handle_component_interaction(interaction: Any, store: FeatureStore | N
     guild = getattr(interaction, "guild", None)
     member = getattr(interaction, "user", None)
     if store is None or guild is None or not isinstance(member, MEMBER_TYPES):
-        await _respond(interaction, "This button is not available right now.")
+        await _respond(interaction, t("This button is not available right now."))
         return True
     try:
         _, _, menu_id, role_id_text = custom_id.split(":", 3)
         role_id = int(role_id_text)
     except ValueError:
-        await _respond(interaction, "This button is not valid.")
+        await _respond(interaction, t("This button is not valid."))
         return True
     menus = store.get(guild.id, "role_menus", {}) or {}
     menu = menus.get(menu_id)
     if not isinstance(menu, dict) or role_id not in [int(value) for value in menu.get("role_ids", [])]:
-        await _respond(interaction, "This role menu is no longer active.")
+        await _respond(interaction, t("This role menu is no longer active."))
         return True
     role = guild.get_role(role_id)
     if not _bot_can_hand_out(guild, role):
-        await _respond(interaction, "This role can no longer be handed out by the bot. Please tell a moderator.")
+        await _respond(interaction, t("This role can no longer be handed out by the bot. Please tell a moderator."))
         return True
     mode = menu.get("mode", "toggle")
     has_role = any(getattr(item, "id", None) == role_id for item in member.roles)
@@ -180,10 +181,10 @@ async def handle_component_interaction(interaction: Any, store: FeatureStore | N
     try:
         if has_role and mode == "toggle":
             await member.remove_roles(role, reason=reason)
-            await _respond(interaction, f"Removed role {role.name}.")
+            await _respond(interaction, t("Removed role {name}.", name=role.name))
             return True
         if has_role:
-            await _respond(interaction, f"You already have {role.name}.")
+            await _respond(interaction, t("You already have {name}.", name=role.name))
             return True
         if mode == "single":
             others = [item for item in member.roles if str(item.id) in menu.get("role_ids", []) and item.id != role_id]
@@ -196,9 +197,9 @@ async def handle_component_interaction(interaction: Any, store: FeatureStore | N
             remove_role = guild.get_role(int(remove_id))
             if remove_role is not None and any(item.id == remove_role.id for item in member.roles) and _bot_can_hand_out(guild, remove_role):
                 await member.remove_roles(remove_role, reason=reason)
-        await _respond(interaction, menu.get("success_text") or f"Added role {role.name}.")
+        await _respond(interaction, menu.get("success_text") or t("Added role {name}.", name=role.name))
     except discord.HTTPException:
-        await _respond(interaction, "Discord refused the role change. Please tell a moderator.")
+        await _respond(interaction, t("Discord refused the role change. Please tell a moderator."))
     return True
 
 
@@ -296,7 +297,7 @@ async def run_due_schedules(client: Any, store: FeatureStore | None, now: float 
 
 def _require_store(context: Any) -> FeatureStore:
     if context.feature_store is None:
-        raise C.AdminToolError("The bot feature store is unavailable in this context.")
+        raise C.AdminToolError(t("The bot feature store is unavailable in this context."))
     return context.feature_store
 
 
@@ -305,7 +306,7 @@ def _text_channel(context: Any, value: Any) -> Any:
 
     channel = admin_tools_content.resolve_any_channel(context, value)
     if C._normalized_channel_type(channel) not in ("text", "news"):
-        raise ValueError("channel_id must be a text or announcement channel.")
+        raise ValueError(t("channel_id must be a text or announcement channel."))
     return channel
 
 
@@ -349,7 +350,7 @@ async def _create_role_menu(context: Any, arguments: dict[str, Any]) -> Any:
     store = _require_store(context)
     menus = store.get(guild.id, "role_menus", {}) or {}
     if len(menus) >= MAX_MENUS:
-        raise C.AdminToolError(f"At most {MAX_MENUS} role menus per server; delete one first.")
+        raise C.AdminToolError(t("At most {max_menus} role menus per server; delete one first.", max_menus=MAX_MENUS))
     channel = _text_channel(context, arguments.get("channel_id"))
     options = []
     for option in arguments["options"]:
@@ -357,7 +358,7 @@ async def _create_role_menu(context: Any, arguments: dict[str, Any]) -> Any:
         admin_tools_server.ensure_self_assignable_role(context, role)
         options.append({"role_id": str(role.id), "label": option.get("label") or role.name, "emoji": option.get("emoji")})
     if len({item["role_id"] for item in options}) != len(options):
-        raise ValueError("Each role may appear only once in a menu.")
+        raise ValueError(t("Each role may appear only once in a menu."))
     menu_id = secrets.token_hex(4)
     message = await _post_menu(context, channel, menu_id, arguments["title"], arguments.get("description"), arguments.get("color"), options)
     menus[menu_id] = {
@@ -369,7 +370,7 @@ async def _create_role_menu(context: Any, arguments: dict[str, Any]) -> Any:
         "title": arguments["title"],
     }
     store.set(guild.id, "role_menus", menus)
-    return C.ToolResult(True, "create_role_menu", f"Role menu posted in #{channel.name} ({len(options)} role(s)).", {"menu_id": menu_id})
+    return C.ToolResult(True, "create_role_menu", t("Role menu posted in #{name} ({count} role(s)).", name=channel.name, count=len(options)), {"menu_id": menu_id})
 
 
 async def _setup_verification(context: Any, arguments: dict[str, Any]) -> Any:
@@ -379,7 +380,7 @@ async def _setup_verification(context: Any, arguments: dict[str, Any]) -> Any:
     store = _require_store(context)
     menus = store.get(guild.id, "role_menus", {}) or {}
     if len(menus) >= MAX_MENUS:
-        raise C.AdminToolError(f"At most {MAX_MENUS} role menus per server; delete one first.")
+        raise C.AdminToolError(t("At most {max_menus} role menus per server; delete one first.", max_menus=MAX_MENUS))
     channel = _text_channel(context, arguments.get("channel_id"))
     role = C._resolve_role(context, arguments["verified_role_id"])
     admin_tools_server.ensure_self_assignable_role(context, role)
@@ -389,13 +390,13 @@ async def _setup_verification(context: Any, arguments: dict[str, Any]) -> Any:
         admin_tools_server.ensure_self_assignable_role(context, remove_role)
         remove_role_id = str(remove_role.id)
     menu_id = secrets.token_hex(4)
-    options = [{"role_id": str(role.id), "label": arguments.get("button_label") or "Verify", "emoji": arguments.get("emoji")}]
+    options = [{"role_id": str(role.id), "label": arguments.get("button_label") or t("Verify"), "emoji": arguments.get("emoji")}]
     message = await _post_menu(
         context,
         channel,
         menu_id,
-        arguments.get("title") or "Verification",
-        arguments.get("text") or "Press the button to get access to the server.",
+        arguments.get("title") or t("Verification"),
+        arguments.get("text") or t("Press the button to get access to the server."),
         arguments.get("color"),
         options,
     )
@@ -406,11 +407,11 @@ async def _setup_verification(context: Any, arguments: dict[str, Any]) -> Any:
         "mode": "add_only",
         "role_ids": [str(role.id)],
         "remove_role_id": remove_role_id,
-        "success_text": arguments.get("success_text") or "You are verified. Welcome!",
-        "title": arguments.get("title") or "Verification",
+        "success_text": arguments.get("success_text") or t("You are verified. Welcome!"),
+        "title": arguments.get("title") or t("Verification"),
     }
     store.set(guild.id, "role_menus", menus)
-    return C.ToolResult(True, "setup_verification", f"Verification button posted in #{channel.name}.", {"menu_id": menu_id})
+    return C.ToolResult(True, "setup_verification", t("Verification button posted in #{name}.", name=channel.name), {"menu_id": menu_id})
 
 
 async def _delete_role_menu(context: Any, arguments: dict[str, Any]) -> Any:
@@ -419,19 +420,19 @@ async def _delete_role_menu(context: Any, arguments: dict[str, Any]) -> Any:
     menus = store.get(guild.id, "role_menus", {}) or {}
     menu = menus.pop(arguments["menu_id"], None)
     if menu is None:
-        raise C.AdminToolError("Role menu not found; see list_bot_features.")
+        raise C.AdminToolError(t("Role menu not found; see list_bot_features."))
     store.set(guild.id, "role_menus", menus or None)
-    note = ""
+    note = "Deleted role menu {menu_id}."
     if arguments.get("delete_message", True) is not False:
         channel = guild.get_channel(int(menu["channel_id"])) if hasattr(guild, "get_channel") else None
         try:
             if channel is not None:
                 message = await channel.fetch_message(int(menu["message_id"]))
                 await message.delete()
-                note = " and its message"
+                note = "Deleted role menu {menu_id} and its message."
         except discord.HTTPException:
-            note = " (its message was already gone)"
-    return C.ToolResult(True, "delete_role_menu", f"Deleted role menu {arguments['menu_id']}{note}.")
+            note = "Deleted role menu {menu_id} (its message was already gone)."
+    return C.ToolResult(True, "delete_role_menu", t(note, menu_id=arguments["menu_id"]))
 
 
 async def _set_welcome(context: Any, arguments: dict[str, Any]) -> Any:
@@ -442,7 +443,7 @@ async def _set_welcome(context: Any, arguments: dict[str, Any]) -> Any:
     current = store.get(guild.id, "welcome", {}) or {}
     if arguments.get("enabled") is False:
         store.set(guild.id, "welcome", {**current, "enabled": False} if current else None)
-        return C.ToolResult(True, "set_welcome", "Welcome message and auto roles disabled.")
+        return C.ToolResult(True, "set_welcome", t("Welcome message and auto roles disabled."))
     config = dict(current)
     config["enabled"] = True
     if arguments.get("channel_id") is not None:
@@ -455,16 +456,16 @@ async def _set_welcome(context: Any, arguments: dict[str, Any]) -> Any:
             admin_tools_server.ensure_self_assignable_role(context, role)
         config["auto_role_ids"] = [str(role.id) for role in roles]
     if config.get("message") and not config.get("channel_id"):
-        raise ValueError("A welcome message needs channel_id.")
+        raise ValueError(t("A welcome message needs channel_id."))
     if not config.get("message") and not config.get("auto_role_ids"):
-        raise ValueError("Provide a welcome message (with channel_id) and/or auto_role_ids.")
+        raise ValueError(t("Provide a welcome message (with channel_id) and/or auto_role_ids."))
     store.set(guild.id, "welcome", config)
     parts = []
     if config.get("message"):
-        parts.append(f"welcome message in <#{config['channel_id']}>")
+        parts.append(t("welcome message in {channel}", channel=f"<#{config['channel_id']}>"))
     if config.get("auto_role_ids"):
-        parts.append(f"{len(config['auto_role_ids'])} auto role(s)")
-    return C.ToolResult(True, "set_welcome", "Welcome enabled: " + ", ".join(parts) + ".")
+        parts.append(t("{count} auto role(s)", count=len(config["auto_role_ids"])))
+    return C.ToolResult(True, "set_welcome", t("Welcome enabled: {parts}.", parts=", ".join(parts)))
 
 
 async def _create_scheduled_message(context: Any, arguments: dict[str, Any]) -> Any:
@@ -472,7 +473,7 @@ async def _create_scheduled_message(context: Any, arguments: dict[str, Any]) -> 
     store = _require_store(context)
     schedules = store.get(guild.id, "schedules", {}) or {}
     if len(schedules) >= MAX_SCHEDULES:
-        raise C.AdminToolError(f"At most {MAX_SCHEDULES} scheduled messages per server; delete one first.")
+        raise C.AdminToolError(t("At most {max_schedules} scheduled messages per server; delete one first.", max_schedules=MAX_SCHEDULES))
     channel = _text_channel(context, arguments.get("channel_id"))
     interval = arguments["interval_minutes"]
     start_in = arguments.get("start_in_minutes")
@@ -490,7 +491,7 @@ async def _create_scheduled_message(context: Any, arguments: dict[str, Any]) -> 
     return C.ToolResult(
         True,
         "create_scheduled_message",
-        f"Scheduled {len(arguments['messages'])} message variant(s) in #{channel.name} every {interval} minute(s).",
+        t("Scheduled {count} message variant(s) in #{name} every {interval} minute(s).", count=len(arguments['messages']), name=channel.name, interval=interval),
         {"schedule_id": schedule_id},
     )
 
@@ -500,9 +501,9 @@ async def _delete_scheduled_message(context: Any, arguments: dict[str, Any]) -> 
     store = _require_store(context)
     schedules = store.get(guild.id, "schedules", {}) or {}
     if schedules.pop(arguments["schedule_id"], None) is None:
-        raise C.AdminToolError("Scheduled message not found; see list_bot_features.")
+        raise C.AdminToolError(t("Scheduled message not found; see list_bot_features."))
     store.set(guild.id, "schedules", schedules or None)
-    return C.ToolResult(True, "delete_scheduled_message", f"Deleted scheduled message {arguments['schedule_id']}.")
+    return C.ToolResult(True, "delete_scheduled_message", t("Deleted scheduled message {schedule_id}.", schedule_id=arguments['schedule_id']))
 
 
 async def _list_bot_features(context: Any, arguments: dict[str, Any]) -> dict[str, Any]:

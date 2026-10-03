@@ -32,6 +32,8 @@ import admin_terminal
 import admin_tools
 import ai_context
 import ai_memory
+import bot_i18n
+from bot_i18n import t
 
 
 AI_SOURCE = "/ai"
@@ -87,17 +89,19 @@ def unreviewable_plan_message(*, too_large: bool, cancelled: bool, earlier_actio
     never implies rollback, and only says "cancelled" when the core rejection
     was confirmed.
     """
-    subject = "The new AI action plan" if earlier_actions else "The AI action plan"
-    reason = "was too large to review safely" if too_large else "could not be displayed safely"
+    subject = t("The new AI action plan") if earlier_actions else t("The AI action plan")
+    reason = t("was too large to review safely") if too_large else t("could not be displayed safely")
     if cancelled:
-        text = f"{subject} {reason}. It was cancelled, and no action from this plan was executed."
+        text = t("{subject} {reason}. It was cancelled, and no action from this plan was executed.", subject=subject, reason=reason)
     else:
-        text = (
-            f"{subject} {reason}. No approval control was created and no action from this plan "
-            "was executed. The pending request will expire automatically."
+        text = t(
+            "{subject} {reason}. No approval control was created and no action from this plan "
+            "was executed. The pending request will expire automatically.",
+            subject=subject,
+            reason=reason,
         )
     if earlier_actions:
-        text += "\n" + EARLIER_ACTIONS_NOTE
+        text += "\n" + t(EARLIER_ACTIONS_NOTE)
     return text
 
 
@@ -166,7 +170,7 @@ def chunk_text(text: str, *, chunk_chars: int = AI_MESSAGE_CHUNK_CHARS, max_chun
         remaining = remaining[cut:]
     if len(chunks) > max_chunks:
         chunks = chunks[:max_chunks]
-        marker = "\n... (response truncated)"
+        marker = "\n" + t("... (response truncated)")
         chunks[-1] = chunks[-1][: chunk_chars - len(marker)] + marker
     return chunks
 
@@ -241,24 +245,24 @@ def _plan_items(tool_plan: Any) -> list[tuple[str, str, str]]:
         items.append(
             (
                 "text",
-                f"**Action {index} of {len(calls)}:** tool `{exact_json_display(tool_name)}` | risk `{exact_json_display(risk)}`",
+                t("**Action {index} of {count}:** tool `{tool}` | risk `{risk}`", index=index, count=len(calls), tool=exact_json_display(tool_name), risk=exact_json_display(risk)),
                 "",
             )
         )
         if not arguments:
-            items.append(("text", "(no arguments)", ""))
+            items.append(("text", t("(no arguments)"), ""))
         for key in sorted(arguments):
-            items.append(("value", f"argument `{exact_json_display(key)}`", exact_json_display(arguments[key])))
+            items.append(("value", t("argument `{name}`", name=exact_json_display(key)), exact_json_display(arguments[key])))
     return items
 
 
 def _value_block(label: str, part: int, final: bool, piece: str) -> str:
     if part == 1 and final:
-        suffix = " (exact JSON value)"
+        suffix = " " + t("(exact JSON value)")
     elif final:
-        suffix = f" (exact JSON value, part {part}, final; parts join without separators)"
+        suffix = " " + t("(exact JSON value, part {part}, final; parts join without separators)", part=part)
     else:
-        suffix = f" (exact JSON value, part {part}, continues)"
+        suffix = " " + t("(exact JSON value, part {part}, continues)", part=part)
     return f"{label}{suffix}:\n```json\n{piece}\n```"
 
 
@@ -322,7 +326,7 @@ def render_tool_plan_pages(tool_plan: Any) -> list[str]:
     if current:
         push()
     total = len(bodies)
-    pages = [f"**AI action plan - review page {number} of {total}**\n{body}" for number, body in enumerate(bodies, start=1)]
+    pages = [t("**AI action plan - review page {number} of {total}**", number=number, total=total) + f"\n{body}" for number, body in enumerate(bodies, start=1)]
     if any(len(page) > AI_PREVIEW_PAGE_CHARS for page in pages):
         raise PlanPreviewError("Plan page exceeds the page size.")
     return pages
@@ -348,28 +352,28 @@ def render_plan_outline(tool_plan: Any) -> str:
         if public.get("tool_name") != "apply_server_blueprint":
             continue
         blueprint = (public.get("arguments") or {}).get("blueprint") or {}
-        lines.append("**Blueprint outline** (existing objects with the same name are reused, not changed):")
+        lines.append(t("**Blueprint outline** (existing objects with the same name are reused, not changed):"))
         roles = [_outline_name(role.get("name")) for role in blueprint.get("roles") or [] if isinstance(role, dict)]
         if roles:
-            lines.append("Roles: " + ", ".join(roles))
+            lines.append(t("Roles: {names}", names=", ".join(roles)))
         for category in blueprint.get("categories") or []:
             if not isinstance(category, dict):
                 continue
             private = category.get("private_to_roles") or []
-            suffix = f" (private: {', '.join(_outline_name(name) for name in private)})" if private else ""
+            suffix = " " + t("(private: {roles})", roles=", ".join(_outline_name(name) for name in private)) if private else ""
             channels = ", ".join(
                 f"{_outline_name(item.get('name'))} [{_outline_name(item.get('type'))}]"
                 for item in category.get("channels") or []
                 if isinstance(item, dict)
             )
-            lines.append(f"Category {_outline_name(category.get('name'))}{suffix}: {channels or '-'}")
+            lines.append(t("Category {name}{suffix}: {channels}", name=_outline_name(category.get("name")), suffix=suffix, channels=channels or "-"))
         loose = [
             f"{_outline_name(item.get('name'))} [{_outline_name(item.get('type'))}]"
             for item in blueprint.get("channels") or []
             if isinstance(item, dict)
         ]
         if loose:
-            lines.append("Without category: " + ", ".join(loose))
+            lines.append(t("Without category: {channels}", channels=", ".join(loose)))
     return clip_text("\n".join(lines), AI_MESSAGE_CHUNK_CHARS) if lines else ""
 
 
@@ -378,19 +382,22 @@ def render_confirmation_control(tool_plan: Any, tool_risk: Any, page_count: int)
     if not isinstance(risk_value, str):
         raise PlanPreviewError("Plan risk is unknown.")
     count = len(tuple(tool_plan))
-    return (
-        f"**Confirm AI action plan:** {count} action(s), overall risk {risk_value}.\n"
-        f"Review all {page_count} plan page(s) above. Approve executes exactly that plan; "
-        "Cancel executes nothing."
+    return t(
+        "**Confirm AI action plan:** {count} action(s), overall risk {risk}.\n"
+        "Review all {pages} plan page(s) above. Approve executes exactly that plan; "
+        "Cancel executes nothing.",
+        count=count,
+        risk=risk_value,
+        pages=page_count,
     )
 
 
 def render_executed_tools(executed_tools: Any) -> str:
     if not executed_tools:
         return ""
-    lines = ["Actions already executed:"]
+    lines = [t("Actions already executed:")]
     for tool in executed_tools:
-        status = "ok" if getattr(tool, "ok", False) is True else "FAILED"
+        status = t("ok") if getattr(tool, "ok", False) is True else t("FAILED")
         name = clip_text(str(getattr(tool, "tool_name", "?")), 64)
         message = clip_text(str(getattr(tool, "message", "")), AI_MAX_TOOL_SUMMARY_CHARS)
         lines.append(f"- `{_code_safe(name)}` {status}: {message}")
@@ -410,7 +417,7 @@ def render_engine_footer(result: Any, planner_label: str = "") -> str:
     """
     label = engine_label(result)
     if planner_label and label:
-        text = "".join(char for char in f"plan: {planner_label} | run: {label}" if char.isprintable())
+        text = "".join(char for char in t("plan: {planner} | run: {engine}", planner=planner_label, engine=label) if char.isprintable())
         return "-# " + clip_text(text, AI_ENGINE_FOOTER_CHARS * 2)
     if not label:
         return ""
@@ -430,7 +437,7 @@ def engine_label(result: Any) -> str:
     if not parts:
         return ""
     if getattr(result, "fallback_used", False) is True:
-        parts.append("fallback")
+        parts.append(t("fallback"))
     text = " · ".join(_code_safe(part) for part in parts)
     return "".join(char for char in text if char.isprintable())
 
@@ -447,33 +454,33 @@ def render_result_messages(result: Any) -> list[str]:
     message = clip_text(str(getattr(result, "message", "") or ""), 400)
     executed = render_executed_tools(getattr(result, "executed_tools", ()))
     if status == "COMPLETED":
-        chunks = chunk_text(str(getattr(result, "content", "") or "")) or ["(The AI returned no text.)"]
+        chunks = chunk_text(str(getattr(result, "content", "") or "")) or [t("(The AI returned no text.)")]
         if executed:
             chunks.append(executed)
         return chunks
     if status == "CANCELLED":
         if message == CORE_REJECTED_MESSAGE:
-            text = "Cancelled. Nothing from this plan was executed."
+            text = t("Cancelled. Nothing from this plan was executed.")
         else:
-            text = EXPIRED_MESSAGE
+            text = t(EXPIRED_MESSAGE)
     elif status == "UNAVAILABLE":
-        text = "AI is currently unavailable." if executed else UNAVAILABLE_MESSAGE
+        text = t("AI is currently unavailable.") if executed else t(UNAVAILABLE_MESSAGE)
         if message.startswith("Provider failed."):
-            text += f"\nReason: {failure_reason(result)}"
+            text += "\n" + t("Reason: {reason}", reason=failure_reason(result))
     elif status == "INVALID_TOOL_PLAN":
-        text = "The AI proposed an invalid action plan; nothing from that plan was executed."
+        text = t("The AI proposed an invalid action plan; nothing from that plan was executed.")
         if message:
-            text += f"\nReason: {message}"
+            text += "\n" + t("Reason: {reason}", reason=message)
     elif status == "TOOL_EXECUTION_FAILED":
-        text = "An AI action failed; remaining actions were not executed."
+        text = t("An AI action failed; remaining actions were not executed.")
         if message:
-            text += f"\nReason: {message}"
+            text += "\n" + t("Reason: {reason}", reason=message)
     elif status == "LIMIT_REACHED":
-        text = "The AI request stopped because a safety limit was reached."
+        text = t("The AI request stopped because a safety limit was reached.")
         if message:
-            text += f"\nReason: {message}"
+            text += "\n" + t("Reason: {reason}", reason=message)
     else:
-        text = "The AI request ended in an unexpected state. Nothing further was executed."
+        text = t("The AI request ended in an unexpected state. Nothing further was executed.")
     parts = [clip_text(text, AI_MESSAGE_CHUNK_CHARS)]
     if executed:
         parts.append(executed)
@@ -549,7 +556,7 @@ def planner_instruction(guild: Any, context_text: str = "") -> str:
         f"List every tool the executor will need, including read tools to look up IDs (max {MAX_EXECUTOR_TOOLS}). "
         "To create several roles/categories/channels at once, plan apply_server_blueprint (one call) instead of many single creates. "
         "Steps must be concrete (names, colors, which roles see which channels). Never invent tool names. "
-        "Write the answer and notes in the user's language.\n"
+        "Write the answer and notes in the language required by the LANGUAGE RULE.\n"
         "Tool catalog:\n" + admin_tools.render_tool_catalog()
     )
 
@@ -573,7 +580,7 @@ def executor_instruction(
         "- Only claim what tool results confirm. If something is impossible with the available tools, say so briefly.\n"
         "- The AI cannot grant Administrator or act on roles/members at or above the requester's highest role.\n"
         "- Earlier user/assistant messages, if any, are the recent conversation.\n"
-        "- Final reply: the user's language, short, plain Discord markdown, no tables."
+        "- Final reply: in the language required by the LANGUAGE RULE, short, plain Discord markdown, no tables."
     )
     if message_content is False:
         text += (
@@ -642,8 +649,8 @@ def collect_attachments(items: Any) -> dict[str, Any]:
     return result
 
 
-MENTION_DENIED_MESSAGE = "Сорян, но у тебя нет прав мной командовать."
-MENTION_EMPTY_MESSAGE = "Слушаю! Напиши задачу сразу после упоминания."
+MENTION_DENIED_MESSAGE = "Sorry, you don't have permission to give me commands."
+MENTION_EMPTY_MESSAGE = "I'm listening! Write the task right after the mention."
 # One denial reply per member per window, so pinging the bot cannot spam the chat.
 MENTION_DENIAL_COOLDOWN_SECONDS = 60.0
 CONFIRMATION_MODES = ("plan", "strict")
@@ -677,24 +684,23 @@ def render_plan_approval(plan: dict[str, Any]) -> str:
     destructive one is still confirmed separately with its exact arguments.
     """
     steps = [_printable(step, MAX_APPROVAL_STEP_CHARS) for step in plan.get("steps") or [] if _printable(step, 1)]
-    lines = ["**AI plan - approve to run it**"]
+    lines = [t("**AI plan - approve to run it**")]
     for index, step in enumerate(steps[:MAX_APPROVAL_STEPS], start=1):
         lines.append(f"{index}. {step}")
     if len(steps) > MAX_APPROVAL_STEPS:
-        lines.append(f"... and {len(steps) - MAX_APPROVAL_STEPS} more step(s).")
+        lines.append(t("... and {count} more step(s).", count=len(steps) - MAX_APPROVAL_STEPS))
     if not steps:
-        lines.append("(The planner gave no step list.)")
+        lines.append(t("(The planner gave no step list.)"))
     writes = plan_write_tools(plan)
     destructive = [name for name in writes if admin_tools.TOOL_DEFINITIONS[name].risk == "destructive"]
-    lines.append("Changes allowed: " + ", ".join(f"`{_code_safe(name)}`" for name in writes))
+    lines.append(t("Changes allowed: {tools}", tools=", ".join(f"`{_code_safe(name)}`" for name in writes)))
     if destructive:
         lines.append(
-            "Destructive actions (" + ", ".join(f"`{_code_safe(name)}`" for name in destructive) + ") will still "
-            "ask for confirmation with the exact data."
+            t("Destructive actions ({tools}) will still ask for confirmation with the exact data.", tools=", ".join(f"`{_code_safe(name)}`" for name in destructive))
         )
     if plan.get("notes"):
-        lines.append(f"Notes: {_printable(plan['notes'], 300)}")
-    lines.append("Approve runs the normal actions of this plan without further prompts. Cancel changes nothing.")
+        lines.append(t("Notes: {notes}", notes=_printable(plan["notes"], 300)))
+    lines.append(t("Approve runs the normal actions of this plan without further prompts. Cancel changes nothing."))
     return clip_text("\n".join(lines), AI_MESSAGE_CHUNK_CHARS - AI_ENGINE_FOOTER_CHARS * 2)
 
 
@@ -711,25 +717,30 @@ def failure_reason(result: Any) -> str:
     message = str(getattr(result, "message", "") or "")
     if message.startswith("Provider failed."):
         message = message[len("Provider failed.") :].strip()
-    return _printable(message, 200) or "unknown error"
+    return _printable(message, 200) or t("unknown error")
 
 
 def render_switch_offer(stage: str, failed: Any, alternative: dict[str, str], executed: Any) -> str:
     failed_name = engine_name(getattr(failed, "provider_id", None), getattr(failed, "model_id", None))
     alt_name = engine_name(alternative.get("provider_id"), alternative.get("model_id"))
-    role = "planning" if stage == "plan" else "execution"
-    lines = [f"⚠️ **{failed_name}** stopped during {role}: {failure_reason(failed)}"]
+    if stage == "plan":
+        lines = [t("⚠️ **{engine}** stopped during planning: {reason}", engine=failed_name, reason=failure_reason(failed))]
+    else:
+        lines = [t("⚠️ **{engine}** stopped during execution: {reason}", engine=failed_name, reason=failure_reason(failed))]
     done = render_executed_tools(executed)
     if done:
         lines.append(done)
     if stage == "plan":
-        lines.append(f"Continue **planning** with **{alt_name}**? Nothing has been changed yet.")
+        lines.append(t("Continue **planning** with **{engine}**? Nothing has been changed yet.", engine=alt_name))
     else:
         lines.append(
-            f"Continue **the task** with **{alt_name}**? It gets the same plan and the list of actions "
-            "already done, so it does not repeat them."
+            t(
+                "Continue **the task** with **{engine}**? It gets the same plan and the list of actions "
+                "already done, so it does not repeat them.",
+                engine=alt_name,
+            )
         )
-    lines.append("Cancel stops here; actions that already ran are not undone.")
+    lines.append(t("Cancel stops here; actions that already ran are not undone."))
     return clip_text("\n".join(lines), AI_MESSAGE_CHUNK_CHARS)
 
 
@@ -856,7 +867,8 @@ class SwitchEngineView(discord.ui.View):
         self.state = state
         self.message: Any = None
         name = PROVIDER_DISPLAY_NAMES.get(state.alternative.get("provider_id", ""), state.alternative.get("provider_id", "?"))
-        self.continue_button.label = clip_text(f"Continue with {name}", 80)
+        self.continue_button.label = clip_text(t("Continue with {engine}", engine=name), 80)
+        self.cancel_button.label = t("Cancel")
 
     @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary)
     async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -892,6 +904,8 @@ class PlanApprovalView(discord.ui.View):
         self.transport = transport
         self.state = state
         self.message: Any = None
+        self.approve_button.label = t("Approve plan")
+        self.cancel_button.label = t("Cancel")
 
     @discord.ui.button(label="Approve plan", style=discord.ButtonStyle.success)
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -917,6 +931,8 @@ class ConfirmationView(discord.ui.View):
         self.transport = transport
         self.state = state
         self.message: Any = None
+        self.approve_button.label = t("Approve")
+        self.cancel_button.label = t("Cancel")
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1091,14 +1107,18 @@ class AITransport:
             config = self._load_config()
         except Exception:
             return None
-        return config if isinstance(config, dict) else None
+        if not isinstance(config, dict):
+            return None
+        # One process = one bot instance: its language applies to everything it says.
+        bot_i18n.set_bot_language(config.get("language"))
+        return config
 
     # -- sending -----------------------------------------------------------
 
     @staticmethod
     async def _respond(interaction: Any, content: str) -> None:
         """Ephemeral reply to one interaction (denials, validation errors)."""
-        content = clip_text(content, AI_MESSAGE_CHUNK_CHARS)
+        content = clip_text(t(content), AI_MESSAGE_CHUNK_CHARS)
         if interaction.response.is_done():
             await interaction.followup.send(content, ephemeral=True, allowed_mentions=no_mentions())
         else:
@@ -1224,9 +1244,9 @@ class AITransport:
             config = self._try_load_config()
             guild = getattr(source, "guild", None)
             if config is None or guild is None or getattr(guild, "id", None) != binding.guild_id:
-                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
+                return admin_tools.ToolResult(False, tool_name, t(AUTH_REVOKED_TOOL_MESSAGE), dict(revoked))
             if getattr(getattr(source, "user", None), "id", None) != binding.user_id:
-                return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
+                return admin_tools.ToolResult(False, tool_name, t(AUTH_REVOKED_TOOL_MESSAGE), dict(revoked))
             operator = binding.user_id == admin_terminal.OPERATOR_USER_ID
             if operator:
                 # Local Manager operator: owns the bot token, so the Discord AI
@@ -1234,13 +1254,13 @@ class AITransport:
                 # and every confirmation still do). Only ManagerInteraction
                 # sources qualify; Discord IDs are never 0.
                 if not admin_terminal.is_manager_operator(source):
-                    return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
+                    return admin_tools.ToolResult(False, tool_name, t(AUTH_REVOKED_TOOL_MESSAGE), dict(revoked))
                 member = source.user
             else:
                 # Fresh member state (current roles), fail closed if not resolvable.
                 member = guild.get_member(binding.user_id) if hasattr(guild, "get_member") else None
                 if member is None or not actor_has_ai_access(member, guild, config):
-                    return admin_tools.ToolResult(False, tool_name, AUTH_REVOKED_TOOL_MESSAGE, dict(revoked))
+                    return admin_tools.ToolResult(False, tool_name, t(AUTH_REVOKED_TOOL_MESSAGE), dict(revoked))
             context = admin_tools.AdminToolContext(
                 guild=guild,
                 fetch_user=self._fetch_user,
@@ -1259,7 +1279,7 @@ class AITransport:
                 result = admin_tools.ToolResult(
                     True,
                     result.tool_name,
-                    f"{result.message} (Action completed, but audit logging failed.)",
+                    f"{result.message} " + t("(Action completed, but audit logging failed.)"),
                     result.data,
                 )
             return result
@@ -1369,14 +1389,14 @@ class AITransport:
             ai_platform, ai_orchestrator = _import_ai_modules()
             orchestrator = self.get_orchestrator()
             if orchestrator is None:
-                await delivery.send(UNAVAILABLE_MESSAGE)
+                await delivery.send(t(UNAVAILABLE_MESSAGE))
                 return
             policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=True)
             history = self._memory_messages(ai_platform, memory_key)
             user_message = ai_platform.AIMessage(role=ai_platform.MessageRole.USER, content=run.user_text)
         except Exception as exc:
             print(f"/ai request failed: {type(exc).__name__}")
-            await delivery.send(UNAVAILABLE_MESSAGE)
+            await delivery.send(t(UNAVAILABLE_MESSAGE))
             return
 
         plan: dict[str, Any] | None = None
@@ -1397,7 +1417,7 @@ class AITransport:
                 plan, planner_result = planned
                 run.planner_label = engine_label(planner_result)
                 if plan["mode"] == "answer":
-                    texts = chunk_text(plan["answer"]) or ["(The AI returned no text.)"]
+                    texts = chunk_text(plan["answer"]) or [t("(The AI returned no text.)")]
                     footer = render_engine_footer(planner_result)
                     if footer:
                         texts[0] = with_footer(texts[0], footer)
@@ -1431,7 +1451,7 @@ class AITransport:
             ai_platform, ai_orchestrator = _import_ai_modules()
             orchestrator = self.get_orchestrator()
             if orchestrator is None:
-                await delivery.send(UNAVAILABLE_MESSAGE)
+                await delivery.send(t(UNAVAILABLE_MESSAGE))
                 return
             instruction = executor_instruction(
                 guild,
@@ -1453,11 +1473,12 @@ class AITransport:
                 allowed_tool_names=executor_tool_names(plan, run.prompt) if self.planning else None,
                 recover_errors=True,
                 auto_fallback=False,
+                response_language=bot_i18n.bot_language(),
             )
             policy = ai_orchestrator.ConfirmationPolicy(confirm_normal=confirm_normal)
         except Exception as exc:
             print(f"/ai request failed: {type(exc).__name__}")
-            await delivery.send(UNAVAILABLE_MESSAGE)
+            await delivery.send(t(UNAVAILABLE_MESSAGE))
             return
         try:
             result = await orchestrator.orchestrate(
@@ -1469,7 +1490,7 @@ class AITransport:
             # The core contains provider/executor failures; reaching this means an
             # unexpected error after tools may have run. Do not claim nothing ran.
             print(f"/ai request failed: {type(exc).__name__}")
-            await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
+            await delivery.send(t(UNEXPECTED_FAILURE_MESSAGE))
             return
         await self._send_result(
             delivery,
@@ -1550,7 +1571,7 @@ class AITransport:
             except Exception:
                 pass
         alt_name = engine_name(state.alternative.get("provider_id"), state.alternative.get("model_id"))
-        decision = f"Continuing with {alt_name}..." if approved else "Stopped. Nothing else was executed."
+        decision = t("Continuing with {engine}...", engine=alt_name) if approved else t("Stopped. Nothing else was executed.")
         try:
             await interaction.response.edit_message(
                 content=clip_text(f"{state.summary}\n\n{decision}", AI_MESSAGE_CHUNK_CHARS),
@@ -1628,6 +1649,7 @@ class AITransport:
                     manual_profile_id=manual_profile_id,
                     allowed_tool_names=(),
                     auto_fallback=False,
+                    response_language=bot_i18n.bot_language(),
                 )
                 result = await orchestrator.orchestrate(request, executor=refuse, confirmation_policy=policy)
             except Exception as exc:
@@ -1661,14 +1683,14 @@ class AITransport:
             await self._respond(interaction, ACCESS_DENIED_MESSAGE)
             return
         if not isinstance(prompt, str) or not prompt.strip():
-            await self._respond(interaction, "Prompt must not be empty.")
+            await self._respond(interaction, t("Prompt must not be empty."))
             return
         if len(prompt) > AI_PROMPT_MAX_CHARS:
-            await self._respond(interaction, f"Prompt must be {AI_PROMPT_MAX_CHARS} characters or fewer.")
+            await self._respond(interaction, t("Prompt must be {limit} characters or fewer.", limit=AI_PROMPT_MAX_CHARS))
             return
         selected_mode = (mode or DEFAULT_TASK_MODE).lower()
         if selected_mode not in TASK_MODES:
-            await self._respond(interaction, "Unknown AI mode.")
+            await self._respond(interaction, t("Unknown AI mode."))
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1706,7 +1728,7 @@ class AITransport:
         )
         if prompt.strip().lower() in RESET_WORDS:
             self.memory.clear(self.memory_key(binding))
-            await interaction.followup.send(MEMORY_CLEARED_MESSAGE)
+            await interaction.followup.send(t(MEMORY_CLEARED_MESSAGE))
             return
         await self._run_request(
             delivery=InteractionDelivery(interaction, DeliveryMode.EPHEMERAL),
@@ -1784,18 +1806,18 @@ class AITransport:
             last = self._mention_denials.get(author.id, -MENTION_DENIAL_COOLDOWN_SECONDS)
             if now - last >= MENTION_DENIAL_COOLDOWN_SECONDS:
                 self._mention_denials[author.id] = now
-                await delivery.send(MENTION_DENIED_MESSAGE)
+                await delivery.send(t(MENTION_DENIED_MESSAGE))
             return
         binding = RequestBinding(user_id=author.id, guild_id=guild.id, channel_id=channel.id)
         if not prompt:
-            await delivery.send(MENTION_EMPTY_MESSAGE)
+            await delivery.send(t(MENTION_EMPTY_MESSAGE))
             return
         if len(prompt) > AI_PROMPT_MAX_CHARS:
-            await delivery.send(f"Message must be {AI_PROMPT_MAX_CHARS} characters or fewer for AI requests.")
+            await delivery.send(t("Message must be {limit} characters or fewer for AI requests.", limit=AI_PROMPT_MAX_CHARS))
             return
         if prompt.lower() in RESET_WORDS:
             self.memory.clear(self.memory_key(binding))
-            await delivery.send(MEMORY_CLEARED_MESSAGE)
+            await delivery.send(t(MEMORY_CLEARED_MESSAGE))
             return
         async with _maybe_typing(channel):
             await self._run_request(
@@ -1850,12 +1872,12 @@ class AITransport:
         delivery = ChannelDelivery(message.channel, reply_to=message)
         prompt = message.content
         if len(prompt) > AI_PROMPT_MAX_CHARS:
-            await delivery.send(f"Message must be {AI_PROMPT_MAX_CHARS} characters or fewer for AI requests.")
+            await delivery.send(t("Message must be {limit} characters or fewer for AI requests.", limit=AI_PROMPT_MAX_CHARS))
             return
         binding = RequestBinding(user_id=message.author.id, guild_id=message.guild.id, channel_id=message.channel.id)
         if prompt.strip().lower() in RESET_WORDS:
             self.memory.clear(self.memory_key(binding))
-            await delivery.send(MEMORY_CLEARED_MESSAGE)
+            await delivery.send(t(MEMORY_CLEARED_MESSAGE))
             return
         async with _maybe_typing(message.channel):
             await self._run_request(
@@ -1912,7 +1934,7 @@ class AITransport:
                 view.stop()
             except Exception:
                 pass
-        decision = "Approved. Executing the plan..." if approved else "Cancelled."
+        decision = t("Approved. Executing the plan...") if approved else t("Cancelled.")
         try:
             await interaction.response.edit_message(
                 content=clip_text(f"{state.summary}\n\n{decision}", AI_MESSAGE_CHUNK_CHARS),
@@ -1934,7 +1956,7 @@ class AITransport:
             )
         except Exception as exc:
             print(f"/ai confirmation failed: {type(exc).__name__}")
-            await delivery.send(UNEXPECTED_FAILURE_MESSAGE)
+            await delivery.send(t(UNEXPECTED_FAILURE_MESSAGE))
             return
         await self._send_result(
             delivery,
@@ -1992,7 +2014,7 @@ class AITransport:
                 view.stop()
             except Exception:
                 pass
-        decision = "Approved. Working on it..." if approved else "Cancelled. Nothing was changed."
+        decision = t("Approved. Working on it...") if approved else t("Cancelled. Nothing was changed.")
         try:
             await interaction.response.edit_message(
                 content=clip_text(f"{state.summary}\n\n{decision}", AI_MESSAGE_CHUNK_CHARS),

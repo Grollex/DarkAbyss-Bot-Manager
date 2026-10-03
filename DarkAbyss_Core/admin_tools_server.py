@@ -16,6 +16,7 @@ from datetime import timedelta
 from typing import Any
 
 import discord
+from bot_i18n import t
 
 C: Any = None  # admin_tools core module, set by build_tools()
 
@@ -147,13 +148,12 @@ def channel_type(channel: Any) -> str:
 def ensure_self_assignable_role(context: Any, role: Any) -> None:
     """Roles that members obtain by themselves must be harmless and below the requester."""
     if callable(getattr(role, "is_default", None)) and role.is_default():
-        raise C.AdminToolError("@everyone cannot be used here.")
+        raise C.AdminToolError(t("@everyone cannot be used here."))
     C.ensure_role_manageable(context, role, action="hand out")
     dangerous = sorted(set(C.permission_names(getattr(role, "permissions", None))) & SELF_ASSIGN_FORBIDDEN_PERMISSIONS)
     if dangerous:
         raise C.AdminToolError(
-            f"Role {getattr(role, 'name', '?')} has moderator/admin permissions ({', '.join(dangerous)}) "
-            "and cannot be self-assigned."
+            t("Role {role} has moderator/admin permissions ({items}) and cannot be self-assigned.", role=getattr(role, 'name', '?'), items=', '.join(dangerous))
         )
 
 
@@ -253,7 +253,7 @@ async def _create_category(context: Any, arguments: dict[str, Any]) -> Any:
     if arguments.get("private_to_role_ids"):
         options["overwrites"] = C.private_overwrites(context, arguments["private_to_role_ids"])
     created = await guild.create_category(name, reason=_reason(arguments), **options)
-    return _ok("create_category", f"Created category {created.name}.", {"category_id": _sid(created)})
+    return _ok("create_category", t("Created category {name}.", name=created.name), {"category_id": _sid(created)})
 
 
 async def _create_stage_channel(context: Any, arguments: dict[str, Any]) -> Any:
@@ -267,7 +267,7 @@ async def _create_stage_channel(context: Any, arguments: dict[str, Any]) -> Any:
     if arguments.get("private_to_role_ids"):
         options["overwrites"] = C.private_overwrites(context, arguments["private_to_role_ids"])
     created = await guild.create_stage_channel(name, reason=_reason(arguments), **options)
-    return _ok("create_stage_channel", f"Created stage channel {created.name}.", {"channel_id": _sid(created)})
+    return _ok("create_stage_channel", t("Created stage channel {name}.", name=created.name), {"channel_id": _sid(created)})
 
 
 def _forum_tags(values: Any) -> list[Any]:
@@ -299,14 +299,14 @@ async def _create_forum_channel(context: Any, arguments: dict[str, Any]) -> Any:
     if arguments.get("private_to_role_ids"):
         options["overwrites"] = C.private_overwrites(context, arguments["private_to_role_ids"])
     created = await guild.create_forum(name, reason=_reason(arguments), **options)
-    return _ok("create_forum_channel", f"Created forum #{created.name}.", {"channel_id": _sid(created)})
+    return _ok("create_forum_channel", t("Created forum #{name}.", name=created.name), {"channel_id": _sid(created)})
 
 
 async def _edit_channel(context: Any, arguments: dict[str, Any]) -> Any:
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     kind = channel_type(channel)
     if kind.endswith("thread"):
-        raise ValueError("Use edit_thread for threads.")
+        raise ValueError(t("Use edit_thread for threads."))
     options: dict[str, Any] = {}
     if arguments.get("name") is not None:
         options["name"] = C._require_name(arguments["name"])
@@ -331,31 +331,31 @@ async def _edit_channel(context: Any, arguments: dict[str, Any]) -> Any:
     ):
         if arguments.get(field) is not None:
             if not allowed:
-                raise ValueError(f"{field} does not apply to a {kind} channel.")
+                raise ValueError(t("{field} does not apply to a {kind} channel.", field=field, kind=kind))
             options[target] = arguments[field]
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     await channel.edit(reason=_reason(arguments), **options)
-    return _ok("edit_channel", f"Updated channel {channel.name} ({', '.join(sorted(options))}).")
+    return _ok("edit_channel", t("Updated channel {name} ({items}).", name=channel.name, items=', '.join(sorted(options))))
 
 
 async def _clone_channel(context: Any, arguments: dict[str, Any]) -> Any:
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     if channel_type(channel) in ("category",) or channel_type(channel).endswith("thread"):
-        raise ValueError("clone_channel works with text, voice, stage and forum channels.")
+        raise ValueError(t("clone_channel works with text, voice, stage and forum channels."))
     name = C._require_name(arguments["name"]) if arguments.get("name") else None
     created = await channel.clone(name=name, reason=_reason(arguments))
-    return _ok("clone_channel", f"Cloned {channel.name} as {created.name}.", {"channel_id": _sid(created)})
+    return _ok("clone_channel", t("Cloned {name} as {name2}.", name=channel.name, name2=created.name), {"channel_id": _sid(created)})
 
 
 async def _delete_any_channel(context: Any, arguments: dict[str, Any]) -> Any:
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     kind = channel_type(channel)
     if kind == "category":
-        raise ValueError("Use delete_category for categories.")
+        raise ValueError(t("Use delete_category for categories."))
     name = channel.name
     await channel.delete(reason=_reason(arguments))
-    return _ok("delete_any_channel", f"Deleted {kind} channel {name}.")
+    return _ok("delete_any_channel", t("Deleted {kind} channel {name}.", kind=kind, name=name))
 
 
 async def _delete_category(context: Any, arguments: dict[str, Any]) -> Any:
@@ -364,33 +364,34 @@ async def _delete_category(context: Any, arguments: dict[str, Any]) -> Any:
     if arguments.get("delete_channels_inside") is True:
         children = list(getattr(category, "channels", []) or [])
         if len(children) > 50:
-            raise ValueError("The category has more than 50 channels; delete them in smaller steps.")
+            raise ValueError(t("The category has more than 50 channels; delete them in smaller steps."))
         for child in children:
             await child.delete(reason=_reason(arguments))
             deleted_children += 1
     name = category.name
     await category.delete(reason=_reason(arguments))
-    suffix = f" and {deleted_children} channel(s) inside it" if deleted_children else " (its channels were kept)"
-    return _ok("delete_category", f"Deleted category {name}{suffix}.")
+    if deleted_children:
+        return _ok("delete_category", t("Deleted category {name} and {count} channel(s) inside it.", name=name, count=deleted_children))
+    return _ok("delete_category", t("Deleted category {name} (its channels were kept).", name=name))
 
 
 async def _set_channel_permissions(context: Any, arguments: dict[str, Any]) -> Any:
     guild = C._require_guild(context)
     channel = resolve_any_channel(context, arguments.get("channel_id"))
     if channel_type(channel).endswith("thread"):
-        raise ValueError("Threads use their parent channel's permissions.")
+        raise ValueError(t("Threads use their parent channel's permissions."))
     target_type = arguments["target_type"]
     if target_type == "everyone":
         target = guild.default_role
     elif target_type == "role":
         if not arguments.get("target_id"):
-            raise ValueError("target_id is required for target_type role.")
+            raise ValueError(t("target_id is required for target_type role."))
         target = C._resolve_role(context, arguments["target_id"])
         if not (callable(getattr(target, "is_default", None)) and target.is_default()):
             C.ensure_role_manageable(context, target, action="change permissions for")
     else:
         if not arguments.get("target_id"):
-            raise ValueError("target_id is required for target_type member.")
+            raise ValueError(t("target_id is required for target_type member."))
         target = await C._resolve_member(context, arguments["target_id"])
         C.ensure_member_actionable(context, target, action="change channel permissions for", allow_self=True)
     allow = C.parse_permission_names(arguments.get("allow"), "allow")
@@ -398,20 +399,20 @@ async def _set_channel_permissions(context: Any, arguments: dict[str, Any]) -> A
     neutral = C.parse_permission_names(arguments.get("reset"), "reset")
     overlap = (set(allow) & set(deny)) | (set(allow) & set(neutral)) | (set(deny) & set(neutral))
     if overlap:
-        raise ValueError(f"A permission appears in more than one list: {', '.join(sorted(overlap))}.")
+        raise ValueError(t("A permission appears in more than one list: {items}.", items=', '.join(sorted(overlap))))
     C.ensure_permissions_grantable(context, C.permissions_from_names(allow))
     if arguments.get("clear") is True:
         if allow or deny or neutral:
-            raise ValueError("clear cannot be combined with allow/deny/reset.")
+            raise ValueError(t("clear cannot be combined with allow/deny/reset."))
         await channel.set_permissions(target, overwrite=None, reason=_reason(arguments))
-        return _ok("set_channel_permissions", f"Removed the permission overwrite for {target} in {channel.name}.")
+        return _ok("set_channel_permissions", t("Removed the permission overwrite for {target} in {name}.", target=target, name=channel.name))
     if not (allow or deny or neutral):
-        raise ValueError("Provide allow, deny, reset or clear.")
+        raise ValueError(t("Provide allow, deny, reset or clear."))
     overwrite = channel.overwrites_for(target)
     updates = {**{name: True for name in allow}, **{name: False for name in deny}, **{name: None for name in neutral}}
     overwrite.update(**updates)
     await channel.set_permissions(target, overwrite=overwrite, reason=_reason(arguments))
-    return _ok("set_channel_permissions", f"Updated permissions for {target} in {channel.name}.")
+    return _ok("set_channel_permissions", t("Updated permissions for {target} in {name}.", target=target, name=channel.name))
 
 
 # --------------------------------------------------------------------------
@@ -426,7 +427,7 @@ async def _edit_role(context: Any, arguments: dict[str, Any]) -> Any:
     options: dict[str, Any] = {}
     if arguments.get("name") is not None:
         if is_default:
-            raise ValueError("@everyone cannot be renamed.")
+            raise ValueError(t("@everyone cannot be renamed."))
         options["name"] = C._require_name(arguments["name"])
     if arguments.get("color") is not None:
         options["colour"] = C.parse_color(arguments["color"])
@@ -438,9 +439,9 @@ async def _edit_role(context: Any, arguments: dict[str, Any]) -> Any:
     remove = C.parse_permission_names(arguments.get("remove_permissions"), "remove_permissions")
     if replace is not None or add or remove:
         if replace is not None and (add or remove):
-            raise ValueError("Use either permissions (replace all) or add_permissions/remove_permissions.")
+            raise ValueError(t("Use either permissions (replace all) or add_permissions/remove_permissions."))
         if set(add) & set(remove):
-            raise ValueError("A permission cannot be both added and removed.")
+            raise ValueError(t("A permission cannot be both added and removed."))
         current = C._permissions_value(getattr(role, "permissions", None)) or 0
         if replace is not None:
             new_permissions = C.permissions_from_names(C.parse_permission_names(replace, "permissions"))
@@ -451,32 +452,32 @@ async def _edit_role(context: Any, arguments: dict[str, Any]) -> Any:
         newly_granted = discord.Permissions(new_permissions.value & ~current)
         C.ensure_permissions_grantable(context, newly_granted)
         if new_permissions.administrator:
-            raise C.AdminToolError("Granting Administrator is not allowed through tools; do it manually in Discord.")
+            raise C.AdminToolError(t("Granting Administrator is not allowed through tools; do it manually in Discord."))
         options["permissions"] = new_permissions
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     await role.edit(reason=_reason(arguments), **options)
-    return _ok("edit_role", f"Updated role {role.name} ({', '.join(sorted(options))}).")
+    return _ok("edit_role", t("Updated role {name} ({items}).", name=role.name, items=', '.join(sorted(options))))
 
 
 async def _set_role_position(context: Any, arguments: dict[str, Any]) -> Any:
     guild = C._require_guild(context)
     role = C._resolve_role(context, arguments.get("role_id"))
     if callable(getattr(role, "is_default", None)) and role.is_default():
-        raise ValueError("@everyone cannot be moved.")
+        raise ValueError(t("@everyone cannot be moved."))
     C.ensure_role_manageable(context, role, action="move")
     position = arguments["position"]
     bot_top = C._top_role_position(C._bot_member(guild))
     if bot_top is not None and position >= bot_top:
-        raise C.AdminToolError("The target position is at or above the bot's highest role.")
+        raise C.AdminToolError(t("The target position is at or above the bot's highest role."))
     if context.enforce_hierarchy:
         requester = C.requester_member(context)
         if not C._is_guild_owner(guild, requester):
             requester_top = C._top_role_position(requester)
             if requester_top is None or position >= requester_top:
-                raise C.AdminToolError("The target position is at or above your highest role.")
+                raise C.AdminToolError(t("The target position is at or above your highest role."))
     await role.edit(position=position, reason=_reason(arguments))
-    return _ok("set_role_position", f"Moved role {role.name} to position {position}.")
+    return _ok("set_role_position", t("Moved role {name} to position {position}.", name=role.name, position=position))
 
 
 # --------------------------------------------------------------------------
@@ -490,7 +491,7 @@ async def _set_nickname(context: Any, arguments: dict[str, Any]) -> Any:
     nickname = arguments.get("nickname")
     nickname = nickname.strip() if isinstance(nickname, str) and nickname.strip() else None
     await member.edit(nick=nickname, reason=_reason(arguments))
-    return _ok("set_nickname", f"{'Set' if nickname else 'Cleared'} nickname for {member}.")
+    return _ok("set_nickname", (t("Set nickname for {member}.", member=member) if nickname else t("Cleared nickname for {member}.", member=member)))
 
 
 async def _bulk_update_role(context: Any, arguments: dict[str, Any]) -> Any:
@@ -515,8 +516,7 @@ async def _bulk_update_role(context: Any, arguments: dict[str, Any]) -> Any:
         candidates.append(member)
     if len(candidates) > max_members:
         raise C.AdminToolError(
-            f"{len(candidates)} members match, more than max_members={max_members}; nothing was changed. "
-            "Raise max_members (up to 500) if this is intended."
+            t("{count} members match, more than max_members={max_members}; nothing was changed. Raise max_members (up to 500) if this is intended.", count=len(candidates), max_members=max_members)
         )
     changed = failed = 0
     for member in candidates:
@@ -539,15 +539,15 @@ async def _move_member_voice(context: Any, arguments: dict[str, Any]) -> Any:
     member = await C._resolve_member(context, arguments.get("member_id"))
     C.ensure_member_actionable(context, member, action="move", allow_self=True)
     if getattr(member, "voice", None) is None:
-        raise C.AdminToolError(f"{member} is not in a voice channel.")
+        raise C.AdminToolError(t("{member} is not in a voice channel.", member=member))
     if arguments.get("channel_id"):
         target = resolve_any_channel(context, arguments["channel_id"])
         if channel_type(target) not in ("voice", "stage_voice"):
-            raise ValueError("channel_id must be a voice or stage channel.")
+            raise ValueError(t("channel_id must be a voice or stage channel."))
         await member.move_to(target, reason=_reason(arguments))
-        return _ok("move_member_voice", f"Moved {member} to {target.name}.")
+        return _ok("move_member_voice", t("Moved {member} to {name}.", member=member, name=target.name))
     await member.move_to(None, reason=_reason(arguments))
-    return _ok("move_member_voice", f"Disconnected {member} from voice.")
+    return _ok("move_member_voice", t("Disconnected {member} from voice.", member=member))
 
 
 async def _set_member_voice_state(context: Any, arguments: dict[str, Any]) -> Any:
@@ -555,9 +555,9 @@ async def _set_member_voice_state(context: Any, arguments: dict[str, Any]) -> An
     C.ensure_member_actionable(context, member, action="server-mute or deafen")
     options = {key: bool(arguments[key]) for key in ("mute", "deafen") if arguments.get(key) is not None}
     if not options:
-        raise ValueError("Provide mute and/or deafen.")
+        raise ValueError(t("Provide mute and/or deafen."))
     await member.edit(reason=_reason(arguments), **options)
-    return _ok("set_member_voice_state", f"Updated voice state of {member}: {options}.")
+    return _ok("set_member_voice_state", t("Updated voice state of {member}: {options}.", member=member, options=options))
 
 
 # --------------------------------------------------------------------------
@@ -583,7 +583,7 @@ async def _get_audit_log(context: Any, arguments: dict[str, Any]) -> dict[str, A
     if arguments.get("action"):
         action = getattr(discord.AuditLogAction, arguments["action"], None)
         if not isinstance(action, discord.AuditLogAction):
-            raise ValueError("action must be a Discord audit log action name such as ban, kick, channel_create, role_update.")
+            raise ValueError(t("action must be a Discord audit log action name such as ban, kick, channel_create, role_update."))
         options["action"] = action
     entries = []
     async for entry in guild.audit_logs(**options):
@@ -606,7 +606,7 @@ async def _get_audit_log(context: Any, arguments: dict[str, Any]) -> dict[str, A
 def _require_store(context: Any) -> Any:
     store = context.feature_store
     if store is None:
-        raise C.AdminToolError("The bot feature store is unavailable in this context.")
+        raise C.AdminToolError(t("The bot feature store is unavailable in this context."))
     return store
 
 
@@ -614,7 +614,7 @@ async def _lockdown_server(context: Any, arguments: dict[str, Any]) -> Any:
     guild = C._require_guild(context)
     store = _require_store(context)
     if store.get(guild.id, "lockdown") is not None:
-        raise C.AdminToolError("A server lockdown is already active; use end_lockdown first.")
+        raise C.AdminToolError(t("A server lockdown is already active; use end_lockdown first."))
     everyone = guild.default_role
     previous = C._permissions_value(getattr(everyone, "permissions", None)) or 0
     new_permissions = discord.Permissions(previous)
@@ -631,8 +631,7 @@ async def _lockdown_server(context: Any, arguments: dict[str, Any]) -> Any:
         raise
     return _ok(
         "lockdown_server",
-        "Server lockdown active: @everyone can no longer send messages, react, create threads or speak "
-        "(channel-specific overrides still apply). Use end_lockdown to restore.",
+        t("Server lockdown active: @everyone can no longer send messages, react, create threads or speak (channel-specific overrides still apply). Use end_lockdown to restore."),
     )
 
 
@@ -641,14 +640,14 @@ async def _end_lockdown(context: Any, arguments: dict[str, Any]) -> Any:
     store = _require_store(context)
     record = store.get(guild.id, "lockdown")
     if not isinstance(record, dict):
-        raise C.AdminToolError("No server lockdown is active.")
+        raise C.AdminToolError(t("No server lockdown is active."))
     previous = discord.Permissions(int(record.get("previous_permissions", 0)))
     everyone = guild.default_role
     current = discord.Permissions(C._permissions_value(getattr(everyone, "permissions", None)) or 0)
     current.update(**{flag: getattr(previous, flag) for flag in record.get("flags", LOCKDOWN_FLAGS) if flag in discord.Permissions.VALID_FLAGS})
     await everyone.edit(permissions=current, reason=_reason(arguments))
     store.set(guild.id, "lockdown", None)
-    return _ok("end_lockdown", "Server lockdown ended; @everyone permissions restored.")
+    return _ok("end_lockdown", t("Server lockdown ended; @everyone permissions restored."))
 
 
 # --------------------------------------------------------------------------
@@ -684,7 +683,7 @@ async def _get_guild_settings(context: Any, arguments: dict[str, Any]) -> dict[s
 def _text_channel_for(context: Any, value: Any, field: str) -> Any:
     channel = resolve_any_channel(context, value, field)
     if channel_type(channel) not in ("text", "news"):
-        raise ValueError(f"{field} must be a text channel.")
+        raise ValueError(t("{field} must be a text channel.", field=field))
     return channel
 
 
@@ -706,7 +705,7 @@ async def _edit_guild(context: Any, arguments: dict[str, Any]) -> Any:
     if arguments.get("afk_channel_id") is not None:
         channel = resolve_any_channel(context, arguments["afk_channel_id"], "afk_channel_id")
         if channel_type(channel) != "voice":
-            raise ValueError("afk_channel_id must be a voice channel.")
+            raise ValueError(t("afk_channel_id must be a voice channel."))
         options["afk_channel"] = channel
     for field, target in (
         ("system_channel_id", "system_channel"),
@@ -719,15 +718,15 @@ async def _edit_guild(context: Any, arguments: dict[str, Any]) -> Any:
         try:
             options["preferred_locale"] = discord.Locale(arguments["preferred_locale"])
         except ValueError as exc:
-            raise ValueError("preferred_locale must be a Discord locale such as ru, en-US, de.") from exc
+            raise ValueError(t("preferred_locale must be a Discord locale such as ru, en-US, de.")) from exc
     for field in arguments.get("clear_fields") or []:
         if field in options:
-            raise ValueError(f"{field} cannot be both set and cleared.")
+            raise ValueError(t("{field} cannot be both set and cleared.", field=field))
         options[field] = None
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     await guild.edit(reason=_reason(arguments), **options)
-    return _ok("edit_guild", f"Updated server settings: {', '.join(sorted(options))}.")
+    return _ok("edit_guild", t("Updated server settings: {items}.", items=', '.join(sorted(options))))
 
 
 MAX_GUILD_IMAGE_BYTES = 8 * 1024 * 1024
@@ -737,16 +736,16 @@ async def _set_guild_image(context: Any, arguments: dict[str, Any], *, field: st
     guild = C._require_guild(context)
     if arguments.get("remove") is True:
         if arguments.get("attachment_id"):
-            raise ValueError("Use either attachment_id or remove.")
+            raise ValueError(t("Use either attachment_id or remove."))
         await guild.edit(reason=_reason(arguments), **{field: None})
-        return _ok(tool, f"Removed the server {field}.")
+        return _ok(tool, t("Removed the server {field}.", field=field))
     if not arguments.get("attachment_id"):
-        raise ValueError("attachment_id (an image attached to this request) or remove is required.")
+        raise ValueError(t("attachment_id (an image attached to this request) or remove is required."))
     data = await C.read_request_attachment(
         context, arguments["attachment_id"], max_bytes=MAX_GUILD_IMAGE_BYTES, label=f"Server {field}"
     )
     await guild.edit(reason=_reason(arguments), **{field: data})
-    return _ok(tool, f"Updated the server {field}.")
+    return _ok(tool, t("Updated the server {field}.", field=field))
 
 
 async def _set_guild_icon(context: Any, arguments: dict[str, Any]) -> Any:
@@ -773,9 +772,9 @@ async def _edit_welcome_screen(context: Any, arguments: dict[str, Any]) -> Any:
             )
         options["welcome_channels"] = welcome_channels
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     await guild.edit_welcome_screen(reason=_reason(arguments), **options)
-    return _ok("edit_welcome_screen", "Updated the server welcome screen.")
+    return _ok("edit_welcome_screen", t("Updated the server welcome screen."))
 
 
 async def _edit_onboarding(context: Any, arguments: dict[str, Any]) -> Any:
@@ -801,7 +800,7 @@ async def _edit_onboarding(context: Any, arguments: dict[str, Any]) -> Any:
                     roles.append(role)
                 channels = [resolve_any_channel(context, value) for value in option.get("channel_ids") or []]
                 if not roles and not channels:
-                    raise ValueError(f"Onboarding option {option['title']!r} needs at least one role or channel.")
+                    raise ValueError(t("Onboarding option {title} needs at least one role or channel.", title=repr(option['title'])))
                 kwargs: dict[str, Any] = {
                     "title": option["title"],
                     "description": option.get("description") or None,
@@ -823,12 +822,12 @@ async def _edit_onboarding(context: Any, arguments: dict[str, Any]) -> Any:
             )
         options["prompts"] = prompts
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     reason = _reason(arguments)
     if reason is not None:
         options["reason"] = reason
     await guild.edit_onboarding(**options)
-    return _ok("edit_onboarding", "Updated server onboarding.")
+    return _ok("edit_onboarding", t("Updated server onboarding."))
 
 
 # --------------------------------------------------------------------------
@@ -870,14 +869,14 @@ def _automod_actions(context: Any, arguments: dict[str, Any], trigger_type: str)
         actions.append(discord.AutoModRuleAction(type=discord.AutoModRuleActionType.send_alert_message, channel_id=channel.id))
     if arguments.get("timeout_seconds"):
         if trigger_type not in ("keyword", "mention_spam"):
-            raise ValueError("timeout_seconds works only with keyword or mention_spam rules.")
+            raise ValueError(t("timeout_seconds works only with keyword or mention_spam rules."))
         actions.append(
             discord.AutoModRuleAction(
                 type=discord.AutoModRuleActionType.timeout, duration=timedelta(seconds=arguments["timeout_seconds"])
             )
         )
     if not actions:
-        raise ValueError("The rule needs at least one action (block_message, alert_channel_id or timeout_seconds).")
+        raise ValueError(t("The rule needs at least one action (block_message, alert_channel_id or timeout_seconds)."))
     return actions
 
 
@@ -886,7 +885,7 @@ def _automod_trigger(arguments: dict[str, Any], trigger_type: str) -> Any:
         keywords = arguments.get("keywords") or []
         patterns = arguments.get("regex_patterns") or []
         if not keywords and not patterns:
-            raise ValueError("A keyword rule needs keywords or regex_patterns.")
+            raise ValueError(t("A keyword rule needs keywords or regex_patterns."))
         return discord.AutoModTrigger(
             type=discord.AutoModRuleTriggerType.keyword,
             keyword_filter=keywords,
@@ -896,7 +895,7 @@ def _automod_trigger(arguments: dict[str, Any], trigger_type: str) -> Any:
     if trigger_type == "keyword_preset":
         presets = arguments.get("presets") or []
         if not presets:
-            raise ValueError("A keyword_preset rule needs presets.")
+            raise ValueError(t("A keyword_preset rule needs presets."))
         flags = discord.AutoModPresets(**{name: True for name in presets})
         return discord.AutoModTrigger(
             type=discord.AutoModRuleTriggerType.keyword_preset, presets=flags, allow_list=arguments.get("allow_list") or []
@@ -927,7 +926,7 @@ async def _create_automod_rule(context: Any, arguments: dict[str, Any]) -> Any:
         exempt_channels=_resolve_ids(context, arguments.get("exempt_channel_ids"), resolve_any_channel),
         reason=_reason(arguments) or "AutoMod rule via Admin bot",
     )
-    return _ok("create_automod_rule", f"Created AutoMod rule {rule.name}.", {"rule_id": _sid(rule)})
+    return _ok("create_automod_rule", t("Created AutoMod rule {name}.", name=rule.name), {"rule_id": _sid(rule)})
 
 
 async def _find_automod_rule(context: Any, value: Any) -> Any:
@@ -936,7 +935,7 @@ async def _find_automod_rule(context: Any, value: Any) -> Any:
     for rule in await guild.fetch_automod_rules():
         if getattr(rule, "id", None) == rule_id:
             return rule
-    raise C.AdminToolError(f"AutoMod rule {rule_id} was not found.")
+    raise C.AdminToolError(t("AutoMod rule {rule_id} was not found.", rule_id=rule_id))
 
 
 async def _edit_automod_rule(context: Any, arguments: dict[str, Any]) -> Any:
@@ -953,7 +952,7 @@ async def _edit_automod_rule(context: Any, arguments: dict[str, Any]) -> Any:
     if any(arguments.get(key) is not None for key in ("keywords", "allow_list", "regex_patterns")):
         trigger = getattr(rule, "trigger", None)
         if _enum_name(getattr(trigger, "type", None)) != "keyword":
-            raise ValueError("keywords/allow_list/regex_patterns can only be changed on keyword rules.")
+            raise ValueError(t("keywords/allow_list/regex_patterns can only be changed on keyword rules."))
         options["trigger"] = discord.AutoModTrigger(
             type=discord.AutoModRuleTriggerType.keyword,
             keyword_filter=arguments["keywords"] if arguments.get("keywords") is not None else list(trigger.keyword_filter),
@@ -961,16 +960,16 @@ async def _edit_automod_rule(context: Any, arguments: dict[str, Any]) -> Any:
             allow_list=arguments["allow_list"] if arguments.get("allow_list") is not None else list(trigger.allow_list),
         )
     if not options:
-        raise ValueError("Nothing to change.")
+        raise ValueError(t("Nothing to change."))
     await rule.edit(reason=_reason(arguments) or "AutoMod rule via Admin bot", **options)
-    return _ok("edit_automod_rule", f"Updated AutoMod rule {rule.name}.")
+    return _ok("edit_automod_rule", t("Updated AutoMod rule {name}.", name=rule.name))
 
 
 async def _delete_automod_rule(context: Any, arguments: dict[str, Any]) -> Any:
     rule = await _find_automod_rule(context, arguments.get("rule_id"))
     name = rule.name
     await rule.delete(reason=_reason(arguments) or "AutoMod rule via Admin bot")
-    return _ok("delete_automod_rule", f"Deleted AutoMod rule {name}.")
+    return _ok("delete_automod_rule", t("Deleted AutoMod rule {name}.", name=name))
 
 
 # --------------------------------------------------------------------------

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
 import discord
+from bot_i18n import t
 
 ToolKind = Literal["read", "write"]
 ToolRisk = Literal["read", "normal", "destructive"]
@@ -76,23 +77,23 @@ MESSAGE_CONTENT_HELP = (
 
 def parse_snowflake(value: object, field_name: str) -> int:
     if isinstance(value, bool):
-        raise ValueError(f'"{field_name}" must be a numeric Discord ID.')
+        raise ValueError(t("\"{field_name}\" must be a numeric Discord ID.", field_name=field_name))
 
     if isinstance(value, int):
         snowflake = value
     elif isinstance(value, str) and value.isdigit():
         snowflake = int(value)
     else:
-        raise ValueError(f'"{field_name}" must be a numeric Discord ID.')
+        raise ValueError(t("\"{field_name}\" must be a numeric Discord ID.", field_name=field_name))
 
     if snowflake <= 0:
-        raise ValueError(f'"{field_name}" must be a positive Discord ID.')
+        raise ValueError(t("\"{field_name}\" must be a positive Discord ID.", field_name=field_name))
     return snowflake
 
 
 def parse_snowflake_list(value: object, field_name: str) -> list[int]:
     if not isinstance(value, list):
-        raise ValueError(f'"{field_name}" must be a JSON array.')
+        raise ValueError(t("\"{field_name}\" must be a JSON array.", field_name=field_name))
     return [parse_snowflake(item, field_name) for item in value]
 
 
@@ -565,7 +566,7 @@ def get_tool_definition(name: str) -> ToolDefinition:
     try:
         return TOOL_DEFINITIONS[name]
     except KeyError as exc:
-        raise AdminToolError(f"Unknown admin tool: {name}") from exc
+        raise AdminToolError(t("Unknown admin tool: {name}", name=name)) from exc
 
 
 def list_tool_definitions() -> tuple[ToolDefinition, ...]:
@@ -601,13 +602,13 @@ async def execute_tool(
         handler = _TOOL_HANDLERS[tool_name]
         data = await handler(context, safe_arguments)
     except discord.Forbidden:
-        return ToolResult(False, tool_name, "Discord refused the action. Check the bot role position and permissions.")
+        return ToolResult(False, tool_name, t("Discord refused the action. Check the bot role position and permissions."))
     except discord.HTTPException as exc:
-        return ToolResult(False, tool_name, f"Discord API error: {exc}")
+        return ToolResult(False, tool_name, t("Discord API error: {exc}", exc=exc))
     except (AdminToolError, ValueError) as exc:
         return ToolResult(False, tool_name, str(exc))
     except Exception as exc:
-        return ToolResult(False, tool_name, f"Unexpected error: {type(exc).__name__}.")
+        return ToolResult(False, tool_name, t("Unexpected error: {kind}.", kind=type(exc).__name__))
 
     if isinstance(data, ToolResult):
         return data
@@ -618,29 +619,29 @@ def _validate_tool_arguments(definition: ToolDefinition, arguments: dict[str, An
     if arguments is None:
         arguments = {}
     if not isinstance(arguments, dict):
-        raise AdminToolError("Tool arguments must be a plain mapping.")
+        raise AdminToolError(t("Tool arguments must be a plain mapping."))
     if not _is_json_compatible(arguments):
-        raise AdminToolError("Tool arguments must contain only JSON-compatible values.")
+        raise AdminToolError(t("Tool arguments must contain only JSON-compatible values."))
 
     schema = definition.arguments
     properties = schema.get("properties", {})
     required = schema.get("required", [])
     additional_properties = schema.get("additionalProperties", True)
     if not isinstance(properties, dict) or not isinstance(required, list):
-        raise AdminToolError(f"Invalid internal schema for {definition.name}.")
+        raise AdminToolError(t("Invalid internal schema for {name}.", name=definition.name))
 
     if additional_properties is False:
         unknown = sorted(set(arguments) - set(properties))
         if unknown:
-            raise AdminToolError(f"Unknown argument for {definition.name}: {unknown[0]}")
+            raise AdminToolError(t("Unknown argument for {name}: {value}", name=definition.name, value=unknown[0]))
 
     for field_name in required:
         if field_name not in arguments:
-            raise AdminToolError(f"Missing required argument for {definition.name}: {field_name}")
+            raise AdminToolError(t("Missing required argument for {name}: {field_name}", name=definition.name, field_name=field_name))
 
     for key, value in arguments.items():
         if not isinstance(key, str):
-            raise AdminToolError("Tool argument names must be strings.")
+            raise AdminToolError(t("Tool argument names must be strings."))
         if key in properties:
             _validate_schema_property(key, value, properties[key])
     return dict(arguments)
@@ -669,39 +670,39 @@ def _validate_schema_property(field_name: str, value: Any, schema: dict[str, Any
     additionalProperties false). Unknown constructs fail closed.
     """
     if depth > MAX_SCHEMA_DEPTH:
-        raise AdminToolError(f"Schema nesting too deep for {field_name}.")
+        raise AdminToolError(t("Schema nesting too deep for {field_name}.", field_name=field_name))
     expected_types = schema.get("type")
     if isinstance(expected_types, str):
         expected_types = [expected_types]
     if not isinstance(expected_types, list):
-        raise AdminToolError(f"Invalid internal schema type for {field_name}.")
+        raise AdminToolError(t("Invalid internal schema type for {field_name}.", field_name=field_name))
 
     if value is None:
         if "null" not in expected_types:
-            raise ValueError(f"{field_name} is required.")
+            raise ValueError(t("{field_name} is required.", field_name=field_name))
         return
 
     enum = schema.get("enum")
     if enum is not None:
         if not isinstance(enum, list):
-            raise AdminToolError(f"Invalid internal enum for {field_name}.")
+            raise AdminToolError(t("Invalid internal enum for {field_name}.", field_name=field_name))
         if not any(type(item) is type(value) and item == value for item in enum):
             allowed = ", ".join(str(item) for item in enum if item is not None)
-            raise ValueError(f"{field_name} must be one of: {allowed}.")
+            raise ValueError(t("{field_name} must be one of: {allowed}.", field_name=field_name, allowed=allowed))
 
     if "string" in expected_types and isinstance(value, str):
         min_length = schema.get("minLength")
         max_length = schema.get("maxLength")
         if isinstance(min_length, int) and len(value) < min_length:
-            raise ValueError(f"{field_name} must be at least {min_length} character(s).")
+            raise ValueError(t("{field_name} must be at least {min_length} character(s).", field_name=field_name, min_length=min_length))
         if isinstance(max_length, int) and len(value) > max_length:
-            raise ValueError(f"{field_name} must be {max_length} character(s) or fewer.")
+            raise ValueError(t("{field_name} must be {max_length} character(s) or fewer.", field_name=field_name, max_length=max_length))
         pattern = schema.get("pattern")
         if pattern == _SNOWFLAKE_PATTERN:
             parse_snowflake(value, field_name)
         elif isinstance(pattern, str):
             if re.fullmatch(pattern, value) is None:
-                raise ValueError(f"{field_name} has invalid format.")
+                raise ValueError(t("{field_name} has invalid format.", field_name=field_name))
         return
 
     if "integer" in expected_types and isinstance(value, int) and not isinstance(value, bool):
@@ -719,17 +720,17 @@ def _validate_schema_property(field_name: str, value: Any, schema: dict[str, Any
         min_items = schema.get("minItems")
         max_items = schema.get("maxItems")
         if isinstance(min_items, int) and len(value) < min_items:
-            raise ValueError(f"{field_name} must contain at least {min_items} item(s).")
+            raise ValueError(t("{field_name} must contain at least {min_items} item(s).", field_name=field_name, min_items=min_items))
         if isinstance(max_items, int) and len(value) > max_items:
-            raise ValueError(f"{field_name} must contain {max_items} item(s) or fewer.")
+            raise ValueError(t("{field_name} must contain {max_items} item(s) or fewer.", field_name=field_name, max_items=max_items))
         if schema.get("uniqueItems") is True:
             seen = [json.dumps(item, sort_keys=True) for item in value]
             if len(seen) != len(set(seen)):
-                raise ValueError(f"{field_name} must not contain duplicates.")
+                raise ValueError(t("{field_name} must not contain duplicates.", field_name=field_name))
         items = schema.get("items")
         if items is not None:
             if not isinstance(items, dict):
-                raise AdminToolError(f"Invalid internal items schema for {field_name}.")
+                raise AdminToolError(t("Invalid internal items schema for {field_name}.", field_name=field_name))
             for index, item in enumerate(value):
                 _validate_schema_property(f"{field_name}[{index}]", item, items, depth + 1)
         return
@@ -738,56 +739,56 @@ def _validate_schema_property(field_name: str, value: Any, schema: dict[str, Any
         _validate_object(field_name, value, schema, depth + 1)
         return
 
-    raise ValueError(f"{field_name} has invalid type.")
+    raise ValueError(t("{field_name} has invalid type.", field_name=field_name))
 
 
 def _check_numeric_bounds(field_name: str, value: Any, schema: dict[str, Any]) -> None:
     minimum = schema.get("minimum")
     maximum = schema.get("maximum")
     if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and value < minimum:
-        raise ValueError(f"{field_name} must be {minimum} or greater.")
+        raise ValueError(t("{field_name} must be {minimum} or greater.", field_name=field_name, minimum=minimum))
     if isinstance(maximum, (int, float)) and not isinstance(maximum, bool) and value > maximum:
-        raise ValueError(f"{field_name} must be {maximum} or lower.")
+        raise ValueError(t("{field_name} must be {maximum} or lower.", field_name=field_name, maximum=maximum))
 
 
 def _validate_object(field_name: str, value: dict[str, Any], schema: dict[str, Any], depth: int) -> None:
     properties = schema.get("properties", {})
     required = schema.get("required", [])
     if not isinstance(properties, dict) or not isinstance(required, list):
-        raise AdminToolError(f"Invalid internal object schema for {field_name}.")
+        raise AdminToolError(t("Invalid internal object schema for {field_name}.", field_name=field_name))
     if schema.get("additionalProperties", True) is False:
         unknown = sorted(str(key) for key in set(value) - set(properties))
         if unknown:
-            raise ValueError(f"{field_name} has unknown field: {unknown[0]}")
+            raise ValueError(t("{field_name} has unknown field: {value}", field_name=field_name, value=unknown[0]))
     for key in required:
         if key not in value:
-            raise ValueError(f"{field_name} is missing field: {key}")
+            raise ValueError(t("{field_name} is missing field: {key}", field_name=field_name, key=key))
     for key, item in value.items():
         if not isinstance(key, str):
-            raise ValueError(f"{field_name} field names must be strings.")
+            raise ValueError(t("{field_name} field names must be strings.", field_name=field_name))
         if key in properties:
             _validate_schema_property(f"{field_name}.{key}", item, properties[key], depth)
 
 
 def _default_success_message(tool_name: str) -> str:
-    return f"{tool_name} completed."
+    return t("{tool} completed.", tool=tool_name)
 
 
 def _require_guild(context: AdminToolContext) -> Any:
     if context.guild is None:
-        raise AdminToolError("Guild is required.")
+        raise AdminToolError(t("Guild is required."))
     return context.guild
 
 
 def _require_name(value: Any, field_name: str = "name") -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be a non-empty string.")
+        raise ValueError(t("{field_name} must be a non-empty string.", field_name=field_name))
     return value.strip()
 
 
 def _require_content(value: Any) -> str:
     if not isinstance(value, str) or not value:
-        raise ValueError("content must be a non-empty string.")
+        raise ValueError(t("content must be a non-empty string."))
     return value
 
 
@@ -795,16 +796,16 @@ def _optional_positive_int(value: Any, field_name: str, default: int) -> int:
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field_name} must be a positive integer.")
+        raise ValueError(t("{field_name} must be a positive integer.", field_name=field_name))
     if value <= 0:
-        raise ValueError(f"{field_name} must be a positive integer.")
+        raise ValueError(t("{field_name} must be a positive integer.", field_name=field_name))
     return value
 
 
 def _bounded_message_limit(value: Any) -> int:
     limit = _optional_positive_int(value, "limit", DEFAULT_RECENT_MESSAGES)
     if limit > MAX_RECENT_MESSAGES:
-        raise ValueError(f"limit must be {MAX_RECENT_MESSAGES} or lower.")
+        raise ValueError(t("limit must be {max_recent_messages} or lower.", max_recent_messages=MAX_RECENT_MESSAGES))
     return limit
 
 
@@ -813,7 +814,7 @@ def _reason(arguments: dict[str, Any]) -> str | None:
     if reason is None:
         return None
     if not isinstance(reason, str):
-        raise ValueError("reason must be a string.")
+        raise ValueError(t("reason must be a string."))
     return reason
 
 
@@ -821,7 +822,7 @@ def _find_by_id(items: Any, item_id: int, label: str) -> Any:
     for item in items:
         if getattr(item, "id", None) == item_id:
             return item
-    raise AdminToolError(f"{label} {item_id} was not found.")
+    raise AdminToolError(t("{label} {item_id} was not found.", label=label, item_id=item_id))
 
 
 def _find_channel(guild: Any, channel_id: int) -> Any:
@@ -901,14 +902,14 @@ def _resolve_channel(context: AdminToolContext, channel_id_value: Any) -> Any:
 def _resolve_text_channel(context: AdminToolContext, channel_id_value: Any, tool_name: str) -> Any:
     channel = _resolve_channel(context, channel_id_value)
     if not _is_text_channel(channel):
-        raise ValueError(f"{tool_name} works only with text channel.")
+        raise ValueError(t("{tool_name} works only with text channel.", tool_name=tool_name))
     return channel
 
 
 def _resolve_text_or_voice_channel(context: AdminToolContext, channel_id_value: Any, tool_name: str) -> Any:
     channel = _resolve_channel(context, channel_id_value)
     if _is_category_channel(channel) or not (_is_text_channel(channel) or _is_voice_channel(channel)):
-        raise ValueError(f"{tool_name} works only with text or voice channel.")
+        raise ValueError(t("{tool_name} works only with text or voice channel.", tool_name=tool_name))
     return channel
 
 
@@ -1070,7 +1071,7 @@ async def _get_recent_messages(context: AdminToolContext, arguments: dict[str, A
     channel = _resolve_text_channel(context, arguments.get("channel_id"), "get_recent_messages")
     history = getattr(channel, "history", None)
     if not callable(history):
-        raise AdminToolError("Channel does not expose message history.")
+        raise AdminToolError(t("Channel does not expose message history."))
     messages = []
     async for message in history(limit=limit):
         messages.append(_serialize_message(message))
@@ -1087,23 +1088,23 @@ async def _send_message(context: AdminToolContext, arguments: dict[str, Any]) ->
         await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
     else:
         await channel.send(content)
-    return ToolResult(True, "send_message", f"Message sent to #{channel.name}.")
+    return ToolResult(True, "send_message", t("Message sent to #{name}.", name=channel.name))
 
 
 async def _purge_messages(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
     channel = _resolve_text_channel(context, arguments.get("channel_id"), "purge_messages")
     count = _optional_positive_int(arguments.get("count"), "count", 10)
     if count > 100:
-        raise ValueError("count must be 100 or lower.")
+        raise ValueError(t("count must be 100 or lower."))
     uses_text = bool(arguments.get("contains_text")) or arguments.get("links_only") is True
     if uses_text and context.message_content is False:
-        raise AdminToolError(f"contains_text/links_only cannot work. {MESSAGE_CONTENT_HELP}")
+        raise AdminToolError(t("contains_text/links_only cannot work. {message_content_help}", message_content_help=t(MESSAGE_CONTENT_HELP)))
     check = _purge_filter(arguments)
     if check is None:
         deleted = await channel.purge(limit=count, reason=_reason(arguments))
     else:
         deleted = await channel.purge(limit=count, check=check, reason=_reason(arguments))
-    return ToolResult(True, "purge_messages", f"Deleted {len(deleted)} messages from #{channel.name}.")
+    return ToolResult(True, "purge_messages", t("Deleted {count} messages from #{name}.", count=len(deleted), name=channel.name))
 
 
 async def _timeout_member(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1112,21 +1113,21 @@ async def _timeout_member(context: AdminToolContext, arguments: dict[str, Any]) 
     duration = _optional_positive_int(arguments.get("duration_minutes"), "duration_minutes", 10)
     until = datetime.now(timezone.utc) + timedelta(minutes=duration)
     await member.timeout(until, reason=_reason(arguments))
-    return ToolResult(True, "timeout_member", f"Timed out {member} for {duration} minutes.")
+    return ToolResult(True, "timeout_member", t("Timed out {member} for {duration} minutes.", member=member, duration=duration))
 
 
 async def _clear_timeout(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
     member = await _resolve_member(context, arguments.get("member_id"))
     ensure_member_actionable(context, member, action="change the timeout of")
     await member.timeout(None, reason=_reason(arguments))
-    return ToolResult(True, "clear_timeout", f"Cleared timeout for {member}.")
+    return ToolResult(True, "clear_timeout", t("Cleared timeout for {member}.", member=member))
 
 
 async def _kick_member(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
     member = await _resolve_member(context, arguments.get("member_id"))
     ensure_member_actionable(context, member, action="kick")
     await member.kick(reason=_reason(arguments))
-    return ToolResult(True, "kick_member", f"Kicked {member}.")
+    return ToolResult(True, "kick_member", t("Kicked {member}.", member=member))
 
 
 async def _ban_member(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1135,17 +1136,17 @@ async def _ban_member(context: AdminToolContext, arguments: dict[str, Any]) -> T
     days = arguments.get("delete_message_days")
     delete_seconds = 0 if days is None else int(days) * 86400
     await member.ban(reason=_reason(arguments), delete_message_seconds=delete_seconds)
-    return ToolResult(True, "ban_member", f"Banned {member}.")
+    return ToolResult(True, "ban_member", t("Banned {member}.", member=member))
 
 
 async def _unban_user(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
     guild = _require_guild(context)
     if context.fetch_user is None:
-        raise AdminToolError("fetch_user is required for unban_user.")
+        raise AdminToolError(t("fetch_user is required for unban_user."))
     target_id = parse_snowflake(arguments.get("user_id"), "user_id")
     user = await context.fetch_user(target_id)
     await guild.unban(user, reason=_reason(arguments))
-    return ToolResult(True, "unban_user", f"Unbanned {user}.")
+    return ToolResult(True, "unban_user", t("Unbanned {user}.", user=user))
 
 
 async def _add_role(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1153,7 +1154,7 @@ async def _add_role(context: AdminToolContext, arguments: dict[str, Any]) -> Too
     role = _resolve_role(context, arguments.get("role_id"))
     _ensure_assignable_role(context, role)
     await member.add_roles(role, reason=_reason(arguments))
-    return ToolResult(True, "add_role", f"Added role {role.name} to {member}.")
+    return ToolResult(True, "add_role", t("Added role {name} to {member}.", name=role.name, member=member))
 
 
 async def _remove_role(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1161,7 +1162,7 @@ async def _remove_role(context: AdminToolContext, arguments: dict[str, Any]) -> 
     role = _resolve_role(context, arguments.get("role_id"))
     _ensure_assignable_role(context, role)
     await member.remove_roles(role, reason=_reason(arguments))
-    return ToolResult(True, "remove_role", f"Removed role {role.name} from {member}.")
+    return ToolResult(True, "remove_role", t("Removed role {name} from {member}.", name=role.name, member=member))
 
 
 async def _create_text_channel(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1172,7 +1173,7 @@ async def _create_text_channel(context: AdminToolContext, arguments: dict[str, A
     return ToolResult(
         True,
         "create_text_channel",
-        f"Created text channel #{created.name}.",
+        t("Created text channel #{name}.", name=created.name),
         {"channel_id": _snowflake_to_string(getattr(created, "id", None))},
     )
 
@@ -1185,7 +1186,7 @@ async def _create_voice_channel(context: AdminToolContext, arguments: dict[str, 
     return ToolResult(
         True,
         "create_voice_channel",
-        f"Created voice channel {created.name}.",
+        t("Created voice channel {name}.", name=created.name),
         {"channel_id": _snowflake_to_string(getattr(created, "id", None))},
     )
 
@@ -1195,14 +1196,14 @@ async def _rename_channel(context: AdminToolContext, arguments: dict[str, Any]) 
     name = _require_name(arguments.get("name"))
     old_name = target_channel.name
     await target_channel.edit(name=name, reason=_reason(arguments))
-    return ToolResult(True, "rename_channel", f"Renamed #{old_name} to #{name}.")
+    return ToolResult(True, "rename_channel", t("Renamed #{old_name} to #{name}.", old_name=old_name, name=name))
 
 
 async def _delete_channel(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
     target_channel = _resolve_text_or_voice_channel(context, arguments.get("channel_id"), "delete_channel")
     channel_name = target_channel.name
     await target_channel.delete(reason=_reason(arguments))
-    return ToolResult(True, "delete_channel", f"Deleted channel #{channel_name}.")
+    return ToolResult(True, "delete_channel", t("Deleted channel #{channel_name}.", channel_name=channel_name))
 
 
 async def _create_role(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1222,7 +1223,7 @@ async def _create_role(context: AdminToolContext, arguments: dict[str, Any]) -> 
     return ToolResult(
         True,
         "create_role",
-        f"Created role {created.name}.",
+        t("Created role {name}.", name=created.name),
         {"role_id": _snowflake_to_string(getattr(created, "id", None))},
     )
 
@@ -1230,11 +1231,11 @@ async def _create_role(context: AdminToolContext, arguments: dict[str, Any]) -> 
 async def _delete_role(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
     role = _resolve_role(context, arguments.get("role_id"))
     if callable(getattr(role, "is_default", None)) and role.is_default():
-        raise AdminToolError("The @everyone role cannot be deleted.")
+        raise AdminToolError(t("The @everyone role cannot be deleted."))
     ensure_role_manageable(context, role, action="delete")
     role_name = role.name
     await role.delete(reason=_reason(arguments))
-    return ToolResult(True, "delete_role", f"Deleted role {role_name}.")
+    return ToolResult(True, "delete_role", t("Deleted role {role_name}.", role_name=role_name))
 
 
 async def _lock_channel(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1243,7 +1244,7 @@ async def _lock_channel(context: AdminToolContext, arguments: dict[str, Any]) ->
     overwrite = channel.overwrites_for(guild.default_role)
     overwrite.send_messages = False
     await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=_reason(arguments))
-    return ToolResult(True, "lock_channel", f"Locked #{channel.name} for @everyone.")
+    return ToolResult(True, "lock_channel", t("Locked #{name} for @everyone.", name=channel.name))
 
 
 async def _unlock_channel(context: AdminToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -1252,12 +1253,12 @@ async def _unlock_channel(context: AdminToolContext, arguments: dict[str, Any]) 
     overwrite = channel.overwrites_for(guild.default_role)
     overwrite.send_messages = None
     await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=_reason(arguments))
-    return ToolResult(True, "unlock_channel", f"Unlocked #{channel.name} for @everyone.")
+    return ToolResult(True, "unlock_channel", t("Unlocked #{name} for @everyone.", name=channel.name))
 
 
 def parse_color(value: Any) -> discord.Colour:
     if not isinstance(value, str) or re.fullmatch(r"#[0-9A-Fa-f]{6}", value) is None:
-        raise ValueError("color must be a hex color like #FF8800.")
+        raise ValueError(t("color must be a hex color like #FF8800."))
     return discord.Colour(int(value[1:], 16))
 
 
@@ -1293,7 +1294,7 @@ def _purge_filter(arguments: dict[str, Any]) -> Callable[[Any], bool] | None:
 def resolve_category(context: AdminToolContext, category_id_value: Any) -> Any:
     channel = _resolve_channel(context, parse_snowflake(category_id_value, "category_id"))
     if not _is_category_channel(channel):
-        raise ValueError("category_id must refer to a category.")
+        raise ValueError(t("category_id must refer to a category."))
     return channel
 
 
@@ -1353,7 +1354,7 @@ def parse_permission_names(value: Any, field_name: str) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{field_name} must be a list of permission names.")
+        raise ValueError(t("{field_name} must be a list of permission names.", field_name=field_name))
     names: list[str] = []
     unknown: list[str] = []
     for raw in value:
@@ -1364,7 +1365,7 @@ def parse_permission_names(value: Any, field_name: str) -> list[str]:
             names.append(name)
     if unknown:
         shown = ", ".join(repr(item) for item in unknown[:5])
-        raise ValueError(f"{field_name} has unknown permission name(s): {shown}. {PERMISSION_NAMES_HINT}")
+        raise ValueError(t("{field_name} has unknown permission name(s): {shown}. {permission_names_hint}", field_name=field_name, shown=shown, permission_names_hint=t(PERMISSION_NAMES_HINT)))
     return names
 
 
@@ -1409,7 +1410,7 @@ def _bot_member(guild: Any) -> Any:
 
 def _ensure_assignable_role(context: AdminToolContext, role: Any) -> None:
     if callable(getattr(role, "is_default", None)) and role.is_default():
-        raise AdminToolError("The @everyone role cannot be assigned or removed.")
+        raise AdminToolError(t("The @everyone role cannot be assigned or removed."))
     ensure_role_manageable(context, role, action="assign or remove")
 
 
@@ -1420,7 +1421,7 @@ def requester_member(context: AdminToolContext) -> Any:
     if context.requesting_user_id is not None and callable(getter):
         member = getter(context.requesting_user_id)
     if member is None:
-        raise AdminToolError("The requesting member could not be resolved; action refused.")
+        raise AdminToolError(t("The requesting member could not be resolved; action refused."))
     return member
 
 
@@ -1429,13 +1430,13 @@ def ensure_role_manageable(context: AdminToolContext, role: Any, *, action: str 
     guild = _require_guild(context)
     role_name = getattr(role, "name", "?")
     if getattr(role, "managed", False) is True:
-        raise AdminToolError(f"Role {role_name} is managed by an integration or bot and cannot be changed.")
+        raise AdminToolError(t("Role {role_name} is managed by an integration or bot and cannot be changed.", role_name=role_name))
     is_default = callable(getattr(role, "is_default", None)) and role.is_default()
     position = _role_position(role)
     bot_top = _top_role_position(_bot_member(guild))
     if not is_default and bot_top is not None and position is not None and position >= bot_top:
         raise AdminToolError(
-            f"Role {role_name} is at or above the bot's highest role; move the bot's role higher first."
+            t("Role {role_name} is at or above the bot's highest role; move the bot's role higher first.", role_name=role_name)
         )
     if not context.enforce_hierarchy:
         return
@@ -1444,33 +1445,33 @@ def ensure_role_manageable(context: AdminToolContext, role: Any, *, action: str 
         return
     requester_top = _top_role_position(requester)
     if requester_top is None or position is None or (not is_default and position >= requester_top):
-        raise AdminToolError(f"Role {role_name} is at or above your highest role; the AI cannot {action} it for you.")
+        raise AdminToolError(t("Role {role_name} is at or above your highest role; the AI cannot {action} it for you.", role_name=role_name, action=action))
 
 
 def ensure_member_actionable(context: AdminToolContext, member: Any, *, action: str, allow_self: bool = False) -> None:
     guild = _require_guild(context)
     member_name = str(member)
     if _is_guild_owner(guild, member):
-        raise AdminToolError(f"Cannot {action} the server owner.")
+        raise AdminToolError(t("Cannot {action} the server owner.", action=action))
     bot = _bot_member(guild)
     if bot is not None and getattr(bot, "id", None) == getattr(member, "id", None):
-        raise AdminToolError(f"Cannot {action} the bot itself.")
+        raise AdminToolError(t("Cannot {action} the bot itself.", action=action))
     member_top = _top_role_position(member)
     bot_top = _top_role_position(bot)
     if bot_top is not None and member_top is not None and member_top >= bot_top:
-        raise AdminToolError(f"{member_name} has a role at or above the bot's highest role.")
+        raise AdminToolError(t("{member_name} has a role at or above the bot's highest role.", member_name=member_name))
     if not context.enforce_hierarchy:
         return
     requester = requester_member(context)
     if getattr(requester, "id", None) == getattr(member, "id", None):
         if allow_self:
             return
-        raise AdminToolError(f"The AI will not {action} you yourself.")
+        raise AdminToolError(t("The AI will not {action} you yourself.", action=action))
     if _is_guild_owner(guild, requester):
         return
     requester_top = _top_role_position(requester)
     if requester_top is None or member_top is None or member_top >= requester_top:
-        raise AdminToolError(f"{member_name} has a role at or above your highest role; the AI cannot {action} them for you.")
+        raise AdminToolError(t("{member_name} has a role at or above your highest role; the AI cannot {action} them for you.", member_name=member_name, action=action))
 
 
 def ensure_permissions_grantable(context: AdminToolContext, permissions: Any) -> None:
@@ -1479,7 +1480,7 @@ def ensure_permissions_grantable(context: AdminToolContext, permissions: Any) ->
     granted = [name for name, enabled in discord.Permissions(value) if enabled]
     forbidden = sorted(set(granted) & FORBIDDEN_GRANT_PERMISSIONS)
     if forbidden:
-        raise AdminToolError("Granting Administrator is not allowed through tools; do it manually in Discord.")
+        raise AdminToolError(t("Granting Administrator is not allowed through tools; do it manually in Discord."))
     if not context.enforce_hierarchy or not value:
         return
     guild = _require_guild(context)
@@ -1493,7 +1494,7 @@ def ensure_permissions_grantable(context: AdminToolContext, permissions: Any) ->
     missing = value & ~requester_value
     if missing:
         names = ", ".join(name for name, enabled in discord.Permissions(missing) if enabled)
-        raise AdminToolError(f"You do not have these permissions yourself, so the AI cannot grant them: {names}.")
+        raise AdminToolError(t("You do not have these permissions yourself, so the AI cannot grant them: {names}.", names=names))
 
 
 IMAGE_CONTENT_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
@@ -1518,18 +1519,18 @@ async def read_request_attachment(
     attachment_id = str(parse_snowflake(attachment_id_value, "attachment_id"))
     attachment = (context.attachments or {}).get(attachment_id)
     if attachment is None:
-        raise AdminToolError("attachment_id must be one of the files attached to this request.")
+        raise AdminToolError(t("attachment_id must be one of the files attached to this request."))
     content_type = str(getattr(attachment, "content_type", "") or "").split(";")[0].strip().lower()
     if content_type not in allowed_types:
-        raise AdminToolError(f"{label} must be one of: {', '.join(sorted(allowed_types))}.")
+        raise AdminToolError(t("{label} must be one of: {items}.", label=label, items=', '.join(sorted(allowed_types))))
     size = getattr(attachment, "size", None)
     if isinstance(size, bool) or not isinstance(size, int) or size <= 0 or size > max_bytes:
-        raise AdminToolError(f"{label} must be at most {max_bytes // 1024} KB.")
+        raise AdminToolError(t("{label} must be at most {value} KB.", label=label, value=max_bytes // 1024))
     data = await attachment.read()
     if not isinstance(data, (bytes, bytearray)) or len(data) > max_bytes or len(data) == 0:
-        raise AdminToolError(f"{label} must be at most {max_bytes // 1024} KB.")
+        raise AdminToolError(t("{label} must be at most {value} KB.", label=label, value=max_bytes // 1024))
     if allowed_types <= IMAGE_CONTENT_TYPES and not _looks_like_image(bytes(data)):
-        raise AdminToolError(f"{label} is not a valid image file.")
+        raise AdminToolError(t("{label} is not a valid image file.", label=label))
     return bytes(data)
 
 
@@ -1563,13 +1564,13 @@ _TOOL_HANDLERS: dict[str, Callable[[AdminToolContext, dict[str, Any]], Awaitable
 
 def register_tool(definition: ToolDefinition, handler: Callable[[AdminToolContext, dict[str, Any]], Awaitable[Any]]) -> None:
     if definition.name in TOOL_DEFINITIONS or definition.name in _TOOL_HANDLERS:
-        raise AdminToolError(f"Duplicate admin tool: {definition.name}")
+        raise AdminToolError(t("Duplicate admin tool: {name}", name=definition.name))
     if definition.category not in TOOL_CATEGORIES:
-        raise AdminToolError(f"Unknown tool category for {definition.name}: {definition.category}")
+        raise AdminToolError(t("Unknown tool category for {name}: {category}", name=definition.name, category=definition.category))
     if definition.kind not in ("read", "write") or definition.risk not in ("read", "normal", "destructive"):
-        raise AdminToolError(f"Invalid kind/risk for {definition.name}.")
+        raise AdminToolError(t("Invalid kind/risk for {name}.", name=definition.name))
     if (definition.kind == "read") != (definition.risk == "read"):
-        raise AdminToolError(f"Inconsistent kind/risk for {definition.name}.")
+        raise AdminToolError(t("Inconsistent kind/risk for {name}.", name=definition.name))
     TOOL_DEFINITIONS[definition.name] = definition
     _TOOL_HANDLERS[definition.name] = handler
 

@@ -42,6 +42,7 @@ def dispatch(
     manager_main: Callable[[manager_core.BotProcessManager], int] | None = None,
     admin_main: Callable[[list[str]], int] | None = None,
     game_presence_main: Callable[[list[str]], int] | None = None,
+    stream_director_main: Callable[[list[str]], int] | None = None,
 ) -> int:
     if args.manager:
         if args.instance:
@@ -69,6 +70,15 @@ def dispatch(
 
             game_presence_main = GamePresence.main
         return int(game_presence_main(["--instance", args.instance]))
+
+    if args.bot_runner == "stream_director":
+        if not args.instance:
+            raise AppEntryError("--bot-runner stream_director requires --instance.")
+        if stream_director_main is None:
+            import StreamDirector
+
+            stream_director_main = StreamDirector.main
+        return int(stream_director_main(["--instance", args.instance]))
 
     raise AppEntryError(f"Unknown bot type for --bot-runner: {args.bot_runner!r}")
 

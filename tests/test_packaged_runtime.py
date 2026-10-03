@@ -391,12 +391,100 @@ class PackagedRuntimeTests(unittest.TestCase):
             self.assertIn("no Discord token yet", output.getvalue())
             self.assertNotIn("Traceback", output.getvalue())
 
+    def test_packaged_launch_spec_for_stream_director_bot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager_core, instance_store, bot_registry, runtime_layout = reset_core_modules(
+                root / "data", "manager_core", "instance_store", "bot_registry", "runtime_layout"
+            )
+            instance = instance_store.create_instance("stream_director", "stream-main")
+            instance.paths.token.write_text("FAKE_SD_TOKEN", encoding="utf-8")
+            (instance.paths.secrets_dir / "twitch_oauth.json").write_text('{"access_token": "FAKE_TWITCH"}', encoding="utf-8")
+            version_dir = root / "install" / "versions" / "1.0.0"
+            version_dir.mkdir(parents=True)
+            app_exe = version_dir / runtime_layout.app_executable_name()
+            app_exe.write_bytes(b"fake exe")
+
+            spec = manager_core.build_packaged_launch_spec(instance, bot_registry.get_bot_type("stream_director"), app_exe, version_dir)
+
+            self.assertEqual(spec.args, ("--bot-runner", "stream_director", "--instance", "stream-main"))
+            command = " ".join(spec.command)
+            self.assertNotIn("StreamDirector.py", command)
+            self.assertNotIn("FAKE_SD_TOKEN", command)
+            self.assertNotIn("FAKE_TWITCH", command)
+            self.assertNotIn("FAKE_TWITCH", " ".join(f"{key}={value}" for key, value in spec.env.items()))
+
+    def test_app_entry_stream_director_bot_runner_dispatches_instance(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            app_entry, = reset_core_modules(Path(data_dir), "app_entry")
+            received = []
+            args = app_entry.parse_args(["--bot-runner", "stream_director", "--instance", "stream-main"])
+            result = app_entry.dispatch(
+                args,
+                admin_main=lambda argv: self.fail("Admin entrypoint must not run for a Stream Director instance"),
+                game_presence_main=lambda argv: self.fail("Game Presence entrypoint must not run for a Stream Director instance"),
+                stream_director_main=lambda argv: received.append(argv) or 0,
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(received, [["--instance", "stream-main"]])
+            with self.assertRaises(app_entry.AppEntryError):
+                app_entry.dispatch(app_entry.parse_args(["--bot-runner", "stream_director"]), stream_director_main=lambda argv: 0)
+
+    def test_app_entry_runs_the_real_stream_director_entrypoint(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            for name in ("StreamDirector", "stream_director", "stream_director_config", "stream_director_store", "stream_director_twitch", "stream_director_discord"):
+                sys.modules.pop(name, None)
+            app_entry, instance_store = reset_core_modules(Path(data_dir), "app_entry", "instance_store")
+            instance_store.create_instance("stream_director", "stream-main")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = app_entry.main(["--bot-runner", "stream_director", "--instance", "stream-main"])
+            sys.modules.pop("StreamDirector", None)
+            self.assertEqual(code, 1)  # placeholder token: actionable message, no network, no traceback
+            self.assertIn("no Discord token yet", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+            # A Game Presence instance is refused by the Stream Director entrypoint.
+            instance_store.create_instance("game_presence", "gp-main")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = app_entry.main(["--bot-runner", "stream_director", "--instance", "gp-main"])
+            sys.modules.pop("StreamDirector", None)
+            self.assertEqual(code, 1)
+            self.assertIn("expected 'stream_director'", output.getvalue())
+
+    def test_stream_director_bot_wiring_without_network(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            for name in ("StreamDirector", "stream_director", "stream_director_config", "stream_director_store", "stream_director_twitch", "stream_director_discord"):
+                sys.modules.pop(name, None)
+            instance_store, = reset_core_modules(Path(data_dir), "instance_store")
+            instance_store.create_instance("stream_director", "stream-main")
+            stream_bot = importlib.import_module("StreamDirector")
+            runtime = stream_bot.resolve_runtime("stream-main")
+            intents = stream_bot.build_intents()
+            self.assertFalse(intents.message_content or intents.members or intents.presences)
+            self.assertTrue(intents.guilds and intents.guild_messages)
+
+            async def build():
+                bot = stream_bot.StreamDirectorBot(runtime)
+                status = bot.status()
+                await bot.http.close()
+                return bot, status
+
+            import asyncio
+
+            bot, status = asyncio.run(build())
+            self.assertEqual(status["diagnosis"]["code"], "not_configured")
+            self.assertEqual(status["twitch"]["state"], "not_configured")
+            self.assertTrue(bot.director.available)
+            self.assertEqual({command.name for command in bot.tree.get_commands()} >= {"moment", "challenge", "suggest", "stream"}, True)
+            sys.modules.pop("StreamDirector", None)
+
     def test_every_bot_type_is_packaged_and_dispatchable(self):
         with tempfile.TemporaryDirectory() as data_dir:
             app_entry, bot_registry = reset_core_modules(Path(data_dir), "app_entry", "bot_registry")
             spec_text = (PROJECT_ROOT / "packaging" / "DarkAbyssApp.spec").read_text(encoding="utf-8")
             types_ = bot_registry.discover_bot_types()
-            self.assertEqual(set(types_), {"admin", "game_presence"})
+            self.assertEqual(set(types_), {"admin", "game_presence", "stream_director"})
             for type_id, bot_type in types_.items():
                 with self.subTest(bot_type=type_id):
                     entry = bot_type.entrypoint
@@ -410,9 +498,15 @@ class PackagedRuntimeTests(unittest.TestCase):
                         args,
                         admin_main=lambda argv: calls.append(("admin", argv)) or 0,
                         game_presence_main=lambda argv: calls.append(("game_presence", argv)) or 0,
+                        stream_director_main=lambda argv: calls.append(("stream_director", argv)) or 0,
                     )
                     self.assertEqual(calls, [(type_id, ["--instance", "x-1"])])
-            for module in ("ai_storage", "ai_usage", "ai_connections", "ai_providers", "ai_groq", "ai_gemini", "game_presence", "game_presence_discord"):
+            for module in (
+                "ai_storage", "ai_usage", "ai_connections", "ai_providers", "ai_groq", "ai_gemini", "game_presence", "game_presence_discord",
+                "stream_director", "stream_director_config", "stream_director_store", "stream_director_twitch", "stream_director_discord",
+                "bot_i18n", "bot_i18n_ru_admin", "bot_i18n_ru_game_presence", "bot_i18n_ru_stream_director",
+                "bot_events", "social_awareness", "social_memory", "social_signals", "manager_kairo",
+            ):
                 self.assertIn(f'"{module}"', spec_text)
 
     def test_app_entry_unknown_bot_type_is_rejected(self):

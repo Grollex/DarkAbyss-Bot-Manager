@@ -14,6 +14,14 @@ Pipeline (each part replaceable):
              uses PreferenceBook (opt-out) and CooldownLedger (anti-spam)
         -> Suggestion        handed to the notifier; mentions are user IDs only
 
+Voice-aware "join" (Group Up): a player of game X sits in a voice channel and
+another player of X is outside voice -> the outsider is invited to that voice
+and, with ``ping_whole_voice``, everyone else in that voice channel is told
+too (``Suggestion.voice_crew_ids``), whether Discord shows them playing or
+not. Not showing "Playing" never excludes a member of the voice; opt-outs,
+per-user cooldowns and the crew size cap still do. Every person mentioned is
+decided here, from tracked Discord state - never by the AI wording.
+
 Persistence (opt-out, suggestion history, cooldowns) goes through a small
 ``PresenceStore`` interface; the bot backs it with the existing per-instance
 FeatureStore. Session state is rebuilt from Discord presence (which carries
@@ -27,8 +35,13 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
+import bot_i18n
+
 MIN_GROUP_SIZE = 2
 MAX_MENTIONS = 10
+# A bigger voice channel is a crowd, not a group to ping one by one: then only
+# the detected players are mentioned.
+MAX_VOICE_CREW = 10
 RESTART_GRACE_SECONDS = 120.0
 MAX_START_HINT_AGE_SECONDS = 24 * 3600.0
 MAX_HISTORY = 300
@@ -46,9 +59,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "group_cooldown_minutes": 180,
     "guild_cooldown_minutes": 15,
     "voice_aware": True,
+    # Group Up: also mention everyone else in the target voice channel.
+    "ping_whole_voice": True,
     "allowlist": [],
     "ignore_list": [],
     "ai_rewrite": False,
+    # Game Presence spoke Russian before languages existed: keep that for old configs.
+    "language": "ru",
 }
 LIMITS = {
     "delay_minutes": (1, 120),
@@ -112,9 +129,11 @@ class GamePresenceConfig:
     group_cooldown_seconds: float = 10800.0
     guild_cooldown_seconds: float = 900.0
     voice_aware: bool = True
+    ping_whole_voice: bool = True
     allowlist: frozenset[str] = frozenset()
     ignore_list: frozenset[str] = frozenset()
     ai_rewrite: bool = False
+    language: str = "ru"
 
     @property
     def active(self) -> bool:
@@ -152,10 +171,14 @@ def normalize_config_dict(raw: Any) -> dict[str, Any]:
         raise ValueError(f'Unknown "game_presence" setting: {unknown[0]}.')
     merged = {**DEFAULT_CONFIG, **raw}
     out: dict[str, Any] = {}
-    for flag in ("enabled", "voice_aware", "ai_rewrite"):
+    for flag in ("enabled", "voice_aware", "ping_whole_voice", "ai_rewrite"):
         if not isinstance(merged[flag], bool):
             raise ValueError(f'"game_presence.{flag}" must be true or false.')
         out[flag] = merged[flag]
+    try:
+        out["language"] = bot_i18n.normalize_language(merged["language"], DEFAULT_CONFIG["language"])
+    except bot_i18n.LanguageError as exc:
+        raise ValueError(f'"game_presence.language": {exc}') from exc
     guild_id = _snowflake(merged["guild_id"], "guild_id")
     channel_id = _snowflake(merged["channel_id"], "channel_id")
     out["guild_id"] = None if guild_id is None else str(guild_id)
@@ -225,9 +248,11 @@ def parse_config(raw: Any, normalizer: GameNormalizer | None = None) -> GamePres
         group_cooldown_seconds=data["group_cooldown_minutes"] * 60.0,
         guild_cooldown_seconds=data["guild_cooldown_minutes"] * 60.0,
         voice_aware=data["voice_aware"],
+        ping_whole_voice=data["ping_whole_voice"],
         allowlist=keys(data["allowlist"]),
         ignore_list=keys(data["ignore_list"]),
         ai_rewrite=data["ai_rewrite"],
+        language=data["language"],
     )
 
 
@@ -298,6 +323,10 @@ class ActivityTracker:
 
     def game_keys(self, guild_id: int) -> list[str]:
         return [key for (guild, key) in self._index if guild == guild_id]
+
+    def voice_members(self, guild_id: int, channel_id: int) -> tuple[int, ...]:
+        """Everyone tracked in that voice channel (bots are never tracked), playing or not."""
+        return tuple(sorted(user for (guild, user), channel in self._voice.items() if guild == guild_id and channel == channel_id))
 
     def player_count(self, guild_id: int) -> int:
         return sum(1 for (guild, _user) in self._games if guild == guild_id)
@@ -400,11 +429,19 @@ class Suggestion:
     guild_id: int
     game_key: str
     game_display_name: str
-    kind: str  # "gather" (nobody together) or "join" (some already share a voice channel)
+    kind: str  # "gather" (nobody in voice), "join" (one voice target), or "split_voice" (multiple voice channels)
     target_user_ids: tuple[int, ...]  # everyone mentioned, in message order
     outsider_user_ids: tuple[int, ...] = ()  # join: players not in the voice channel
     voice_member_ids: tuple[int, ...] = ()  # join: players already in the voice channel
     voice_channel_id: int | None = None
+    # join + ping_whole_voice: the other people in that voice channel (no
+    # visible "Playing" of this game), opt-outs and cooled-down users removed.
+    voice_crew_ids: tuple[int, ...] = ()
+
+    @property
+    def mentioned_user_ids(self) -> tuple[int, ...]:
+        """Exactly the users the message may ping (allowed_mentions), in message order."""
+        return self.target_user_ids + tuple(user for user in self.voice_crew_ids if user not in self.target_user_ids)
 
 
 @dataclass(frozen=True)
@@ -413,6 +450,8 @@ class PolicyContext:
     config: GamePresenceConfig
     is_muted: Callable[[int, int], bool]
     ledger: "CooldownLedger"
+    # (guild_id, voice channel id) -> everyone tracked in that voice channel.
+    voice_members: Callable[[int, int], tuple[int, ...]] | None = None
 
 
 class SuggestionPolicy(Protocol):
@@ -483,7 +522,7 @@ class DefaultSuggestionPolicy:
         target_ids = tuple(record.user_id for record in eligible)
         if ledger.group_recently_suggested(group.guild_id, group.game_key, target_ids, now, config):
             return None, Diagnosis("group_cooldown", f"These players were already invited to {game} recently (group cooldown).")
-        return self._suggestion(group, config, eligible, target_ids), None
+        return self._suggestion(group, config, eligible, target_ids, context), None
 
     @staticmethod
     def _last(context: PolicyContext, guild_id: int, key: str) -> float | None:
@@ -491,30 +530,69 @@ class DefaultSuggestionPolicy:
         return float(value) if isinstance(value, (int, float)) else None
 
     @staticmethod
-    def _suggestion(group: CandidateGroup, config: GamePresenceConfig, eligible: list[ActivityRecord], target_ids: tuple[int, ...]) -> Suggestion:
+    def voice_crew(group: CandidateGroup, context: PolicyContext, channel_id: int, players: tuple[int, ...]) -> tuple[int, ...]:
+        """The rest of the target voice channel: opted-out and cooled-down
+        members are left out; a crowd (> MAX_VOICE_CREW) is not pinged at all."""
+        config = context.config
+        if not config.ping_whole_voice or context.voice_members is None:
+            return ()
+        try:
+            present = context.voice_members(group.guild_id, channel_id)
+        except Exception:
+            return ()
+        crew = tuple(
+            user_id
+            for user_id in present
+            if user_id not in players
+            and not context.is_muted(group.guild_id, user_id)
+            and context.ledger.user_available(group.guild_id, user_id, context.now, config)
+        )
+        return crew if len(crew) <= MAX_VOICE_CREW else ()
+
+    @classmethod
+    def _suggestion(
+        cls,
+        group: CandidateGroup,
+        config: GamePresenceConfig,
+        eligible: list[ActivityRecord],
+        target_ids: tuple[int, ...],
+        context: PolicyContext | None = None,
+    ) -> Suggestion:
         if config.voice_aware:
-            cluster_channel, cluster = _largest_voice_cluster(eligible)
-            if cluster_channel is not None and len(cluster) >= MIN_GROUP_SIZE:
+            clusters = _voice_clusters(eligible)
+            if len(clusters) == 1:
+                cluster_channel, cluster = next(iter(clusters.items()))
                 outsiders = tuple(record.user_id for record in eligible if record.voice_channel_id != cluster_channel)
-                insiders = tuple(record.user_id for record in cluster)
-                return Suggestion(
-                    group.guild_id,
-                    group.game_key,
-                    group.game_display_name,
-                    "join",
-                    outsiders + insiders,
-                    outsiders,
-                    insiders,
-                    cluster_channel,
-                )
+                if outsiders:
+                    insiders = tuple(record.user_id for record in cluster)
+                    players = tuple(record.user_id for record in group.members)
+                    crew = () if context is None else cls.voice_crew(group, context, cluster_channel, players)
+                    return Suggestion(
+                        group.guild_id,
+                        group.game_key,
+                        group.game_display_name,
+                        "join",
+                        outsiders + insiders,
+                        outsiders,
+                        insiders,
+                        cluster_channel,
+                        crew,
+                    )
+            elif len(clusters) > 1:
+                return Suggestion(group.guild_id, group.game_key, group.game_display_name, "split_voice", target_ids)
         return Suggestion(group.guild_id, group.game_key, group.game_display_name, "gather", target_ids)
 
 
-def _largest_voice_cluster(records: Iterable[ActivityRecord]) -> tuple[int | None, list[ActivityRecord]]:
+def _voice_clusters(records: Iterable[ActivityRecord]) -> dict[int, list[ActivityRecord]]:
     clusters: dict[int, list[ActivityRecord]] = {}
     for record in records:
         if record.voice_channel_id is not None:
             clusters.setdefault(record.voice_channel_id, []).append(record)
+    return clusters
+
+
+def _largest_voice_cluster(records: Iterable[ActivityRecord]) -> tuple[int | None, list[ActivityRecord]]:
+    clusters = _voice_clusters(records)
     if not clusters:
         return None, []
     channel_id, members = max(clusters.items(), key=lambda item: (len(item[1]), -item[0]))
@@ -636,6 +714,7 @@ class CooldownLedger:
                 "name": suggestion.game_display_name,
                 "users": [str(user) for user in suggestion.target_user_ids],
                 "at": now,
+                **({"crew": [str(user) for user in suggestion.voice_crew_ids]} if suggestion.voice_crew_ids else {}),
             }
         )
         users = {
@@ -643,7 +722,8 @@ class CooldownLedger:
             for key, value in (state.get("users") or {}).items()
             if isinstance(value, (int, float)) and now - value < config.user_cooldown_seconds
         }
-        for user_id in suggestion.target_user_ids:
+        # The voice crew was pinged as well: same per-user cooldown.
+        for user_id in suggestion.mentioned_user_ids:
             users[str(user_id)] = now
         state["history"] = history[-MAX_HISTORY:]
         state["users"] = users
@@ -760,7 +840,7 @@ class GamePresenceEngine:
                     (left, Diagnosis("waiting_delay", f"Waiting: {len(group.members)} players in {group.game_display_name}, check in {_minutes(left)}."))
                 )
                 continue
-            context = PolicyContext(now, config, self.preferences.is_muted, self.ledger)
+            context = PolicyContext(now, config, self.preferences.is_muted, self.ledger, self.tracker.voice_members)
             if callable(decide):
                 suggestion, reason = decide(group, context)
             else:

@@ -39,7 +39,7 @@ def presence_state_store(path):
 
 GUILD = 1
 CHANNEL = 2
-A, B, C, D = 101, 102, 103, 104
+A, B, C, D, E = 101, 102, 103, 104, 105
 OW = "Overwatch 2"
 
 
@@ -161,6 +161,66 @@ class EngineScenarioTests(unittest.TestCase):
         play(engine, C)
         engine.tick()
         self.assertEqual(run_until(engine, clock, 200)[0].kind, "gather")
+
+    def test_voice_aware_distinguishes_absent_single_group_split_and_same_voice(self):
+        # Everyone outside voice: neutral gather, not "different voice channels".
+        engine, clock = make_engine()
+        play(engine, A)
+        play(engine, B)
+        produced = run_until(engine, clock, 200)
+        self.assertEqual(produced[0].kind, "gather")
+        text = gpd.render_message(produced[0], None)
+        self.assertIn("соберётесь в войсе", text)
+        self.assertNotIn("разных войсах", text)
+
+        # One player is already in voice: invite the outsider to that player/channel.
+        engine, clock = make_engine()
+        play(engine, A, voice=500)
+        play(engine, B)
+        produced = run_until(engine, clock, 200)
+        self.assertEqual(produced[0].kind, "join")
+        self.assertEqual(produced[0].outsider_user_ids, (B,))
+        self.assertEqual(produced[0].voice_member_ids, (A,))
+        self.assertEqual(produced[0].voice_channel_id, 500)
+        text = gpd.render_message(produced[0], "Gaming")
+        self.assertTrue(text.startswith(f"<@{B}>, <@{A}> уже играет в **Overwatch 2** и сидит в **Gaming**"))
+
+        # Existing voice group plus outsiders: invite outsiders to the group.
+        engine, clock = make_engine()
+        play(engine, A, voice=500)
+        play(engine, B, voice=500)
+        play(engine, C)
+        play(engine, D)
+        produced = run_until(engine, clock, 200)
+        self.assertEqual(produced[0].kind, "join")
+        self.assertEqual(produced[0].outsider_user_ids, (C, D))
+        self.assertEqual(produced[0].voice_member_ids, (A, B))
+
+        # Different voice channels: only this case uses split/different-voice wording.
+        engine, clock = make_engine()
+        play(engine, A, voice=500)
+        play(engine, B, voice=501)
+        produced = run_until(engine, clock, 200)
+        self.assertEqual(produced[0].kind, "split_voice")
+        text = gpd.render_message(produced[0], None)
+        self.assertIn("разных войсах", text)
+
+        # Multiple voice groups: also split voice, not join-to-one-cluster.
+        engine, clock = make_engine()
+        play(engine, A, voice=500)
+        play(engine, B, voice=500)
+        play(engine, C, voice=501)
+        play(engine, D, voice=501)
+        produced = run_until(engine, clock, 200)
+        self.assertEqual(produced[0].kind, "split_voice")
+        self.assertEqual(produced[0].target_user_ids, (A, B, C, D))
+
+        # Everyone already together: still silent.
+        engine, clock = make_engine()
+        play(engine, A, voice=500)
+        play(engine, B, voice=500)
+        play(engine, C, voice=500)
+        self.assertEqual(run_until(engine, clock, 200), [])
 
     def test_muted_users_are_never_targets_and_too_few_targets_means_silence(self):
         engine, clock = make_engine()
@@ -330,23 +390,23 @@ class PreferenceButtonTests(unittest.IsolatedAsyncioTestCase):
     async def test_mute_and_allow_are_persistent_idempotent_ephemeral_and_personal(self):
         interaction, response = click(gpd.CUSTOM_ID_MUTE, A)
         self.assertTrue(await gpd.handle_preference_interaction(interaction, self.book()))
-        self.assertEqual(response.sent[0][0], gpd.PREF_MUTED)
+        self.assertEqual(response.sent[0][0], gpd.bot_i18n.tr("ru", gpd.PREF_MUTED))
         self.assertIs(response.sent[0][1]["ephemeral"], True)
         self.assertTrue(self.book().is_muted(GUILD, A))  # persisted (new store object)
         self.assertFalse(self.book().is_muted(GUILD, B))  # nobody else changed
 
         interaction, response = click(gpd.CUSTOM_ID_MUTE, A)
         await gpd.handle_preference_interaction(interaction, self.book())
-        self.assertEqual(response.sent[0][0], gpd.PREF_ALREADY_MUTED)
+        self.assertEqual(response.sent[0][0], gpd.bot_i18n.tr("ru", gpd.PREF_ALREADY_MUTED))
 
         interaction, response = click(gpd.CUSTOM_ID_ALLOW, A)
         await gpd.handle_preference_interaction(interaction, self.book())
-        self.assertEqual(response.sent[0][0], gpd.PREF_ALLOWED)
+        self.assertEqual(response.sent[0][0], gpd.bot_i18n.tr("ru", gpd.PREF_ALLOWED))
         self.assertFalse(self.book().is_muted(GUILD, A))
 
         interaction, response = click(gpd.CUSTOM_ID_ALLOW, A)
         await gpd.handle_preference_interaction(interaction, self.book())
-        self.assertEqual(response.sent[0][0], gpd.PREF_ALREADY_ALLOWED)
+        self.assertEqual(response.sent[0][0], gpd.bot_i18n.tr("ru", gpd.PREF_ALREADY_ALLOWED))
 
     async def test_actor_is_only_interaction_user_and_state_is_per_guild(self):
         interaction, _ = click(gpd.CUSTOM_ID_MUTE, B)
@@ -367,10 +427,55 @@ class FakeTextChannel:
         self.id = channel_id
         self.name = name
         self.sent = []
+        self.fail_send = False
 
     async def send(self, content, **kwargs):
+        if self.fail_send:
+            raise RuntimeError("send failed")
         self.sent.append((content, kwargs))
         return types.SimpleNamespace(id=777)
+
+
+class FakeRole:
+    def __init__(self, role_id, name):
+        self.id = role_id
+        self.name = name
+        self.mention = f"<@&{role_id}>"
+        self.deleted = False
+
+    async def delete(self, **kwargs):
+        self.deleted = True
+
+
+class FakeVoiceChannel:
+    def __init__(self, channel_id, name):
+        self.id = channel_id
+        self.name = name
+        self.members = []
+
+
+class FakeMember:
+    def __init__(self, guild, user_id, game=None, voice=False, bot=False):
+        self.id = user_id
+        self.guild = guild
+        self.bot = bot
+        self.activities = [discord.Game(name=game)] if game else []
+        self.roles = []
+        self.added_roles = []
+        self.removed_roles = []
+        self.voice = types.SimpleNamespace(channel=guild.voice) if voice else None
+        if voice:
+            guild.voice.members.append(self)
+
+    async def add_roles(self, role, **kwargs):
+        self.added_roles.append(role)
+        if role not in self.roles:
+            self.roles.append(role)
+
+    async def remove_roles(self, role, **kwargs):
+        self.removed_roles.append(role)
+        if role in self.roles:
+            self.roles.remove(role)
 
 
 class FakeGuild:
@@ -378,22 +483,28 @@ class FakeGuild:
         self.id = GUILD
         self.name = "Null"
         self.text = FakeTextChannel(CHANNEL, "games")
-        self.voice = types.SimpleNamespace(id=500, name="Gaming")
+        self.voice = FakeVoiceChannel(500, "Gaming")
         self.members = []
+        self.roles = []
+        self.role_counter = 9000
+        self.fail_create_role = False
 
     def get_channel(self, channel_id):
         return {CHANNEL: self.text, 500: self.voice}.get(channel_id)
 
+    async def create_role(self, *, name, mentionable=False, permissions=None, reason=None):
+        if self.fail_create_role:
+            raise RuntimeError("Missing Manage Roles")
+        self.role_counter += 1
+        role = FakeRole(self.role_counter, name)
+        role.mentionable = mentionable
+        role.permissions = permissions
+        self.roles.append(role)
+        return role
+
 
 def member(guild, user_id, game=None, voice=False):
-    activities = [discord.Game(name=game)] if game else []
-    return types.SimpleNamespace(
-        id=user_id,
-        guild=guild,
-        bot=False,
-        activities=activities,
-        voice=types.SimpleNamespace(channel=guild.voice) if voice else None,
-    )
+    return FakeMember(guild, user_id, game, voice)
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -415,18 +526,26 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         clock.advance(200)
         return await runtime.tick()
 
+    async def post_members_after_delay(self, runtime, guild, clock, members):
+        guild.members = members
+        runtime.seed()
+        await runtime.tick()
+        clock.advance(200)
+        return await runtime.tick()
+
     async def test_public_suggestion_with_buttons_and_only_approved_mentions(self):
         runtime, guild, clock = self.make_runtime()
         self.assertEqual(await self.post_after_delay(runtime, guild, clock), 1)
         content, kwargs = guild.text.sent[0]
-        self.assertEqual(content, f"<@{A}> <@{B}>, вы оба уже несколько минут в **Overwatch 2** и не в одном войсе. Может, соберётесь?")
+        self.assertEqual(content, f"<@{A}> <@{B}>, вы оба уже несколько минут в **Overwatch 2**. Может, соберётесь в войсе?")
         self.assertNotIn("ephemeral", kwargs)
         mentions = kwargs["allowed_mentions"]
         self.assertFalse(mentions.everyone)
         self.assertFalse(mentions.roles)
         self.assertEqual(sorted(user.id for user in mentions.users), [A, B])
         labels = [item.label for item in kwargs["view"].children]
-        self.assertEqual(labels, ["Mute pings", "Allow pings"])
+        # The bot's language (default for Game Presence: Russian) labels the buttons too.
+        self.assertEqual(labels, ["Отключить пинги", "Включить пинги"])
         self.assertEqual([item.custom_id for item in kwargs["view"].children], [gpd.CUSTOM_ID_MUTE, gpd.CUSTOM_ID_ALLOW])
         status = json.loads((runtime.runtime_dir / gpd.STATUS_FILE_NAME).read_text(encoding="utf-8"))
         self.assertEqual(status["channel_name"], "games")
@@ -473,14 +592,133 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.post_after_delay(runtime, guild, clock), 1)
         self.assertIn("вы оба уже несколько минут", guild.text.sent[0][0])
 
+    async def test_whole_voice_mentions_everyone_in_the_voice_channel(self):
+        runtime, guild, clock = self.make_runtime()
+        in_voice = member(guild, A, OW, voice=True)
+        outsider = member(guild, B, OW)
+        hidden_one = member(guild, C, None, voice=True)  # in voice, Discord shows no game
+        hidden_two = member(guild, D, "Minecraft", voice=True)  # in voice, another game
+        guild.roles.append(FakeRole(7000, "Group Up: Raid night"))  # a server role that only looks similar
+
+        self.assertEqual(await self.post_members_after_delay(runtime, guild, clock, [in_voice, outsider, hidden_one, hidden_two]), 1)
+
+        content, kwargs = guild.text.sent[0]
+        self.assertEqual(
+            content,
+            f"<@{B}>, <@{A}> уже играет в **Overwatch 2** и сидит в **Gaming**. Залетай! <@{C}> и <@{D}>, к вам, возможно, присоединятся.",
+        )
+        # Exactly the engine's people: outsider, the player in voice, the rest of that voice channel.
+        self.assertEqual([user.id for user in kwargs["allowed_mentions"].users], [B, A, C, D])
+        self.assertFalse(kwargs["allowed_mentions"].roles)
+        self.assertFalse(kwargs["allowed_mentions"].everyone)
+        # Plain user mentions: no role is created, nothing to clean up, other roles untouched.
+        self.assertEqual([role.name for role in guild.roles], ["Group Up: Raid night"])
+        self.assertFalse(guild.roles[0].deleted)
+        self.assertEqual([m.added_roles for m in (in_voice, outsider, hidden_one, hidden_two)], [[], [], [], []])
+
+    async def test_whole_voice_respects_opt_out_cooldown_setting_and_crowds(self):
+        runtime, guild, clock = self.make_runtime()
+        in_voice = member(guild, A, OW, voice=True)
+        hidden = member(guild, D, None, voice=True)
+        muted_hidden = member(guild, E, None, voice=True)
+        outsider_one = member(guild, B, OW)
+        outsider_two = member(guild, C, OW)
+        runtime.engine.preferences.set_muted(GUILD, E, True)
+        self.assertEqual(
+            await self.post_members_after_delay(runtime, guild, clock, [in_voice, outsider_one, outsider_two, hidden, muted_hidden]),
+            1,
+        )
+        content, kwargs = guild.text.sent[0]
+        self.assertEqual([user.id for user in kwargs["allowed_mentions"].users], [B, C, A, D])
+        self.assertNotIn(f"<@{E}>", content)  # opted out: never mentioned
+        self.assertTrue(content.endswith(f"Залетайте! <@{D}>, к вам, возможно, присоединятся."))
+        # The voice crew was pinged: it gets the per-user cooldown like the players.
+        self.assertFalse(runtime.engine.ledger.user_available(GUILD, D, clock.now, runtime.engine.config))
+        self.assertEqual(runtime.engine.ledger.last_suggestion(GUILD)["crew"], [str(D)])
+
+        # Switched off: only the detected players.
+        runtime, guild, clock = self.make_runtime(ping_whole_voice=False)
+        members = [member(guild, A, OW, voice=True), member(guild, B, OW), member(guild, C, None, voice=True)]
+        await self.post_members_after_delay(runtime, guild, clock, members)
+        content, kwargs = guild.text.sent[0]
+        self.assertEqual([user.id for user in kwargs["allowed_mentions"].users], [B, A])
+        self.assertNotIn(f"<@{C}>", content)
+
+        # A crowd in the voice channel is not pinged person by person.
+        runtime, guild, clock = self.make_runtime()
+        crowd = [member(guild, 5000 + index, None, voice=True) for index in range(gp.MAX_VOICE_CREW + 1)]
+        await self.post_members_after_delay(runtime, guild, clock, [member(guild, A, OW, voice=True), member(guild, B, OW), *crowd])
+        self.assertEqual([user.id for user in guild.text.sent[0][1]["allowed_mentions"].users], [B, A])
+
+    async def test_failed_send_marks_nothing_and_leaves_nothing_behind(self):
+        runtime, guild, clock = self.make_runtime()
+        members = [member(guild, A, OW, voice=True), member(guild, B, OW), member(guild, C, None, voice=True)]
+        guild.text.fail_send = True
+        self.assertEqual(await self.post_members_after_delay(runtime, guild, clock, members), 0)
+        self.assertEqual(guild.text.sent, [])
+        self.assertEqual(guild.roles, [])
+        self.assertIn("Posting failed", runtime.problem)
+        self.assertIsNone(runtime.engine.ledger.last_suggestion(GUILD))  # retried later, nobody put on cooldown
+        self.assertTrue(runtime.engine.ledger.user_available(GUILD, C, clock.now, runtime.engine.config))
+
+    async def test_post_is_announced_on_the_bot_event_bus(self):
+        import bot_events
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        runtime, guild, clock = self.make_runtime()
+        runtime.events = bot_events.EventPublisher("gp-main", "game_presence", Path(temp.name), clock=clock)
+        members = [member(guild, A, OW, voice=True), member(guild, B, OW), member(guild, C, None, voice=True)]
+        await self.post_members_after_delay(runtime, guild, clock, members)
+        events = bot_events.read_file(Path(temp.name) / "gp-main.json")
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual((event.kind, event.guild_id, event.channel_id, event.message_id), ("group_up.suggested", GUILD, CHANNEL, 777))
+        self.assertEqual(event.data["invited_user_ids"], [str(B)])
+        self.assertEqual(event.data["voice_player_ids"], [str(A)])
+        self.assertEqual(event.data["voice_crew_ids"], [str(C)])
+        self.assertEqual((event.data["game"], event.data["voice_channel_name"]), ("Overwatch 2", "Gaming"))
+
+    async def test_ai_wording_keeps_the_crew_placeholder_and_blocks_extra_mentions(self):
+        contexts = []
+
+        async def sneaky(template, suggestion, context=None):
+            contexts.append(context)
+            return "{targets}, <@999> @here {crew} в {game}?"
+
+        runtime, guild, clock = self.make_runtime(rewriter=sneaky, ai_rewrite=True)
+        members = [member(guild, A, OW, voice=True), member(guild, B, OW), member(guild, C, None, voice=True)]
+        self.assertEqual(await self.post_members_after_delay(runtime, guild, clock, members), 1)
+        content, kwargs = guild.text.sent[0]
+        self.assertTrue(contexts[0]["notifies_rest_of_voice"])
+        self.assertEqual(contexts[0]["rest_of_voice_count"], 1)
+        self.assertIn("crew", contexts[0]["required_placeholders"])
+        self.assertNotIn("<@999>", content)  # rejected -> deterministic template
+        self.assertNotIn("@here", content)
+        self.assertIn("к вам, возможно, присоединятся", content)
+        self.assertEqual([user.id for user in kwargs["allowed_mentions"].users], [B, A, C])
+
+        async def friendly(template, suggestion, context=None):
+            return "{targets}, {others} уже в {channel} с {game} — залетай! {crew}, встречайте."
+
+        runtime, guild, clock = self.make_runtime(rewriter=friendly, ai_rewrite=True)
+        members = [member(guild, A, OW, voice=True), member(guild, B, OW), member(guild, C, None, voice=True)]
+        await self.post_members_after_delay(runtime, guild, clock, members)
+        content, kwargs = guild.text.sent[0]
+        self.assertEqual(content, f"<@{B}>, <@{A}> уже в **Gaming** с **Overwatch 2** — залетай! <@{C}>, встречайте.")
+        self.assertEqual([user.id for user in kwargs["allowed_mentions"].users], [B, A, C])
+
     def test_validate_rewrite_rules(self):
         template = gpd.TEMPLATE_PAIR
         self.assertIsNone(gpd.validate_rewrite("{targets} {targets} {game}", template))
         self.assertIsNone(gpd.validate_rewrite("{targets} {game} {admins}", template))
-        self.assertIsNone(gpd.validate_rewrite("{game} {targets}", template))
+        self.assertIsNone(gpd.validate_rewrite("{game} is waiting, " + "really " * 8 + "{targets}", template))  # addressee buried
         self.assertIsNone(gpd.validate_rewrite("{targets} @everyone {game}", template))
         self.assertIsNone(gpd.validate_rewrite("{targets} https://x.y {game}", template))
         self.assertEqual(gpd.validate_rewrite(" {targets}, в {game}? ", template), "{targets}, в {game}?")
+        # Natural openings are fine as long as the invited people come early.
+        self.assertEqual(gpd.validate_rewrite("Эй, {targets}, в {game}?", template, "ru"), "Эй, {targets}, в {game}?")
+        self.assertIsNone(gpd.validate_rewrite("Hey {targets}, {game}?", template, "ru"))  # wrong language
 
     def test_status_survives_unreadable_engine_state(self):
         class BrokenStore:
@@ -720,7 +958,7 @@ class GamePresenceBotTests(unittest.IsolatedAsyncioTestCase):
         interaction, response = click(gpd.CUSTOM_ID_MUTE, A)
         interaction.type = discord.InteractionType.component
         await bot.on_interaction(interaction)
-        self.assertEqual(response.sent[0][0], gpd.PREF_MUTED)
+        self.assertEqual(response.sent[0][0], gpd.bot_i18n.tr("ru", gpd.PREF_MUTED))
         self.assertIs(response.sent[0][1]["ephemeral"], True)
         state_file = self.instance.paths.data_dir / self.G.STATE_FILE_NAME
         self.assertTrue(state_file.is_file())
@@ -747,7 +985,7 @@ class GamePresenceBotTests(unittest.IsolatedAsyncioTestCase):
         interaction, response = click(gpd.CUSTOM_ID_MUTE, A)
         interaction.type = discord.InteractionType.component
         await bot.on_interaction(interaction)
-        self.assertEqual(response.sent[0][0], gpd.PREF_UNAVAILABLE)
+        self.assertEqual(response.sent[0][0], gpd.bot_i18n.tr("ru", gpd.PREF_UNAVAILABLE))
         # The Manager reads the reason from the status file (written although
         # the engine status itself cannot be read).
         status = json.loads((self.instance.paths.runtime_dir / gpd.STATUS_FILE_NAME).read_text(encoding="utf-8"))

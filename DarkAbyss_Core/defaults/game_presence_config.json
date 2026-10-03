@@ -7,7 +7,9 @@
   "group_cooldown_minutes": 180,
   "guild_cooldown_minutes": 15,
   "voice_aware": true,
+  "ping_whole_voice": true,
   "allowlist": [],
   "ignore_list": [],
-  "ai_rewrite": false
+  "ai_rewrite": false,
+  "language": "ru"
 }

@@ -210,6 +210,41 @@ def muted(text: str = "") -> QLabel:
     return label
 
 
+class SaveIndicator(QLabel):
+    """One line under a settings form: does the form show what is saved?
+
+    states: "clean" (form = saved config), "dirty" (changed, not saved yet),
+    "saved" (just saved; says when it applies), "error" (not saved), "disabled".
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("", parent)
+        self.setWordWrap(True)
+        self.state = "clean"
+        self.show_clean()
+
+    def _show(self, state: str, text: str, color: str) -> None:
+        self.state = state
+        self.setText(text)
+        colored(self, color)
+
+    def show_clean(self, text: str = "Showing the saved settings of this bot.") -> None:
+        self._show("clean", text, "muted")
+
+    def show_dirty(self, text: str = "● Unsaved changes — press Save to keep them.") -> None:
+        self._show("dirty", text, "warn")
+
+    def show_saved(self, note: str = "", at: datetime | None = None) -> None:
+        stamp = (at or datetime.now()).strftime("%H:%M:%S")
+        self._show("saved", f"✓ Saved at {stamp}." + (f" {note}" if note else ""), "ok")
+
+    def show_error(self, text: str) -> None:
+        self._show("error", f"✗ Not saved: {text}", "bad")
+
+    def show_disabled(self, text: str) -> None:
+        self._show("disabled", text, "muted")
+
+
 class ClickableFrame(QFrame):
     clicked = Signal()
 

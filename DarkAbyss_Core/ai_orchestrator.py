@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
 import admin_tools
 import ai_platform
+import bot_i18n
 
 
 MAX_PROVIDER_ATTEMPTS = 4
@@ -37,6 +38,9 @@ SYSTEM_INSTRUCTION = (
     "Do not invent tool names. Do not claim a tool succeeded before receiving its tool result. "
     "Ask for clarification in visible text when required data is missing."
 )
+
+
+REASONING_EFFORTS = ("low", "medium", "high")
 
 
 class OrchestratorError(ai_platform.AIPlatformError):
@@ -98,6 +102,15 @@ class OrchestratorRequest:
     # False: never switch to a routing fallback profile automatically; the
     # caller asks the user first (see AIOrchestrator.alternative_profile).
     auto_fallback: bool = True
+    # Language of the bot instance ("en"/"ru"): a mandatory system rule in
+    # every provider call of this request (see _initial_history).
+    response_language: str | None = None
+    # Reasoning effort for THIS request only ("low"/"medium"/"high"), over the
+    # routed profile's own setting; applied only where the provider supports
+    # that level (ai_providers catalog), otherwise the profile stays as it is.
+    # Kairo's Social Awareness analysis uses "high"; everything else keeps the
+    # profile's effort.
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -115,6 +128,10 @@ class OrchestratorRequest:
             raise ValueError("recover_errors must be boolean.")
         if type(self.auto_fallback) is not bool:
             raise ValueError("auto_fallback must be boolean.")
+        if self.response_language is not None:
+            object.__setattr__(self, "response_language", bot_i18n.normalize_language(self.response_language))
+        if self.reasoning_effort is not None and self.reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("reasoning_effort must be low, medium or high.")
         if self.allowed_tool_names is not None:
             object.__setattr__(self, "allowed_tool_names", _coerce_allowed_tool_names(self.allowed_tool_names))
 
@@ -306,6 +323,27 @@ class _RunContext:
     tools: tuple[Mapping[str, Any], ...]
     confirmation_policy: ConfirmationPolicy
     recover_errors: bool = False
+    reasoning_effort: str | None = None
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return request_options(self.profile, self.reasoning_effort)
+
+
+def request_options(profile: ai_platform.AIProfile, reasoning_effort: str | None) -> Mapping[str, Any]:
+    """The profile's provider options, with ``reasoning_effort`` for this request
+    when the provider supports that level (unknown providers stay unchanged)."""
+    if reasoning_effort is None:
+        return profile.options
+    try:
+        import ai_providers
+
+        spec = ai_providers.get_spec(profile.provider_id)
+    except Exception:
+        return profile.options
+    if "reasoning_effort" not in spec.options or reasoning_effort not in spec.reasoning_levels:
+        return profile.options
+    return {**dict(profile.options), "reasoning_effort": reasoning_effort}
 
 
 @dataclass(frozen=True)
@@ -499,10 +537,11 @@ class AIOrchestrator:
                 tools=tools,
                 confirmation_policy=confirmation_policy,
                 recover_errors=request.recover_errors,
+                reasoning_effort=request.reasoning_effort,
             )
             result = await self._run_loop(
                 context=context,
-                history=_initial_history(request.messages),
+                history=_initial_history(request.messages, request.response_language),
                 executor=executor,
                 attempts=attempts,
                 executed_tools=(),
@@ -569,6 +608,7 @@ class AIOrchestrator:
         *,
         messages: tuple[ai_platform.AIMessage, ...],
         allowed_tool_names: tuple[str, ...] | None = None,
+        response_language: str | None = None,
     ) -> CompareResult:
         if not isinstance(compare_request, ai_platform.ComparePlanRequest):
             raise ValueError("compare_request must be a ComparePlanRequest.")
@@ -602,7 +642,7 @@ class AIOrchestrator:
             if selected is None:
                 candidates.append(CompareCandidate(profile_id, None, None, CompareStatus.UNAVAILABLE, message="Profile is unavailable."))
                 continue
-            history = _initial_history(messages)
+            history = _initial_history(messages, response_language)
             try:
                 response = await selected.provider.generate(
                     ai_platform.AIRequest(
@@ -852,7 +892,7 @@ class AIOrchestrator:
                         model_id=context.profile.model_id,
                         messages=history,
                         tools=context.tools,
-                        options=context.profile.options,
+                        options=context.options,
                     ),
                     context.profile.credential_ref,
                 )
@@ -1187,8 +1227,12 @@ def _append_tool_round(
     return (*history, assistant, *tool_messages)
 
 
-def _initial_history(messages: tuple[ai_platform.AIMessage, ...]) -> tuple[ai_platform.AIMessage, ...]:
-    return (ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=SYSTEM_INSTRUCTION), *messages)
+def _initial_history(messages: tuple[ai_platform.AIMessage, ...], language: str | None = None) -> tuple[ai_platform.AIMessage, ...]:
+    system = (ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=SYSTEM_INSTRUCTION),)
+    if language is not None:
+        # The bot's language is part of the request, right after the core rules.
+        system += (ai_platform.AIMessage(role=ai_platform.MessageRole.SYSTEM, content=bot_i18n.ai_language_rule(language)),)
+    return (*system, *messages)
 
 
 def _provider_tool_schemas(allowed_tool_names: tuple[str, ...] | None) -> tuple[Mapping[str, Any], ...]:

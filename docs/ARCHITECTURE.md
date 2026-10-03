@@ -37,10 +37,14 @@ Manager
 │   ├── Discord Token A                instances/<admin>/secrets/token.txt
 │   ├── AI source: base set            instances/<admin>/data/ai_selection.json (absent = base set)
 │   └── AI usage A                     instances/<admin>/data/ai_usage.json
-└── Game Presence Bot instance (bot type "game_presence", GamePresence.py)
-    ├── Discord Token B                instances/<gp>/secrets/token.txt
-    ├── AI source: own → Groq backup   instances/<gp>/data/ai_selection.json
-    └── AI usage B                     instances/<gp>/data/ai_usage.json
+├── Game Presence Bot instance (bot type "game_presence", GamePresence.py)
+│   ├── Discord Token B                instances/<gp>/secrets/token.txt
+│   ├── AI source: own → Groq backup   instances/<gp>/data/ai_selection.json
+│   └── AI usage B                     instances/<gp>/data/ai_usage.json
+└── Stream Director Bot instance (bot type "stream_director", StreamDirector.py) — no AI
+    ├── Discord Token C                instances/<sd>/secrets/token.txt
+    ├── Twitch OAuth tokens            instances/<sd>/secrets/twitch_oauth.json
+    └── Sessions, community, inbox     instances/<sd>/data/stream_director_state.json
 ```
 
 Both run at the same time as separate processes (`--bot-runner admin` /
@@ -372,7 +376,7 @@ AI-6.1/6.2 harden the runtime and make the agent usable for multi-step work:
 - Engine switching (AI-6.3/6.4): the Discord transport sends `OrchestratorRequest(auto_fallback=False)` so routing fallbacks never switch engines silently. When the planning or execution engine fails (rate limit, outage), the transport asks `AIOrchestrator.alternative_profile(task_class, exclude)` (local checks only) and shows the failed engine, its sanitized reason (provider adapter error texts are kept; other exceptions stay type-name only), the actions already executed, and a "Continue with <engine>" / Cancel prompt bound to the requester. Continuing re-plans with the chosen engine (`manual_profile_id`) or restarts the executor on it with the same plan, the same confirmation policy and a system note listing the actions that already ran so they are not repeated. Failed engines are not offered again within the request. With no alternative the reply includes the reason. `auto_fallback=True` callers keep automatic fallback, which now also applies after read-only tools (they have no side effects). The bot exits with an actionable message (no traceback dialog) when Discord rejects the token.
 - Manager AI terminal (`admin_terminal.py`, `manager_terminal.py`): a file mailbox in the instance `runtime` folder (`ai_terminal/requests`, `ai_terminal/decisions`, `ai_terminal/events/<id>.jsonl`, `bot_status.json`); the bot polls it every 0.5 s (`terminal_loop`) and opens no port. Requests run through `AITransport.handle_manager_request` as the local operator (binding user ID 0, only for `ManagerInteraction` objects, which Discord can never produce): no AI whitelist and no requester hierarchy, bot hierarchy and every plan/destructive/engine-switch confirmation still apply. `ManagerInteraction` imitates the interaction API, so views become `approval` events and Manager clicks become decision files dispatched by `dispatch_view_decision`. Stale requests (>5 min) are refused; event files are purged after 24 h. `bot_status.json` lists servers and channels for the Manager pickers (refreshed on ready and every 30 s).
 - @mention requests: `ai_mention_enabled` + `ai_mention_channel_ids` (empty = every channel). A message pinging the bot user or its managed role (`guild.self_role`) starts the same public flow as the control channel (mention text stripped, buttons owner-only); non-whitelisted members get one refusal per 60 s. Requests the Message Content Intent (role pings carry no text without it).
-- Game Presence (separate bot type `game_presence` with its own Discord application, token and process; see "Game Presence Bot" below): `game_presence.py` is the pure domain (no discord import): `GameNormalizer` (trim/casefold key + display name, alias hook), `ActivityTracker` (current game + voice per member, index guild+game -> users, so selection is never O(n^2)), `SessionTracker` (session start per member+game, 120 s restart grace, Discord activity start used as hint), `CandidateSelector` (groups of >= 2 per guild+game, allow/ignore lists), pending candidates (created on first sight, re-checked against the CURRENT state after the delay, then re-armed; a group that falls apart is cancelled silently), replaceable `SuggestionPolicy` (default: >= 2 players settled for the delay, guild cooldown, opt-out + per-user cooldown filter the mention targets, all eligible in one voice -> nothing, group cooldown by >= 2-member overlap, optional voice-aware "join" suggestion, max 10 mentions), `PreferenceBook` and `CooldownLedger` over a `PresenceStore` (backed by the Game Presence instance's own `data/game_presence_state.json`, key `game_presence`, scoped per guild + user; the Admin bot's `admin_features.json` is not used). `game_presence_discord.py` reads `Member.activities` (Playing) and voice state, renders deterministic Russian templates, builds mentions only from approved IDs and sends with `AllowedMentions(users=targets, everyone=False, roles=False)`; persistent `dab:gp:mute`/`dab:gp:allow` buttons change only `interaction.user`'s state (ephemeral replies, idempotent); the optional AI rewrite may only rephrase a template with fixed placeholders and is validated by the runtime (fallback to the template on any failure). The settings are the Game Presence instance's top-level config (validated fail-closed by `normalize_bot_config`, which only differs from `normalize_config_dict` in treating "on but no server/channel yet" as "not configured"); live settings reload every 15 s. The bot writes `runtime/game_presence_status.json` for the Manager "Game Presence" page (settings, status, required intents, Save & Restart through the normal lifecycle path). Session state is rebuilt from presence after a restart; cooldowns/history persist, and pending delays always restart, so a restart never re-posts. Future large-server work: sampling, per-pool policies, sharding the tracker, batching status.
+- Game Presence (separate bot type `game_presence` with its own Discord application, token and process; see "Game Presence Bot" below): `game_presence.py` is the pure domain (no discord import): `GameNormalizer` (trim/casefold key + display name, alias hook), `ActivityTracker` (current game + voice per member, index guild+game -> users, so selection is never O(n^2)), `SessionTracker` (session start per member+game, 120 s restart grace, Discord activity start used as hint), `CandidateSelector` (groups of >= 2 per guild+game, allow/ignore lists), pending candidates (created on first sight, re-checked against the CURRENT state after the delay, then re-armed; a group that falls apart is cancelled silently), replaceable `SuggestionPolicy` (default: >= 2 players settled for the delay, guild cooldown, opt-out + per-user cooldown filter the mention targets, all eligible in one voice -> nothing, group cooldown by >= 2-member overlap, optional voice-aware "join" suggestion, max 10 mentions), `PreferenceBook` and `CooldownLedger` over a `PresenceStore` (backed by the Game Presence instance's own `data/game_presence_state.json`, key `game_presence`, scoped per guild + user; the Admin bot's `admin_features.json` is not used). `game_presence_discord.py` reads `Member.activities` (Playing) and voice state, renders deterministic templates in the instance language, builds mentions only from approved IDs and sends with `AllowedMentions(users=targets, everyone=False, roles=False)`; persistent `dab:gp:mute`/`dab:gp:allow` buttons change only `interaction.user`'s state (ephemeral replies, idempotent); the optional AI rewrite may only rephrase a template with fixed placeholders and is validated by the runtime (fallback to the template on any failure). The settings are the Game Presence instance's top-level config (validated fail-closed by `normalize_bot_config`, which only differs from `normalize_config_dict` in treating "on but no server/channel yet" as "not configured"); live settings reload every 15 s. The bot writes `runtime/game_presence_status.json` for the Manager "Game Presence" page (settings, status, required intents, Save & Restart through the normal lifecycle path). Session state is rebuilt from presence after a restart; cooldowns/history persist, and pending delays always restart, so a restart never re-posts. Future large-server work: sampling, per-pool policies, sharding the tracker, batching status.
 - Manager bot groups (`manager_groups.py`): Manager-only tabs stored in `config/manager_groups.json`; bots without an assignment are in "Main".
 - Message text: `ai_read_message_content` (default false) requests the Message Content Intent without a control channel. When the intent is off, `AdminToolContext.message_content=False`: text/link purge filters refuse with an actionable message instead of silently matching nothing, `get_recent_messages` adds a `content_note`, and the executor instruction says message text is unreadable.
 
@@ -460,6 +464,178 @@ Bot type `game_presence` (`bots/game_presence/manifest.json`, entrypoint `DarkAb
 - AI: optional wording only, through `InstanceAI` (this instance's `ai_storage` stores) and `TextOnlyAI`, which strips every tool from the request and never passes a tool executor, so Admin tools are unreachable.
 - Admin separation: `Admin.py` has no Game Presence import, listener, loop, intent or status. An old Admin config with a `game_presence` section still starts (root schema allows unknown keys) and the section is ignored, never deleted. The Manager "Game Presence" page lists only Game Presence instances, shows such leftover sections and imports them (settings; opt-outs/cooldowns only while the Game Presence bot is stopped, never overwriting its existing state) when the user clicks Import.
 - Manager: Bot Setup for this type has Name, Token, Presence + Server Members intents, Invite (View Channels + Send Messages, scope `bot`) and Ready; the AI terminal lists only Admin bots; the dashboard shows each type's capabilities.
+
+## Stream Director Bot
+
+Bot type `stream_director` (`bots/stream_director/manifest.json`, entrypoint `DarkAbyss_Core/StreamDirector.py`, defaults `DarkAbyss_Core/defaults/stream_director_config.json`). Its own Discord application, token, process, config, data and runtime; it shares only infrastructure (instance/config stores, `admin_terminal` status files and server/channel pickers, packaging) with the other types and imports nothing from Admin or Game Presence. AI is not used.
+
+Modules (each can change independently):
+
+```text
+stream_director_config.py   settings: defaults, limits, features, normalization (the whole instance config)
+stream_director.py          domain: sessions, moments (+clustering), challenges, polls/predictions, inbox,
+                            community points/levels/seasons, goals, recap, next-stream poll — no Discord, no network
+stream_director_store.py    persistence: one JSON state, atomic writes, backup, fail closed
+stream_director_twitch.py   Twitch: OAuth Device Code flow, token store, Helix, EventSub WebSocket supervisor
+stream_director_discord.py  Discord: live card + session thread, buttons/modals/slash commands, rendering
+StreamDirector.py           process: discord.Client wiring, 5 s tick, status file, single-instance lock
+manager_stream_director.py  Manager page: Twitch connect, Discord place, features, limits, status, inbox, recap
+```
+
+Domain contract: inputs are `StreamEvent` (normalized EventSub notification with its message id), `LiveStream` (Helix state for reconciliation) and `Actor` (Discord member or Twitch chatter, `team` = owner / Manage Server / Administrator / configured team role, or Twitch broadcaster/moderator badge). Outputs are `Effect`s that the Discord adapter turns into posts and edits, and `Outcome` (ok + private reply + effects) for member actions. The state is saved after every change.
+
+Session lifecycle: `stream.online` (or `/stream start` without Twitch) → `live`; `stream.offline` → `ending` for `end_grace_minutes`; a stream that comes back within the grace — even with a new Twitch stream id — resumes the same session; after the grace the session is finalized (points, counters, recap) and moved to history. Helix polling (every 2 minutes and right after every EventSub (re)connect) reconciles missed events: live without a session starts one with the real `started_at`, offline with a live session begins the grace, a different stream id after a long gap ends the old session and starts a new one, and a Twitch session not confirmed for 12 h is closed.
+
+Duplicates and replays: EventSub message ids are stored (24 h, at most 2000) in the state, so a repeated notification — also after a restart — is ignored; notifications older than 10 minutes are dropped (Twitch replay guidance); `stream.online` for a stream id the session already has is a no-op.
+
+Twitch transport: a public Twitch application (no client secret anywhere). The Manager runs the Device Code flow (`/oauth2/device`, polling `/oauth2/token`, `/oauth2/validate`) and writes `secrets/twitch_oauth.json` with a new `generation`; the bot refreshes tokens (rotating refresh token) and writes them only if the generation is unchanged (`save_if_current`), so a reconnect in the Manager is never overwritten. Scopes: `moderator:read:followers` (follower count), `channel:read:subscriptions`, `bits:read`, `user:read:chat` (chat commands and activity); a missing scope only disables its subscription. `TwitchSupervisor` keeps EventSub connected (welcome within 10 s → subscriptions with the session id; `session_reconnect` is followed without resubscribing; close, keepalive loss or errors reconnect with backoff and resubscribe; revocation of the stream subscriptions asks for a reconnect) and never raises: no Client ID, no account, auth failure or no network only change its `status` (`not_configured`, `not_connected`, `connecting`, `connected`, `auth_failed`, `error`). After an auth failure it waits for a new token instead of retrying the rejected one. HTTP goes only to `id.twitch.tv` / `api.twitch.tv`; tokens never appear in logs, status files, `repr` or the config.
+
+Discord surfaces: the configured stream channel gets one card per session (edited at most every 20 s: status, title, category, uptime, moments, challenges, inbox, community level) with a public thread for the session. Only useful events go to the thread (category changes, raids, challenge suggestions and decisions, poll results, goals and level-ups, the full recap); follows, subs, bits and chat are counted for the recap. At the end the card becomes the short recap without buttons and the thread is renamed. All posts use `AllowedMentions.none()` except the optional go-live role ping (exactly that role); user text is cleaned (control characters, length) on input and markdown/mention-escaped (`stream_director.md`) in posts, so masked links or fake `@everyone` cannot be created. Buttons and modals use custom ids that carry the entity id (`sd:card:moment`, `sd:ch:<id>:accept`, `sd:poll:<id>:vote:<i>`, `sd:inbox:<id>:done`) and are routed in `on_interaction`, so they work after a restart without in-memory views. Slash commands (`/moment`, `/challenge`, `/suggest`, `/poll`, `/prediction`, `/inbox`, `/community`, `/stream start|end`, `/goal add|remove`, `/nextstream`) are synced to the configured server. Intents: guilds + guild messages (activity count in the thread only; no Message Content, nothing privileged). Invite: View Channels, Send Messages, Embed Links, Read Message History, Create Public Threads, Send Messages in Threads, Manage Events; scopes `bot applications.commands`.
+
+Community mechanics: moments store the offset from the stream start minus a reaction lag; marks within `moment_cluster_seconds` are one cluster, notable when at least `notable_moment_min_users` different people (or the team) marked it; the recap links clusters to the VOD (`/helix/videos` by stream id) when the streamer keeps VODs. Challenges: suggest (duplicates become support), support, team accept/reject, then completed/failed; accepted ones carry over to the next stream (posted again at its start). Polls and predictions have up to 5 options, one vote per person (changeable), predictions lock and are resolved by the team — no points, no currency, no stakes. The inbox is one queue of questions, game suggestions, clips/links and topics plus waiting challenges (duplicates become votes), visible to the team with `/inbox` and on the Manager page. Progression is shared, not per user: streams, minutes live, completed (and attempted) challenges, polls, notable moments, raids and new followers add XP to the community level (level L starts at 50·L·(L−1) XP) and to the monthly season; goals (weekly / season / long-term, metrics from `stream_director.METRICS`) award a bonus once per period. After a stream with ≥2 game suggestions a 24 h "next stream" poll is posted in the channel; `/nextstream` creates a Discord Scheduled Event that mentions its result.
+
+Persistence and failure: `stream_director_state.json` is written atomically after every change, a backup is refreshed from a state that loaded fine (at start and every 5 minutes); an unreadable or malformed file makes the director unavailable (fail closed): nothing changes, buttons answer "not ready", the status and the Manager page explain how to restore the backup. A config problem is reported the same way; an unconfigured bot tracks nothing visible and posts nothing. Status for the Manager: `runtime/stream_director_status.json` (diagnosis, Twitch status without tokens, missing channel permissions, command sync, session/community/inbox summary, last recap).
+
+Manager: Add Bot → Stream Director Bot; Bot Setup has Name, Token, an intents step stating that nothing privileged is needed, Invite and Ready; the Stream Director page has the status, the Twitch connection (Client ID, Connect with the device code, Cancel, Disconnect with token revocation), the server/stream channel, team roles, go-live role, the seven feature switches, eight limits, the inbox and the last recap. Stream Director instances are not listed on the AI page or the AI terminal.
+
+## Bot Language (per instance)
+
+Every instance config has `language` (`"en"` or `"ru"`, schema pattern `^(en|ru)$`). It is a bot setting, not a
+program setting: two bots — also two of the same type — speak different languages at the same time. Defaults keep
+what each type did before languages existed: Admin `en`, Game Presence `ru`, Stream Director `en`; an old config
+without the key gets that default through the normal defaults merge.
+
+`bot_i18n.py` translates by the English text in the code (the key) into the Russian catalogs
+`bot_i18n_ru_admin.py`, `bot_i18n_ru_game_presence.py`, `bot_i18n_ru_stream_director.py`; placeholders are
+`str.format` names and a missing translation falls back to English. Stream Director and Game Presence pass their
+instance language explicitly (`Director._t`, `tr(language, …)`, render functions take `language`). The Admin bot,
+whose output is spread over many modules (commands, AI transport, admin tools, features, blueprint), sets its process
+language whenever it loads its config (`Admin.load_config`, `AITransport._try_load_config`) and uses `t(...)`; one
+bot process serves exactly one instance. Tool results and errors are translated where they are created, so `/execute`
+replies, the "actions already executed" list and plan previews follow the language. Slash command descriptions:
+Stream Director builds them in its language, Admin translates them through `BotLanguageTranslator` (descriptions only,
+for every Discord locale); both are registered at start, so a language change shows there after a restart while every
+reply, button and post switches live.
+
+AI: `OrchestratorRequest.response_language` puts `bot_i18n.ai_language_rule(language)` as a SYSTEM message right after
+the core rules into every provider call of the request (planning, tool rounds, final answer; also `compare_plans`).
+The Admin planner/executor instructions refer to that rule instead of "the user's language"; Game Presence passes
+its language to the wording rewrite. Tests: `tests/test_bot_languages.py` (catalog completeness, deterministic en/ru
+output of all three types, the rule in every provider call, old configs) and the Manager round-trip tests.
+
+## Manager Settings Feedback
+
+Pages: Bot Setup (all types), Kairo (Admin: language, Social Awareness), Game Presence, Stream Director. Showing a page
+again keeps unsaved edits of the same bot (still marked unsaved); Refresh asks before discarding them.
+
+Every settings form shows one line (`manager_dashboard.SaveIndicator`): the saved settings of which bot are shown,
+"● Unsaved changes" as soon as a control differs from the stored value, "✓ Saved at HH:MM:SS" plus when it applies
+(live within 15 s / next command / when the bot starts / restart required for a new token) or "✗ Not saved: …".
+After Save the form is reloaded from storage, so it always shows what is really stored. Switching to another bot or
+closing Bot Setup with unsaved changes asks first. A config that cannot be read locks the form (defaults are never
+shown as saved or written over it). Bot Setup also remembers the steps that happen outside the program — Discord
+Application ID, "intents enabled", "bot invited" — in `config/manager_setup.json` (Manager-side, no secrets), so
+reopening the wizard no longer shows them unchecked.
+
+## Group Up: Whole-Voice Invitations
+
+Voice-aware "join" (Game Presence): a player of game X is in a voice channel and another player of X is outside voice
+-> the outsider is invited to that channel. With `ping_whole_voice` (default on, Manager checkbox) the engine also puts
+the rest of that voice channel into `Suggestion.voice_crew_ids`: everyone the tracker sees there (bots are never
+tracked), whether Discord shows them playing or not - not showing "Playing" never excludes a voice member. Opted-out
+members and members under the per-user cooldown are left out, more than `MAX_VOICE_CREW` (10) are not pinged one by one,
+and the crew gets the per-user cooldown after the post. Semantics kept from before: everyone outside voice -> "gather",
+several voice channels -> "split_voice", all in one channel -> nothing, third player during the delay -> one message.
+
+The notification is plain user mentions (`allowed_mentions.users` = exactly `Suggestion.mentioned_user_ids`, roles and
+everyone off). The earlier temporary-role variant was replaced: it needed Manage Roles (which the Game Presence invite
+does not ask for, so it always fell back), its stale cleanup deleted any role whose name merely started with
+"Group Up: " (also roles of people or of another Game Presence instance), it left "@deleted-role" in the posted message,
+and a crash could leave the role behind. No role is created now, so there is nothing to clean up and the invite stays
+View Channels + Send Messages.
+
+AI wording (optional, CREATIVE route, no tools) only rephrases the template: each call gets a random tone and the last
+accepted wordings to avoid; the result must keep exactly the template's placeholders (`{targets}` within the first 60
+characters), contain no mention/link syntax, and be in the bot's language (Cyrillic check), otherwise the deterministic
+template is posted. Targets, mentions, timing and cooldowns never come from the AI.
+
+## Bot Event Bus (`bot_events.py`)
+
+DarkAbyss bots are separate processes; `bot_events` lets one bot understand what another just did. Each producing
+instance owns one file `<data root>/runtime/bot_events/<instance>.json` with its last 50 events (6 h TTL), replaced
+atomically on each publish; readers poll the folder (file signature check), skip their own file and keep seen IDs.
+Events carry Discord IDs, names and facts only (no tokens, keys, paths or message text); the reader validates every
+field, the file name must equal the producer (a file cannot speak for another instance), sizes are capped and invalid
+data is dropped. Producers today: Game Presence (`group_up.suggested`: kind, game, invited/voice/crew IDs, voice channel,
+message ID) and Stream Director (`stream.started`, `stream.ended`, `stream.level_up`, `stream.goal_completed`). Publishing
+never raises; nothing depends on another bot running.
+
+## Kairo Social Awareness (`social_awareness.py`)
+
+Optional per Admin instance: `social_awareness_enabled` (null = never chosen = off; the Manager asks once when such a
+bot is started and saves the answer), `social_awareness_channel_ids` (empty = every channel Kairo can read) and
+`social_awareness_replies_per_hour` (1-20, default 4). It needs the Message Content Intent (`message_content_requested`
+includes it); switched on while the bot runs without that intent, the status says "restart".
+
+Pipeline: messages (and bot events) -> RAM-only timeline per server (45 min, nothing persisted, nothing kept while off)
+-> cheap local triggers: Kairo's name without a mention, a reply to Kairo, the person Kairo just answered, a member
+involved in a recent bot event or anyone in that channel in the first minutes after it, rarely a lively conversation.
+Messages the normal AI flow answers (control channel, @mention requests) and bot messages never trigger. A trigger
+schedules ONE analysis after a short debounce (6-40 s, bursts merge), with per-channel gaps per trigger type.
+
+Analysis: one orchestrator request on the PLANNER route of this bot's own AI connections, `reasoning_effort="high"`
+(new `OrchestratorRequest.reasoning_effort`: overrides the profile option for that request only, where the provider
+catalog supports the level), no tools, the bot language rule. The timeline goes in as JSON data with short refs (m1, e2),
+member texts never reach the system prompt. The model answers ignore / reply_now / wait with a hypothesis, confidence,
+target ref and intent. Policy: confidence >= 0.6, analyses/hour = 3 x replies/hour (6-40), replies/hour cap, 3 min
+between two replies in a channel, 5 min backoff after AI failures. "wait" stores a thought (60-1800 s); any new message,
+bot event or Kairo message in that channel drops it as outdated. The final message is written on the normal ROUTINE
+route (normal effort), sanitized (no mention syntax, no links, @everyone neutralized, 400 chars) and sent as a reply
+with `AllowedMentions.none()`, only where the bot may post. Ordinary commands, /ai and @mentions are unchanged. Status:
+`runtime/social_awareness_status.json` (counts, last decision, problem) for the Manager "Kairo" page. Admin re-reads its
+config every 15 s (`refresh_live_config`), so language and Social Awareness changes apply without a command; an
+unreadable config switches Social Awareness off.
+
+## Kairo's Social Life: Reactions, Server Lore, Feedback, Quiet, the DarkAbyss System
+
+Everything below happens inside Social Awareness (autonomous interventions only) and adds no AI call of its own:
+lore proposals, the reaction choice and "stay out for a while" come from the same high-effort analysis; feedback,
+quiet wishes and heartbeats are deterministic.
+
+- Reactions: `react` is a fourth decision next to ignore / reply_now / wait. The analysis names a member message
+  (exact ref, never a guess) and one emoji from `social_signals.KAIRO_REACTIONS` (unicode only). Threshold 0.65
+  (moved by feedback), reactions/hour = 2 x replies/hour (max 30), 45 s per channel, never twice on one message, never
+  on a bot's message, never older than 20 min. `Admin.social_react` checks View Channel, Add Reactions and Read Message
+  History.
+- Server Lore (`social_memory.py`, `instances/<id>/data/social_memory.json`, per guild): durable things that help
+  understand later conversations (kinds meme, nickname, joke, relation, event, norm, fact). The analysis may propose at
+  most 2 ops (remember / update / forget by L-ref of the lore it was shown). A new item is a candidate until a later
+  analysis (>= 10 min) proposes a similar text again; text is validated (12-180 chars, no mention syntax, links, long
+  IDs, e-mail, phone numbers); at most 30 active and 20 candidates per server, candidates expire after 7 days, weakly
+  confirmed lore fades after 120 days. Config `social_awareness_lore_enabled` (default true). The Manager lists,
+  forgets and clears it.
+- Feedback: each autonomous reply/reaction is watched for 10 min: replies to it, being addressed again, reactions
+  (positive/negative sets in `social_signals`), negative phrases ("no one asked", "кринж"), and whether people just kept
+  talking. The outcome (engaged / positive / neutral / ignored / negative) goes to the memory file (last 40 per server).
+  The confidence bar for replies and reactions in that channel moves within 0.55-0.85 with the last 10 outcomes, and the
+  analysis sees the counts. Two negative outcomes in a channel within 2 h make Kairo step back there (auto quiet 45 min,
+  doubling per repeat within 24 h, max 6 h); one bad joke only raises the bar. Personality and direct commands are not
+  touched.
+- Quiet wishes (`social_signals.parse_quiet_request`, RU/EN): only for messages addressed to Kairo (name, reply to it,
+  mention, or right after its own intervention with no other addressee). Scopes: channel (default; 1 h, or 30 days for
+  "не отвечай в этом канале" / "stay out of this channel"), whole server ("везде"), one member ("мне не отвечай", 30
+  days); explicit durations ("на 2 часа", "for 10 minutes", "до завтра", "навсегда" = 30 days max). Kairo nods with a
+  reaction (🤐 / 👌, at most once a minute per channel) unless the normal AI flow answers that message. "Можешь снова
+  говорить" lifts it: a member's own wish only by that member, a channel/server wish by whoever set it, a server
+  manager, or anyone for an automatic step-back. Wishes persist across restarts; the Manager shows and lifts them.
+  Mutes never reach /ai, @mention requests, the control channel or admin commands. An unreadable memory file means
+  silence (the wishes are unknown) until it is fixed or reset.
+- The DarkAbyss system: every bot writes a heartbeat into its `bot_events` file (type, Manager name, Discord account,
+  servers, once a minute, "stopped" on clean exit; 3 min without one = not running). Kairo combines heartbeats, the
+  instance list (metadata only) and the bus events into `darkabyss_bots` for the analysis (name, type, running, in this
+  server, last actions here), labels messages of those bot accounts in the timeline, and treats talk about them (their
+  names, mentions, or "Group Up"/"Stream Director" when that bot acted here within 2 h) as a trigger, so "Group Up опять
+  охуел" is linked to that instance's latest invitation. Awareness only: Kairo cannot control another bot through it.
 
 ## Shared AI Access And Runtime Ownership
 

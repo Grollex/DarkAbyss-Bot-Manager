@@ -119,6 +119,40 @@
           "pattern": "^[0-9]+$"
         }
       ]
+    },
+    "language": {
+      "type": "string",
+      "pattern": "^(en|ru)$"
+    },
+    "social_awareness_enabled": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "social_awareness_channel_ids": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        ]
+      }
+    },
+    "social_awareness_replies_per_hour": {
+      "type": "integer"
+    },
+    "social_awareness_lore_enabled": {
+      "type": "boolean"
     }
   }
 }

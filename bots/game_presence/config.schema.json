@@ -10,9 +10,11 @@
     "group_cooldown_minutes",
     "guild_cooldown_minutes",
     "voice_aware",
+    "ping_whole_voice",
     "allowlist",
     "ignore_list",
-    "ai_rewrite"
+    "ai_rewrite",
+    "language"
   ],
   "additionalProperties": false,
   "properties": {
@@ -24,8 +26,10 @@
     "group_cooldown_minutes": {"type": "integer"},
     "guild_cooldown_minutes": {"type": "integer"},
     "voice_aware": {"type": "boolean"},
+    "ping_whole_voice": {"type": "boolean"},
     "allowlist": {"type": "array", "items": {"type": "string"}},
     "ignore_list": {"type": "array", "items": {"type": "string"}},
-    "ai_rewrite": {"type": "boolean"}
+    "ai_rewrite": {"type": "boolean"},
+    "language": {"type": "string", "pattern": "^(en|ru)$"}
   }
 }

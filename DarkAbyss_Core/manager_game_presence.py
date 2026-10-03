@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 import admin_terminal
+import bot_i18n
 import game_presence
 import instance_store
 import manager_dashboard as dash
@@ -125,6 +127,9 @@ class GamePresencePanel(QWidget):
         self._config_api = config_api
         self._restart_bot = restart_bot
         self._loaded: dict[str, Any] = dict(game_presence.DEFAULT_CONFIG, enabled=True)
+        self._loading = False
+        self._config_ok = False
+        self._current_bot: str | None = None
 
         title = QLabel("Game Presence")
         title.setObjectName("heroSubtitle")
@@ -137,7 +142,7 @@ class GamePresencePanel(QWidget):
         description.setWordWrap(True)
 
         self.bot_combo = QComboBox()
-        self.bot_combo.currentIndexChanged.connect(lambda _index: self.load())
+        self.bot_combo.currentIndexChanged.connect(lambda _index: self._on_bot_changed())
         refresh = QPushButton("⟳  Refresh")
         refresh.clicked.connect(self.refresh)
         bot_row = QHBoxLayout()
@@ -187,6 +192,11 @@ class GamePresencePanel(QWidget):
         form.addRow("", self.enabled_checkbox)
         form.addRow("Server", self.guild_combo)
         form.addRow("Suggestion channel", self.channel_combo)
+        self.language_combo = QComboBox()
+        for code, label in bot_i18n.LANGUAGES.items():
+            self.language_combo.addItem(label, code)
+        self.language_combo.setToolTip("Language of everything this bot writes: suggestions, buttons and replies (also the AI wording).")
+        form.addRow("Bot language", self.language_combo)
         for key, label, suffix, tip in SPIN_FIELDS:
             spin = QSpinBox()
             low, high = game_presence.LIMITS[key]
@@ -196,10 +206,18 @@ class GamePresencePanel(QWidget):
             self.spins[key] = spin
             form.addRow(label, spin)
         self.voice_checkbox = QCheckBox("Voice-aware: invite people to a voice channel where others already play")
+        self.whole_voice_checkbox = QCheckBox("Group Up: also ping everyone else in that voice channel (even without a visible game)")
+        self.whole_voice_checkbox.setToolTip(
+            "Someone plays a game in voice and another player of it is outside: the outsider is invited and the rest of that voice "
+            "channel is told. Opted-out members and members pinged recently are left out; more than "
+            f"{game_presence.MAX_VOICE_CREW} people in the voice channel are never pinged one by one. Plain user mentions only. "
+            "Works together with Voice-aware."
+        )
         self.ai_checkbox = QCheckBox(
             "Let the AI vary the wording (Base Set or this bot's own connections in AI Providers; mentions and timing stay rule-based)"
         )
         form.addRow("", self.voice_checkbox)
+        form.addRow("", self.whole_voice_checkbox)
         form.addRow("", self.ai_checkbox)
         self.allowlist_edit = QPlainTextEdit()
         self.allowlist_edit.setPlaceholderText("Only these games (one per line). Empty = every game.")
@@ -214,8 +232,8 @@ class GamePresencePanel(QWidget):
         self.save_restart_button = dash.styled_button("Save && Restart Bot", "secondary")
         self.save_button.clicked.connect(self.save)
         self.save_restart_button.clicked.connect(lambda: self.save(restart=True))
-        self.result_label = dash.muted("")
-        self.result_label.setWordWrap(True)
+        # Saved / unsaved changes / saved now (and when it applies) / not saved.
+        self.result_label = dash.SaveIndicator()
         buttons = QHBoxLayout()
         buttons.addWidget(self.save_button)
         buttons.addWidget(self.save_restart_button)
@@ -242,6 +260,14 @@ class GamePresencePanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
+        for box in (self.enabled_checkbox, self.voice_checkbox, self.whole_voice_checkbox, self.ai_checkbox):
+            box.toggled.connect(lambda _checked: self._update_dirty())
+        for combo in (self.guild_combo, self.channel_combo, self.language_combo):
+            combo.currentIndexChanged.connect(lambda _index: self._update_dirty())
+        for spin in self.spins.values():
+            spin.valueChanged.connect(lambda _value: self._update_dirty())
+        for edit in (self.allowlist_edit, self.ignore_edit):
+            edit.textChanged.connect(self._update_dirty)
         self.refresh()
 
     # -- helpers ---------------------------------------------------------------
@@ -274,8 +300,13 @@ class GamePresencePanel(QWidget):
 
     # -- loading -------------------------------------------------------------------
 
-    def refresh(self) -> None:
+    def refresh(self, keep_edits: bool = False) -> None:
+        """Re-read bots and the saved settings. ``keep_edits`` (the page is shown
+        again): unsaved edits of the same bot stay on screen, still marked unsaved."""
         current = self.bot_combo.currentData()
+        dirty = self.dirty
+        if dirty and not keep_edits and not self._confirm_reload():
+            return
         self.bot_combo.blockSignals(True)
         self.bot_combo.clear()
         for instance_id, label, _info in self._presence_bots():
@@ -284,7 +315,21 @@ class GamePresencePanel(QWidget):
         self.bot_combo.setCurrentIndex(index if index >= 0 else 0)
         self.bot_combo.blockSignals(False)
         self._refresh_legacy()
+        if dirty and keep_edits and current is not None and self.bot_combo.currentData() == current == self._current_bot:
+            self.refresh_status()
+            return
         self.load()
+
+    def _confirm_reload(self) -> bool:
+        """Refresh with unsaved edits: reload the saved settings only if the user agrees."""
+        answer = QMessageBox.question(
+            self,
+            "Unsaved changes",
+            "Reload the saved settings and discard the unsaved changes?",
+            QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        return answer == QMessageBox.Discard
 
     def _refresh_legacy(self) -> None:
         legacy = self._legacy_bots()
@@ -308,44 +353,105 @@ class GamePresencePanel(QWidget):
             self.guild_combo,
             self.channel_combo,
             self.voice_checkbox,
+            self.whole_voice_checkbox,
             self.ai_checkbox,
             self.allowlist_edit,
             self.ignore_edit,
+            self.language_combo,
             *self.spins.values(),
         ):
             widget.setEnabled(enabled)
         self.import_button.setEnabled(enabled)
 
+    def _bot_label(self) -> str:
+        return self.bot_combo.currentText() or "this bot"
+
     def load(self) -> None:
+        """Fill every control from the selected bot's saved config (nothing from the previous bot stays)."""
         bot = self._bot()
+        self._current_bot = bot[0] if bot is not None else None
         self._set_controls_enabled(bot is not None)
+        self.guild_combo.setToolTip("")
         if bot is None:
             self.status_title.setText("No Game Presence bot")
             dash.colored(self.status_title, "muted")
             dash.set_dot_color(self.status_dot, "muted")
             self.status_details.setText("Add one with Bots → Add Bot → Game Presence Bot (it needs its own Discord application and token).")
-            self.result_label.setText("")
+            self.result_label.show_disabled("Settings appear here once a Game Presence bot exists.")
+            self._config_ok = False
             return
         try:
             effective = self._config_api.get_config_snapshot(bot[0]).effective
             self._loaded = game_presence.normalize_bot_config(effective)
             problem = None
         except Exception as exc:
-            # Fail closed: show the problem, keep defaults in the form, save
-            # only what the user explicitly confirms.
+            # Fail closed: show the problem and lock the form, so defaults are
+            # neither shown as "saved" nor written over the real config.
             self._loaded = dict(game_presence.DEFAULT_CONFIG, enabled=True)
             problem = str(exc)
         data = self._loaded
-        self.enabled_checkbox.setChecked(data["enabled"])
-        for key, spin in self.spins.items():
-            spin.setValue(int(data[key]))
-        self.voice_checkbox.setChecked(data["voice_aware"])
-        self.ai_checkbox.setChecked(data["ai_rewrite"])
-        self.allowlist_edit.setPlainText("\n".join(data["allowlist"]))
-        self.ignore_edit.setPlainText("\n".join(data["ignore_list"]))
-        self._load_guilds(data["guild_id"], data["channel_id"])
-        self.result_label.setText(f"Config problem: {problem}" if problem else "")
+        self._loading = True
+        try:
+            self.enabled_checkbox.setChecked(data["enabled"])
+            for key, spin in self.spins.items():
+                spin.setValue(int(data[key]))
+            self.voice_checkbox.setChecked(data["voice_aware"])
+            self.whole_voice_checkbox.setChecked(data["ping_whole_voice"])
+            self.ai_checkbox.setChecked(data["ai_rewrite"])
+            self.allowlist_edit.setPlainText("\n".join(data["allowlist"]))
+            self.ignore_edit.setPlainText("\n".join(data["ignore_list"]))
+            index = self.language_combo.findData(data["language"])
+            self.language_combo.setCurrentIndex(index if index >= 0 else 0)
+            self._load_guilds(data["guild_id"], data["channel_id"])
+        finally:
+            self._loading = False
+        self._config_ok = problem is None
+        if problem:
+            self._set_controls_enabled(False)
+            self.import_button.setEnabled(True)
+            self.result_label.show_disabled(
+                f"Config problem: {problem} The form is locked so nothing is saved over it — fix or reset the config in "
+                "Bots → Advanced JSON, then press Refresh."
+            )
+            dash.colored(self.result_label, "bad")
+        else:
+            self.result_label.show_clean(f"Showing the saved settings of {self._bot_label()}.")
         self.refresh_status(config_problem=problem)
+
+    @property
+    def dirty(self) -> bool:
+        if self._current_bot is None or not self._config_ok:
+            return False
+        try:
+            return game_presence.normalize_bot_config(self.current_settings()) != self._loaded
+        except Exception:
+            return True  # something was typed that cannot be saved as it is
+
+    def _update_dirty(self) -> None:
+        if self._loading or self._current_bot is None or not self._config_ok:
+            return
+        if self.dirty:
+            self.result_label.show_dirty()
+        elif self.result_label.state == "dirty":
+            self.result_label.show_clean(f"Showing the saved settings of {self._bot_label()}.")
+
+    def _on_bot_changed(self) -> None:
+        new_id = self.bot_combo.currentData()
+        if self._current_bot is not None and new_id != self._current_bot and self.dirty:
+            answer = QMessageBox.question(
+                self,
+                "Unsaved changes",
+                "The settings of the previous bot have unsaved changes. Switch and discard them?",
+                QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Discard:
+                index = self.bot_combo.findData(self._current_bot)
+                self.bot_combo.blockSignals(True)
+                self.bot_combo.setCurrentIndex(index)
+                self.bot_combo.blockSignals(False)
+                return
+        self.load()
 
     def _load_guilds(self, guild_id: str | None, channel_id: str | None) -> None:
         runtime = self._runtime()
@@ -354,6 +460,8 @@ class GamePresencePanel(QWidget):
         self.guild_combo.blockSignals(True)
         self.guild_combo.clear()
         guilds = list((status or {}).get("guilds") or [])
+        if not guilds:
+            self.guild_combo.setToolTip("Start this bot once: the Manager lists the servers and channels the bot can see.")
         if not guild_id:
             # Nothing saved yet: never pre-select a real server, or the page looks
             # configured while the bot posts nothing.
@@ -474,34 +582,40 @@ class GamePresencePanel(QWidget):
             "channel_id": self.channel_combo.currentData() or None,
             **{key: spin.value() for key, spin in self.spins.items()},
             "voice_aware": self.voice_checkbox.isChecked(),
+            "ping_whole_voice": self.whole_voice_checkbox.isChecked(),
             "allowlist": _lines(self.allowlist_edit.toPlainText()),
             "ignore_list": _lines(self.ignore_edit.toPlainText()),
             "ai_rewrite": self.ai_checkbox.isChecked(),
+            "language": self.language_combo.currentData() or game_presence.DEFAULT_CONFIG["language"],
         }
 
     def save(self, restart: bool = False) -> bool:
         bot = self._bot()
         if bot is None:
             return False
+        if not self._config_ok:
+            self.result_label.show_error("the stored config has a problem; fix it in Bots → Advanced JSON first.")
+            return False
         try:
             settings = game_presence.normalize_bot_config(self.current_settings())
             # The whole config of a Game Presence bot is these settings.
             self._config_api.save_config_overrides(bot[0], dict(settings))
         except Exception as exc:
-            self.result_label.setText(f"Not saved: {exc}")
-            dash.colored(self.result_label, "bad")
+            self.result_label.show_error(str(exc))
             return False
-        self._loaded = settings
-        if restart and self._running(bot[1]):
+        running = self._running(bot[1])
+        if restart and running:
             self._restart_bot(bot[0])
-            message = "Saved. Restarting the bot..."
+            note = "Restarting the bot now."
         elif not game_presence.is_configured(settings):
-            message = "Saved. Choose a server and a channel so the bot can post."
+            note = "Choose a server and a channel so the bot can post."
+        elif running:
+            note = "Applied live: the running bot picks it up within 15 seconds (no restart needed)."
         else:
-            message = "Saved. Changes apply within 15 seconds while the bot runs."
-        self.result_label.setText(message)
-        dash.colored(self.result_label, "ok")
-        self.refresh_status()
+            note = "The bot uses it when it starts."
+        # Show what is stored now (a round trip, not the form as typed).
+        self.load()
+        self.result_label.show_saved(note)
         return True
 
     # -- import from the old Admin module ------------------------------------------------
