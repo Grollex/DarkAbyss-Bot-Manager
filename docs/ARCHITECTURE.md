@@ -1227,9 +1227,13 @@ and the bots keep running), then save the running instance ids, `shutdown_all()`
 The next Manager calls `resume_bots_after_update()` in `main()` and starts those instances again.
 
 Housekeeping after a successful activation only touches program files: `updates/downloads` and
-`updates/prepared` are emptied, and installed versions other than the current and the previous one are
-removed (the previous one stays for `rollback_to_previous`). A version already staged by an interrupted
-attempt is activated without downloading again.
+`updates/prepared` are emptied, and installed versions other than the current, the previous one (for
+`rollback_to_previous`) and the running one (`keep_versions`) are removed. A version is renamed into
+`updates/trash` before it is deleted; Windows refuses that rename while a process runs from the folder,
+so a version in use is skipped whole instead of being left half deleted. A version already staged by an
+interrupted attempt is activated without downloading again, and a version that is already active is not
+re-activated (re-activation would overwrite `previous_version` with itself). If listing the bots fails
+after the switch, the Manager still restarts into the new version.
 
 Data safety: the update payload holds only program files; DATA_ROOT (instances, tokens, AI connections and
 keys, configs, groups, logs, runtime state) is never written by the updater, and `update_engine` refuses an
