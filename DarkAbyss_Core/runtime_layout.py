@@ -12,6 +12,18 @@ class RuntimeLayoutError(RuntimeError):
     pass
 
 
+def line_buffered_output() -> None:
+    """Bot processes write to log files: flush every line so the Manager's Logs
+    page shows messages while the bot runs (block buffering hid them until exit)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(line_buffering=True)
+            except (ValueError, OSError):
+                pass
+
+
 def _exe_name(base_name: str) -> str:
     return f"{base_name}.exe" if sys.platform == "win32" else base_name
 

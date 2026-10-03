@@ -18,6 +18,7 @@ import app_paths
 import bot_registry
 import config_store
 import instance_store
+import runtime_layout
 
 try:
     # /ai transport. It imports no AI/provider module at import time; even if
@@ -612,13 +613,13 @@ async def ai_control_channel_listener(message: discord.Message) -> None:
 
 
 def resolve_ai_stores(runtime: AdminRuntime) -> Any:
-    """This instance's own AI settings + keys; None leaves AI unavailable (fail closed)."""
+    """This bot's AI: the connections it may use (base set or its own choice) and
+    its usage store; None leaves AI unavailable (fail closed)."""
     try:
         import ai_storage
 
-        result = ai_storage.migrate_legacy_global_ai()
-        if result.status in ("migrated", "ambiguous", "failed"):
-            print(result.message)
+        for message in ai_storage.run_migrations():
+            print(message)
         return ai_storage.for_instance_id(runtime.instance_id)
     except Exception as exc:
         print(f"AI storage unavailable for this bot: {type(exc).__name__}")
@@ -626,6 +627,7 @@ def resolve_ai_stores(runtime: AdminRuntime) -> Any:
 
 
 def main(argv: list[str] | None = None) -> int:
+    runtime_layout.line_buffered_output()
     try:
         args = parse_args(argv)
         runtime = resolve_runtime(args.instance)

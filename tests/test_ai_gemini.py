@@ -21,7 +21,7 @@ if not _os.environ.get("DARKABYSS_DATA_DIR"):
 
 def load_modules():
     sys.path.insert(0, str(CORE_ROOT))
-    for name in ("ai_gemini", "ai_platform"):
+    for name in ("ai_gemini", "ai_platform", "ai_providers", "ai_connections"):
         sys.modules.pop(name, None)
     import ai_platform
     import ai_gemini

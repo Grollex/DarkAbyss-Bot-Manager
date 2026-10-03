@@ -1,6 +1,8 @@
+import contextlib
 import hashlib
 import importlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -340,6 +342,78 @@ class PackagedRuntimeTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertEqual(received, [["--instance", "admin-second"]])
+
+    def test_packaged_launch_spec_for_game_presence_bot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager_core, instance_store, bot_registry, runtime_layout = reset_core_modules(
+                root / "data", "manager_core", "instance_store", "bot_registry", "runtime_layout"
+            )
+            instance = instance_store.create_instance("game_presence", "gp-main")
+            instance.paths.token.write_text("FAKE_GP_TOKEN", encoding="utf-8")
+            version_dir = root / "install" / "versions" / "1.0.0"
+            version_dir.mkdir(parents=True)
+            app_exe = version_dir / runtime_layout.app_executable_name()
+            app_exe.write_bytes(b"fake exe")
+
+            spec = manager_core.build_packaged_launch_spec(instance, bot_registry.get_bot_type("game_presence"), app_exe, version_dir)
+
+            self.assertEqual(spec.args, ("--bot-runner", "game_presence", "--instance", "gp-main"))
+            self.assertEqual(spec.stdout_log_path, instance.paths.logs_dir / manager_core.STDOUT_LOG_NAME)
+            self.assertNotIn("GamePresence.py", " ".join(spec.command))
+            self.assertNotIn("FAKE_GP_TOKEN", " ".join(spec.command))
+
+    def test_app_entry_game_presence_bot_runner_dispatches_instance(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            app_entry, = reset_core_modules(Path(data_dir), "app_entry")
+            received = []
+            args = app_entry.parse_args(["--bot-runner", "game_presence", "--instance", "gp-main"])
+            result = app_entry.dispatch(
+                args,
+                admin_main=lambda argv: self.fail("Admin entrypoint must not run for a Game Presence instance"),
+                game_presence_main=lambda argv: received.append(argv) or 0,
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(received, [["--instance", "gp-main"]])
+            with self.assertRaises(app_entry.AppEntryError):
+                app_entry.dispatch(app_entry.parse_args(["--bot-runner", "game_presence"]), game_presence_main=lambda argv: 0)
+
+    def test_app_entry_runs_the_real_game_presence_entrypoint(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            sys.modules.pop("GamePresence", None)
+            app_entry, instance_store = reset_core_modules(Path(data_dir), "app_entry", "instance_store")
+            instance_store.create_instance("game_presence", "gp-main")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = app_entry.main(["--bot-runner", "game_presence", "--instance", "gp-main"])
+            sys.modules.pop("GamePresence", None)
+            self.assertEqual(code, 1)  # placeholder token: actionable message, no network, no traceback
+            self.assertIn("no Discord token yet", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+
+    def test_every_bot_type_is_packaged_and_dispatchable(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            app_entry, bot_registry = reset_core_modules(Path(data_dir), "app_entry", "bot_registry")
+            spec_text = (PROJECT_ROOT / "packaging" / "DarkAbyssApp.spec").read_text(encoding="utf-8")
+            types_ = bot_registry.discover_bot_types()
+            self.assertEqual(set(types_), {"admin", "game_presence"})
+            for type_id, bot_type in types_.items():
+                with self.subTest(bot_type=type_id):
+                    entry = bot_type.entrypoint
+                    # The manifest entrypoint must exist in the bundle (registry validation) and
+                    # be importable in-process by app_entry.
+                    self.assertIn(f'"DarkAbyss_Core" / "{entry.name}"', spec_text)
+                    self.assertIn(f'"{entry.stem}"', spec_text)
+                    calls = []
+                    args = app_entry.parse_args(["--bot-runner", type_id, "--instance", "x-1"])
+                    app_entry.dispatch(
+                        args,
+                        admin_main=lambda argv: calls.append(("admin", argv)) or 0,
+                        game_presence_main=lambda argv: calls.append(("game_presence", argv)) or 0,
+                    )
+                    self.assertEqual(calls, [(type_id, ["--instance", "x-1"])])
+            for module in ("ai_storage", "ai_usage", "ai_connections", "ai_providers", "ai_groq", "ai_gemini", "game_presence", "game_presence_discord"):
+                self.assertIn(f'"{module}"', spec_text)
 
     def test_app_entry_unknown_bot_type_is_rejected(self):
         with tempfile.TemporaryDirectory() as data_dir:

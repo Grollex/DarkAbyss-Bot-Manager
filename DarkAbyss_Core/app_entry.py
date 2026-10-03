@@ -74,6 +74,7 @@ def dispatch(
 
 
 def main(argv: list[str] | None = None) -> int:
+    runtime_layout.line_buffered_output()
     try:
         return dispatch(parse_args(argv))
     except AppEntryError as exc:

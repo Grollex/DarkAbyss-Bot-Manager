@@ -1,7 +1,8 @@
 """Manager page for Game Presence Bot instances (bot type ``game_presence``).
 
 A Game Presence bot is its own Discord application with its own token,
-process, config, data and (optional) AI keys. Settings are the instance's
+process, config and data; optional AI wording uses the Base Set or the bot's
+own connections (AI Providers). Settings are the instance's
 top-level config (ConfigStore overrides, same validation as the bot).
 Servers/channels come from the bot's own ``bot_status.json``; operational
 status from its ``game_presence_status.json``.
@@ -47,6 +48,12 @@ LEGACY_SECTION = "game_presence"
 STATUS_FILE_NAME = "game_presence_status.json"
 STATE_FILE_NAME = "game_presence_state.json"
 LEGACY_STATE_FILE_NAME = "admin_features.json"
+CHOOSE_SERVER = "— choose a server —"
+CHOOSE_CHANNEL = "— choose a channel —"
+# Diagnoses that mean "something is wrong", not "waiting for players".
+PROBLEM_DIAGNOSES = frozenset(
+    {"config_problem", "state_problem", "intent_missing", "guild_unavailable", "channel_unavailable", "permission_denied", "send_failed"}
+)
 REQUIRED_INTENTS_TEXT = (
     "Discord Developer Portal → your Game Presence application → Bot → Privileged Gateway Intents:\n"
     "• Presence Intent — required (who plays what).\n"
@@ -60,6 +67,35 @@ SPIN_FIELDS = (
     ("user_cooldown_minutes", "Per-user cooldown", "min", "A person is mentioned at most once in this time."),
     ("guild_cooldown_minutes", "Server cooldown", "min", "At most one suggestion per server in this time."),
 )
+
+
+ACTIVITY_LABELS = {"custom": "custom status", "listening": "listening", "streaming": "streaming", "watching": "watching", "competing": "competing"}
+
+
+def presence_data_lines(status: dict[str, Any]) -> list[str]:
+    """What Discord delivers to the bot, with a hint when it is nothing useful."""
+    visible = int(status.get("visible_members") or 0)
+    playing = int(status.get("playing_members") or 0)
+    online = status.get("online_members")
+    parts = [f"{visible} members"]
+    if isinstance(online, int):
+        parts.append(f"{online} online")
+    parts.append(f"{playing} playing a game")
+    other = status.get("other_activities") or {}
+    if isinstance(other, dict) and other:
+        parts.append("other: " + ", ".join(f"{count} {ACTIVITY_LABELS.get(kind, kind)}" for kind, count in sorted(other.items())))
+    lines = ["Discord presence data: " + " · ".join(parts)]
+    if visible == 0:
+        lines.append("No member data: check Server Members Intent and that the bot is in the server.")
+    elif isinstance(online, int) and online == 0 and playing == 0:
+        lines.append("Everyone looks offline to the bot: if members are online, check Presence Intent in the Developer Portal.")
+    elif playing == 0:
+        lines.append(
+            "Discord shares no game from these members. A member is only seen as playing when Discord shows "
+            "'Playing …' under their name in this server: Discord → Settings → Activity Privacy → share activity "
+            "(also per server in Privacy Settings), and the game must be detected (Settings → Registered Games)."
+        )
+    return lines
 
 
 def _lines(text: str) -> list[str]:
@@ -160,7 +196,9 @@ class GamePresencePanel(QWidget):
             self.spins[key] = spin
             form.addRow(label, spin)
         self.voice_checkbox = QCheckBox("Voice-aware: invite people to a voice channel where others already play")
-        self.ai_checkbox = QCheckBox("Let the AI vary the wording (this bot's own AI keys; mentions and timing stay rule-based)")
+        self.ai_checkbox = QCheckBox(
+            "Let the AI vary the wording (Base Set or this bot's own connections in AI Providers; mentions and timing stay rule-based)"
+        )
         form.addRow("", self.voice_checkbox)
         form.addRow("", self.ai_checkbox)
         self.allowlist_edit = QPlainTextEdit()
@@ -316,12 +354,16 @@ class GamePresencePanel(QWidget):
         self.guild_combo.blockSignals(True)
         self.guild_combo.clear()
         guilds = list((status or {}).get("guilds") or [])
+        if not guild_id:
+            # Nothing saved yet: never pre-select a real server, or the page looks
+            # configured while the bot posts nothing.
+            self.guild_combo.addItem(CHOOSE_SERVER, {})
         for guild in guilds:
             self.guild_combo.addItem(str(guild.get("name")), guild)
         if guild_id and not any(str(guild.get("id")) == guild_id for guild in guilds):
             # Bot offline or not in that server any more: keep the saved choice visible.
             self.guild_combo.addItem(f"Server {guild_id} (bot offline or not in it)", {"id": guild_id, "channels": []})
-        index = next((i for i in range(self.guild_combo.count()) if str(self.guild_combo.itemData(i).get("id")) == guild_id), 0)
+        index = next((i for i in range(self.guild_combo.count()) if guild_id and str(self.guild_combo.itemData(i).get("id")) == guild_id), 0)
         self.guild_combo.setCurrentIndex(index)
         self.guild_combo.blockSignals(False)
         self._load_channels()
@@ -331,6 +373,8 @@ class GamePresencePanel(QWidget):
         wanted = getattr(self, "_channel_wanted", None)
         self.channel_combo.clear()
         guild = self.guild_combo.currentData() or {}
+        if not wanted:
+            self.channel_combo.addItem(CHOOSE_CHANNEL, None)
         for channel in guild.get("channels") or []:
             if channel.get("type") in ("text", "news"):
                 self.channel_combo.addItem(f"#{channel.get('name')}", str(channel.get("id")))
@@ -340,6 +384,21 @@ class GamePresencePanel(QWidget):
         self.channel_combo.setCurrentIndex(index if index >= 0 else 0)
         self._channel_wanted = None
 
+    @staticmethod
+    def state_file_problem(instance_id: str) -> str | None:
+        """Read-only check of the bot's opt-out/cooldown file (never repaired here)."""
+        try:
+            path = instance_store.get_instance_paths(instance_id).data_dir / STATE_FILE_NAME
+            _read_state_file(path)
+        except (OSError, ValueError) as exc:
+            reason = "has an invalid shape" if "invalid shape" in str(exc) else "is unreadable"
+            return (
+                f"{STATE_FILE_NAME} {reason}. The bot fails closed: it posts nothing and the Mute/Allow buttons "
+                "answer 'unavailable', so no opt-out is lost. Restore the file from a backup or remove it "
+                "(removing forgets opt-outs and cooldowns), then restart the bot."
+            )
+        return None
+
     def refresh_status(self, config_problem: str | None = None) -> None:
         bot = self._bot()
         if bot is None:
@@ -348,8 +407,13 @@ class GamePresencePanel(QWidget):
         running = self._running(bot[1])
         runtime = self._runtime()
         status = admin_terminal.read_runtime_json(runtime, STATUS_FILE_NAME) if running and runtime is not None else None
+        state_problem = self.state_file_problem(bot[0])
         details = []
-        if config_problem:
+        if state_problem:
+            # Checked here directly, so it is visible even while the bot is stopped.
+            title, color = "State file problem", "bad"
+            details.append(state_problem)
+        elif config_problem:
             title, color = "Config problem", "bad"
             details.append(f"{config_problem} The bot posts nothing until this is fixed.")
         elif not running:
@@ -359,17 +423,25 @@ class GamePresencePanel(QWidget):
             title, color = "Paused", "muted"
             details.append("Posting is paused. Check 'Post suggestions' and save to resume.")
         elif not game_presence.is_configured(data):
-            title, color = "Not configured", "warn"
-            details.append("Choose the server and the suggestion channel below, then Save.")
+            title, color = "Not configured — nothing is posted", "bad"
+            details.append(
+                "The bot is online but has no server and channel saved. Choose both below and press Save; "
+                "the bot picks it up within 15 seconds."
+            )
         elif status is None:
             title, color = "Starting...", "warn"
             details.append("Waiting for the bot to report its status.")
-        elif status.get("problem"):
+        elif status.get("problem") or (status.get("diagnosis") or {}).get("code") in PROBLEM_DIAGNOSES:
             title, color = "Problem", "bad"
-            details.append(str(status["problem"]))
+            details.append(str(status.get("problem") or status["diagnosis"].get("text")))
         else:
             title, color = "Active", "ok"
-        if status:
+        diagnosis = (status or {}).get("diagnosis") if running else None
+        if isinstance(diagnosis, dict) and diagnosis.get("text") and game_presence.is_configured(data) and data.get("enabled") is True:
+            details.append(f"Now: {diagnosis['text']}")
+        if status and "visible_members" in status:
+            details.extend(presence_data_lines(status))
+        if status and game_presence.is_configured(data):
             details.append(
                 f"Server: {status.get('guild_name') or status.get('guild_id') or '-'} · "
                 f"channel: #{status.get('channel_name') or status.get('channel_id') or '-'}"

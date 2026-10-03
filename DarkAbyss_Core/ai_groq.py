@@ -52,7 +52,7 @@ class GroqHTTPTransport(Protocol):
         body: dict[str, Any],
         timeout_seconds: float,
         max_response_bytes: int,
-    ) -> tuple[int, bytes]:
+    ) -> tuple[int, bytes] | tuple[int, bytes, dict[str, str]]:
         ...
 
 
@@ -66,7 +66,7 @@ class UrllibGroqHTTPTransport:
         body: dict[str, Any],
         timeout_seconds: float,
         max_response_bytes: int,
-    ) -> tuple[int, bytes]:
+    ) -> tuple[int, bytes] | tuple[int, bytes, dict[str, str]]:
         payload = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -77,12 +77,24 @@ class UrllibGroqHTTPTransport:
         try:
             with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 data = _read_limited(response, max_response_bytes)
-                return int(response.status), data
+                return int(response.status), data, _rate_limit_headers(response)
         except urllib.error.HTTPError as exc:
             data = _read_limited(exc, max_response_bytes)
-            return int(exc.code), data
+            return int(exc.code), data, _rate_limit_headers(exc)
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             raise GroqNetworkError("Groq network request failed.") from exc
+
+
+def _rate_limit_headers(response: Any) -> dict[str, str]:
+    """Only Groq's x-ratelimit-* response headers (numbers/durations, no secrets)."""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return {}
+    try:
+        items = headers.items()
+    except Exception:
+        return {}
+    return {str(key).lower(): str(value)[:64] for key, value in items if str(key).lower().startswith("x-ratelimit-")}
 
 
 class GroqProvider:
@@ -95,11 +107,14 @@ class GroqProvider:
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         retry_delays: tuple[float, ...] = (),
         sleep: Any = None,
+        usage_recorder: Any = None,
     ) -> None:
         parsed = urlparse(GROQ_API_BASE)
         if parsed.scheme != "https":
             raise ValueError("Groq API endpoint must use HTTPS.")
         self._credential_store = credential_store
+        # ai_usage recorder of the bot instance whose key this is (None = off).
+        self._usage_recorder = usage_recorder
         self._api_base = GROQ_API_BASE
         self._transport = transport or UrllibGroqHTTPTransport()
         self._timeout_seconds = float(timeout_seconds)
@@ -184,7 +199,7 @@ class GroqProvider:
         attempt = 0
         while True:
             try:
-                status, response_bytes = await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     self._transport.post_json,
                     url=url,
                     headers=headers,
@@ -192,12 +207,17 @@ class GroqProvider:
                     timeout_seconds=self._timeout_seconds,
                     max_response_bytes=self._max_response_bytes,
                 )
+                # Transports return (status, body) or (status, body, rate-limit headers).
+                status, response_bytes = result[0], result[1]
+                response_headers = result[2] if len(result) > 2 else None
             except GroqNetworkError:
                 if attempt >= len(self._retry_delays):
                     raise
                 await self._sleep(self._retry_delays[attempt])
                 attempt += 1
                 continue
+            # Every received response counts (retries and 429s included).
+            await self._record_usage(request.model_id, credential_ref, status, response_bytes, response_headers)
             if status in RETRYABLE_STATUSES and attempt < len(self._retry_delays):
                 wait = _retry_wait_seconds(response_bytes, self._retry_delays[attempt])
                 if wait is not None:
@@ -214,6 +234,19 @@ class GroqProvider:
         if status < 200 or status >= 300:
             raise _error_for_status(status, response_bytes)
         return _parse_response(response_bytes)
+
+    async def _record_usage(self, model_id: str, credential_ref: str, status: int, response_bytes: bytes, headers: Any) -> None:
+        """One received response: provider-reported usage and rate limits only,
+        never content or keys. Recording problems never affect the request."""
+        if self._usage_recorder is None:
+            return
+        try:
+            import ai_usage
+
+            event = ai_usage.groq_event(model_id, status, response_bytes, headers if isinstance(headers, dict) else None, credential_ref)
+            await asyncio.to_thread(self._usage_recorder, event)
+        except Exception:
+            pass
 
     def _load_api_key(self, credential_ref: str) -> str:
         try:

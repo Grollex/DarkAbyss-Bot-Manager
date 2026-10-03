@@ -29,6 +29,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QButtonGroup,
+    QRadioButton,
+    QSizePolicy,
     QScrollArea,
     QStackedWidget,
     QInputDialog,
@@ -44,9 +47,15 @@ from PySide6.QtWidgets import (
 )
 
 import admin_instance
+import admin_terminal
+import ai_connections
 import ai_platform
+import ai_providers
 import ai_storage
+import ai_usage
 import app_paths
+import app_updates
+import game_presence
 import manager_dashboard as dash
 import manager_game_presence
 import manager_groups
@@ -59,12 +68,8 @@ import manager_core
 
 
 REFRESH_INTERVAL_MS = 1500
-GROQ_PROFILE_ID = "groq-default"
-GROQ_PROVIDER_ID = "groq"
-GROQ_CREDENTIAL_REF = "groq-default"
-GEMINI_PROFILE_ID = "gemini-default"
-GEMINI_PROVIDER_ID = "gemini"
-GEMINI_CREDENTIAL_REF = "gemini-default"
+UPDATE_FIRST_CHECK_MS = 4000
+UPDATES_SOURCE_TEXT = "Updates are installed by the packaged app (started with Launcher.exe)."
 
 DISCORD_DEVELOPER_PORTAL_URL = "https://discord.com/developers/applications"
 DISCORD_INVITE_BASE_URL = "https://discord.com/oauth2/authorize"
@@ -517,604 +522,291 @@ class ConfigEditorDialog(QDialog):
         self.status_label.setText(f"Error: {message}")
 
 
-def create_groq_provider(credential_store: ai_platform.CredentialStore):
-    try:
-        import ai_groq
-    except Exception as exc:
-        raise ai_platform.AIPlatformError("Provider unavailable.") from exc
-    return ai_groq.GroqProvider(credential_store)
+def create_provider(provider_id: str, credential_store: ai_platform.CredentialStore, usage_recorder: Callable | None = None):
+    """Adapter from the provider catalog (ai_providers); no network on creation."""
+    return ai_providers.create_provider(provider_id, credential_store, usage_recorder=usage_recorder)
 
 
-def create_gemini_provider(credential_store: ai_platform.CredentialStore):
-    try:
-        import ai_gemini
-    except Exception as exc:
-        raise ai_platform.AIPlatformError("Provider unavailable.") from exc
-    return ai_gemini.GeminiProvider(credential_store)
+def availability_text(result: ActionResult) -> str:
+    """Short, sanitized Test Connection result (provider texts are never shown)."""
+    if not result.ok or not isinstance(result.value, ai_platform.Availability):
+        return "Network unavailable"
+    availability = result.value
+    if availability.state == ai_platform.AvailabilityState.AVAILABLE:
+        return "Connected"
+    if availability.state == ai_platform.AvailabilityState.CREDENTIAL_INVALID:
+        return "Invalid API key"
+    if availability.state == ai_platform.AvailabilityState.ACCESS_FORBIDDEN:
+        return "Access forbidden"
+    if availability.state == ai_platform.AvailabilityState.CREDENTIAL_MISSING:
+        return "No key saved"
+    message = (availability.message or "").lower()
+    if "rate" in message or "quota" in message:
+        return "Rate limit / quota reached"
+    if "unexpected" in message:
+        return "Unexpected provider response"
+    return "Network unavailable"
 
 
-def _profile_by_id(settings: ai_platform.AISettings, profile_id: str) -> ai_platform.AIProfile | None:
-    return next((profile for profile in settings.profiles if profile.profile_id == profile_id), None)
+class ConnectionDialog(QDialog):
+    """Add or edit one provider connection: provider, name, key, model, options.
 
-
-def _routing_with_default(routing: ai_platform.RoutingConfig, profile_id: str) -> ai_platform.RoutingConfig:
-    """Fill only UNSET routing slots with ``profile_id``; assigned slots are kept.
-
-    Without this, saving only a Gemini key (or saving Gemini before Groq) left
-    every task class unrouted and /ai answered "No usable AI profile".
+    The saved key is never shown back and a blank key field keeps it. Test
+    Connection uses THIS connection's saved key and is counted as Manager usage.
     """
-    return replace(
-        routing,
-        routine_profile_id=routing.routine_profile_id or profile_id,
-        planner_profile_id=routing.planner_profile_id or profile_id,
-        creative_profile_id=routing.creative_profile_id or profile_id,
-    )
 
-
-class AIProviderSettingsDialog(QDialog):
     def __init__(
         self,
-        settings_store: ai_platform.AISettingsStore | None = None,
-        credential_store: ai_platform.CredentialStore | None = None,
-        provider_factory: Callable[[ai_platform.CredentialStore], object] = create_groq_provider,
-        gemini_provider_factory: Callable[[ai_platform.CredentialStore], object] = create_gemini_provider,
+        store: ai_connections.ConnectionStore,
+        connection: ai_connections.Connection | None = None,
+        *,
+        provider_factory: Callable[..., object] = create_provider,
+        usage_store: ai_usage.AIUsageStore | None = None,
+        users_of: Callable[[str], list[str]] | None = None,
         parent: QWidget | None = None,
-        bot_label: str | None = None,
     ) -> None:
         super().__init__(parent)
-        # Keys, models and routing belong to ONE bot instance (ai_storage);
-        # there is no global store to fall back to.
-        if settings_store is None or credential_store is None:
-            raise ValueError("AIProviderSettingsDialog needs the selected bot instance's AI stores.")
-        self.setWindowTitle(f"AI Providers — {bot_label}" if bot_label else "AI Providers")
-        self._settings_store = settings_store
-        self._credential_store = credential_store
+        self._store = store
+        self.connection = connection
         self._provider_factory = provider_factory
-        self._gemini_provider_factory = gemini_provider_factory
+        self._usage_recorder = usage_store.recorder() if usage_store is not None else None
+        self._users_of = users_of or (lambda _connection_id: [])
         self._worker_handles: list[_WorkerHandle] = []
-        self._provider = None
-        self._gemini_provider = None
-        self._settings_invalid = False
-        self._loaded_settings = ai_platform.AISettings()
         self._test_in_progress = False
-        self._gemini_test_in_progress = False
+        self._auto_name = connection is None
+        self.removed = False
+        self.changed = False
+        self.setWindowTitle("Edit Connection" if connection is not None else "Add Connection")
+        self.resize(560, 380)
 
-        self.status_label = QLabel("")
+        self.provider_combo = QComboBox()
+        for provider_id in ai_providers.provider_ids():
+            self.provider_combo.addItem(ai_providers.get_spec(provider_id).display_name, provider_id)
+        self.name_edit = QLineEdit()
+        self.name_edit.setMaxLength(ai_connections.MAX_NAME)
+        self.name_edit.textEdited.connect(lambda _text: setattr(self, "_auto_name", False))
         self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.Password)
         self.show_key_checkbox = QCheckBox("Show key while editing")
+        self.show_key_checkbox.toggled.connect(
+            lambda checked: self.key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        )
+        self.key_help = dash.muted("")
+        self.key_help.setWordWrap(True)
         self.model_combo = QComboBox()
         self.reasoning_combo = QComboBox()
-        self.reasoning_combo.addItems(["low", "medium", "high"])
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
         self.save_button = QPushButton("Save")
         self.test_button = QPushButton("Test Connection")
-        self.remove_button = QPushButton("Remove Key")
+        self.remove_button = QPushButton("Remove Connection")
         self.close_button = QPushButton("Close")
-        self.gemini_status_label = QLabel("")
-        self.gemini_key_edit = QLineEdit()
-        self.gemini_key_edit.setEchoMode(QLineEdit.Password)
-        self.gemini_show_key_checkbox = QCheckBox("Show key while editing")
-        self.gemini_model_combo = QComboBox()
-        self.gemini_reasoning_combo = QComboBox()
-        self.gemini_reasoning_combo.addItems(["low", "medium", "high"])
-        self.gemini_save_button = QPushButton("Save")
-        self.gemini_test_button = QPushButton("Test Connection")
-        self.gemini_remove_button = QPushButton("Remove Key")
-        # AI-6 two-stage routing: a (stronger) planner picks the tools, a
-        # (cheaper) executor runs them. Stored as PLANNER vs ROUTINE/CREATIVE.
-        self.planner_combo = QComboBox()
-        self.executor_combo = QComboBox()
-        for combo in (self.planner_combo, self.executor_combo):
-            combo.addItem("Groq", GROQ_PROFILE_ID)
-            combo.addItem("Gemini", GEMINI_PROFILE_ID)
-        self.routing_fallback_checkbox = QCheckBox("If the selected engine fails, try the other one")
-        self.routing_save_button = QPushButton("Save Routing")
-        self.routing_status_label = QLabel("")
-        self.routing_status_label.setWordWrap(True)
 
         form = QFormLayout()
-        form.addRow("Status:", self.status_label)
-        form.addRow("API Key:", self.key_edit)
+        form.addRow("Provider:", self.provider_combo)
+        form.addRow("Name:", self.name_edit)
+        form.addRow("API key:", self.key_edit)
         form.addRow("", self.show_key_checkbox)
+        form.addRow("", self.key_help)
         form.addRow("Model:", self.model_combo)
         form.addRow("Reasoning:", self.reasoning_combo)
-
-        button_row = QHBoxLayout()
-        for button in (self.save_button, self.test_button, self.remove_button, self.close_button):
-            button_row.addWidget(button)
-        button_row.addStretch(1)
-
-        groq_tab_layout = QVBoxLayout()
-        groq_tab_layout.addLayout(form)
-        groq_tab_layout.addLayout(button_row)
-        groq_tab = QWidget()
-        groq_tab.setLayout(groq_tab_layout)
-
-        gemini_form = QFormLayout()
-        gemini_form.addRow("Status:", self.gemini_status_label)
-        gemini_form.addRow("API Key:", self.gemini_key_edit)
-        gemini_form.addRow("", self.gemini_show_key_checkbox)
-        gemini_form.addRow("Model:", self.gemini_model_combo)
-        gemini_form.addRow("Reasoning:", self.gemini_reasoning_combo)
-
-        gemini_button_row = QHBoxLayout()
-        for button in (self.gemini_save_button, self.gemini_test_button, self.gemini_remove_button):
-            gemini_button_row.addWidget(button)
-        gemini_button_row.addStretch(1)
-
-        gemini_tab_layout = QVBoxLayout()
-        gemini_tab_layout.addLayout(gemini_form)
-        gemini_tab_layout.addLayout(gemini_button_row)
-        gemini_tab = QWidget()
-        gemini_tab.setLayout(gemini_tab_layout)
-
-        routing_form = QFormLayout()
-        routing_form.addRow("Planning (reasoning):", self.planner_combo)
-        routing_form.addRow("Execution (tool calls):", self.executor_combo)
-        routing_form.addRow("", self.routing_fallback_checkbox)
-        routing_help = QLabel(
-            "Every /ai request is first planned by the planning engine (it sees only a short tool catalog), "
-            "then executed by the execution engine with just the tools from the plan. "
-            "A stronger model for planning and a faster/cheaper one for execution works well. "
-            "Both engines need a saved API key."
+        form.addRow("Status:", self.status_label)
+        buttons = QHBoxLayout()
+        for button in (self.save_button, self.test_button, self.remove_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.close_button)
+        note = dash.muted(
+            "A connection is one provider account. Bots that use the same connection share its key and its limits; "
+            "give a bot its own connection (own key) for separate limits."
         )
-        routing_help.setWordWrap(True)
-        routing_button_row = QHBoxLayout()
-        routing_button_row.addWidget(self.routing_save_button)
-        routing_button_row.addStretch(1)
-        routing_tab_layout = QVBoxLayout()
-        routing_tab_layout.addWidget(routing_help)
-        routing_tab_layout.addLayout(routing_form)
-        routing_tab_layout.addWidget(self.routing_status_label)
-        routing_tab_layout.addLayout(routing_button_row)
-        routing_tab_layout.addStretch(1)
-        routing_tab = QWidget()
-        routing_tab.setLayout(routing_tab_layout)
+        note.setWordWrap(True)
+        layout = QVBoxLayout(self)
+        layout.addWidget(note)
+        layout.addLayout(form)
+        layout.addLayout(buttons)
 
-        self.provider_tabs = QTabWidget()
-        self.provider_tabs.addTab(groq_tab, "Groq")
-        self.provider_tabs.addTab(gemini_tab, "Gemini")
-        self.provider_tabs.addTab(routing_tab, "Routing")
-
-        self.bot_label = QLabel(
-            f"These keys, models and routing are used only by: {bot_label}" if bot_label else ""
-        )
-        self.bot_label.setWordWrap(True)
-        self.bot_label.setVisible(bool(bot_label))
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.bot_label)
-        layout.addWidget(self.provider_tabs)
-        layout.addWidget(self.close_button)
-        self.setLayout(layout)
-
-        self.show_key_checkbox.toggled.connect(self._toggle_key_visibility)
-        self.gemini_show_key_checkbox.toggled.connect(self._toggle_gemini_key_visibility)
-        self.save_button.clicked.connect(self.save_settings)
+        self.provider_combo.currentIndexChanged.connect(lambda _index: self._load_provider())
+        self.save_button.clicked.connect(self.save)
         self.test_button.clicked.connect(self.test_connection)
-        self.remove_button.clicked.connect(self.remove_key)
-        self.gemini_save_button.clicked.connect(self.save_gemini_settings)
-        self.gemini_test_button.clicked.connect(self.test_gemini_connection)
-        self.gemini_remove_button.clicked.connect(self.remove_gemini_key)
-        self.routing_save_button.clicked.connect(self.save_routing)
+        self.remove_button.clicked.connect(self.remove)
         self.close_button.clicked.connect(self.accept)
 
-        self._load_provider_metadata()
-        self._load_gemini_provider_metadata()
-        self._load_settings()
-        self._load_gemini_settings()
-        self._load_routing()
+        if connection is not None:
+            self.provider_combo.blockSignals(True)
+            self.provider_combo.setCurrentIndex(max(self.provider_combo.findData(connection.provider_id), 0))
+            self.provider_combo.blockSignals(False)
+            self.provider_combo.setEnabled(False)  # the key belongs to that provider
+            self.name_edit.setText(connection.name)
+        self._load_provider()
+        if connection is not None:
+            index = self.model_combo.findData(connection.model_id)
+            if index < 0:
+                self.model_combo.addItem(connection.model_id, connection.model_id)
+                index = self.model_combo.count() - 1
+            self.model_combo.setCurrentIndex(index)
+            reasoning = self.reasoning_combo.findText(str(connection.options.get("reasoning_effort", "medium")))
+            self.reasoning_combo.setCurrentIndex(reasoning if reasoning >= 0 else 0)
+        self.remove_button.setVisible(connection is not None)
         self._refresh_status()
-        self._refresh_gemini_status()
 
-    def _toggle_key_visibility(self, checked: bool) -> None:
-        self.key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+    def _provider_id(self) -> str:
+        return str(self.provider_combo.currentData())
 
-    def _toggle_gemini_key_visibility(self, checked: bool) -> None:
-        self.gemini_key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
-
-    def _load_provider_metadata(self) -> None:
+    def _load_provider(self) -> None:
+        provider_id = self._provider_id()
+        spec = ai_providers.get_spec(provider_id)
         self.model_combo.clear()
         try:
-            self._provider = self._provider_factory(self._credential_store)
-            models = self._provider.metadata.models
+            models = self._provider_factory(provider_id, self._store.credentials).metadata.models
         except Exception:
-            self._provider = None
-            self.status_label.setText("Provider unavailable")
-            self.test_button.setEnabled(False)
-            return
+            models = ()
         for model in models:
             self.model_combo.addItem(model.display_name, model.model_id)
+        self.reasoning_combo.clear()
+        self.reasoning_combo.addItems(list(spec.reasoning_levels))
+        medium = self.reasoning_combo.findText("medium")
+        self.reasoning_combo.setCurrentIndex(medium if medium >= 0 else 0)
+        self.reasoning_combo.setEnabled("reasoning_effort" in spec.options)
+        self.key_help.setText(f"Where to get it: {spec.key_help}")
+        if self._auto_name:
+            try:
+                taken = {item.name for item in self._store.load().connections}
+            except ai_platform.AIPlatformError:
+                taken = set()
+            name = f"{spec.display_name} main"
+            number = 2
+            while name in taken:
+                name = f"{spec.display_name} {number}"
+                number += 1
+            self.name_edit.setText(name)
+        self._refresh_status()
 
-    def _load_gemini_provider_metadata(self) -> None:
-        self.gemini_model_combo.clear()
-        try:
-            self._gemini_provider = self._gemini_provider_factory(self._credential_store)
-            models = self._gemini_provider.metadata.models
-        except Exception:
-            self._gemini_provider = None
-            self.gemini_status_label.setText("Provider unavailable")
-            self.gemini_test_button.setEnabled(False)
-            return
-        for model in models:
-            self.gemini_model_combo.addItem(model.display_name, model.model_id)
+    def _has_key(self) -> bool:
+        return self.connection is not None and self._store.has_key(self.connection)
 
-    def _load_settings(self) -> None:
-        try:
-            settings = self._settings_store.load()
-        except ai_platform.AIPlatformError:
-            self._settings_invalid = True
-            self._loaded_settings = ai_platform.AISettings()
-            self.status_label.setText("AI settings are invalid.")
-            self.save_button.setEnabled(False)
-            return
-        self._settings_invalid = False
-        self._loaded_settings = settings
-        profile = _profile_by_id(settings, GROQ_PROFILE_ID)
-        if profile is None:
-            profile = _profile_by_id(ai_platform.default_groq_settings(), GROQ_PROFILE_ID)
-        if profile is None:
-            return
-        model_index = self.model_combo.findData(profile.model_id)
-        if model_index >= 0:
-            self.model_combo.setCurrentIndex(model_index)
-        reasoning = str(profile.options.get("reasoning_effort", "medium"))
-        reasoning_index = self.reasoning_combo.findText(reasoning)
-        self.reasoning_combo.setCurrentIndex(reasoning_index if reasoning_index >= 0 else 1)
-
-    def _load_gemini_settings(self) -> None:
-        if self._settings_invalid:
-            return
-        profile = _profile_by_id(self._loaded_settings, GEMINI_PROFILE_ID)
-        if profile is None:
-            profile = _profile_by_id(ai_platform.default_gemini_settings(), GEMINI_PROFILE_ID)
-        if profile is None:
-            return
-        model_index = self.gemini_model_combo.findData(profile.model_id)
-        if model_index >= 0:
-            self.gemini_model_combo.setCurrentIndex(model_index)
-        reasoning = str(profile.options.get("reasoning_effort", "medium"))
-        reasoning_index = self.gemini_reasoning_combo.findText(reasoning)
-        self.gemini_reasoning_combo.setCurrentIndex(reasoning_index if reasoning_index >= 0 else 1)
-
-    def _load_routing(self) -> None:
-        if self._settings_invalid:
-            self.routing_save_button.setEnabled(False)
-            self.routing_status_label.setText("AI settings are invalid.")
-            return
-        routing = self._loaded_settings.routing
-        executor = routing.routine_profile_id or GROQ_PROFILE_ID
-        planner = routing.planner_profile_id or executor
-        for combo, profile_id in ((self.planner_combo, planner), (self.executor_combo, executor)):
-            index = combo.findData(profile_id)
-            combo.setCurrentIndex(index if index >= 0 else 0)
-        self.routing_fallback_checkbox.setChecked(bool(routing.routine_fallback_profile_ids))
-        self.routing_status_label.setText(self._routing_summary(routing))
-
-    @staticmethod
-    def _routing_summary(routing: ai_platform.RoutingConfig) -> str:
-        names = {GROQ_PROFILE_ID: "Groq", GEMINI_PROFILE_ID: "Gemini"}
-        planner = names.get(routing.planner_profile_id or "", routing.planner_profile_id or "not set")
-        executor = names.get(routing.routine_profile_id or "", routing.routine_profile_id or "not set")
-        return f"Current: planning = {planner}, execution = {executor}."
-
-    def _current_routing_settings(self) -> ai_platform.AISettings:
-        planner = str(self.planner_combo.currentData())
-        executor = str(self.executor_combo.currentData())
-        profiles = list(self._loaded_settings.profiles)
-        defaults = {
-            GROQ_PROFILE_ID: ai_platform.default_groq_settings(),
-            GEMINI_PROFILE_ID: ai_platform.default_gemini_settings(),
-        }
-        for profile_id in {planner, executor}:
-            if _profile_by_id(self._loaded_settings, profile_id) is None:
-                default_profile = _profile_by_id(defaults[profile_id], profile_id)
-                if default_profile is not None:
-                    profiles.append(default_profile)
-
-        def other(profile_id: str) -> tuple[str, ...]:
-            if not self.routing_fallback_checkbox.isChecked():
-                return ()
-            return (GEMINI_PROFILE_ID,) if profile_id == GROQ_PROFILE_ID else (GROQ_PROFILE_ID,)
-
-        routing = ai_platform.RoutingConfig(
-            routine_profile_id=executor,
-            planner_profile_id=planner,
-            creative_profile_id=executor,
-            routine_fallback_profile_ids=other(executor),
-            planner_fallback_profile_ids=other(planner),
-            creative_fallback_profile_ids=other(executor),
-        )
-        return ai_platform.AISettings(profiles=tuple(profiles), routing=routing)
-
-    def save_routing(self) -> None:
-        if self._settings_invalid:
-            self.routing_status_label.setText("AI settings are invalid.")
-            return
-        try:
-            settings = self._current_routing_settings()
-            self._settings_store.save(settings)
-            self._loaded_settings = settings
-        except Exception:
-            self.routing_status_label.setText("Save failed")
-            return
-        self.routing_status_label.setText("Saved. " + self._routing_summary(settings.routing))
-
-    def _current_settings(self) -> ai_platform.AISettings | None:
-        current_model = self.model_combo.currentData()
-        existing_groq = _profile_by_id(self._loaded_settings, GROQ_PROFILE_ID)
-        if current_model is None:
-            if existing_groq is None:
-                return None
-            model_id = existing_groq.model_id
-        else:
-            model_id = str(current_model)
-        reasoning = self.reasoning_combo.currentText() or "medium"
-        profile = ai_platform.AIProfile(
-            profile_id=GROQ_PROFILE_ID,
-            provider_id=GROQ_PROVIDER_ID,
-            model_id=str(model_id),
-            credential_ref=GROQ_CREDENTIAL_REF,
-            options={"reasoning_effort": reasoning},
-        )
-        preserved_profiles = tuple(item for item in self._loaded_settings.profiles if item.profile_id != GROQ_PROFILE_ID)
-        return ai_platform.AISettings(
-            profiles=preserved_profiles + (profile,),
-            routing=_routing_with_default(self._loaded_settings.routing, GROQ_PROFILE_ID),
-        )
-
-    def _current_gemini_settings(self) -> ai_platform.AISettings | None:
-        current_model = self.gemini_model_combo.currentData()
-        existing_gemini = _profile_by_id(self._loaded_settings, GEMINI_PROFILE_ID)
-        if current_model is None:
-            if existing_gemini is None:
-                return None
-            model_id = existing_gemini.model_id
-        else:
-            model_id = str(current_model)
-        reasoning = self.gemini_reasoning_combo.currentText() or "medium"
-        profile = ai_platform.AIProfile(
-            profile_id=GEMINI_PROFILE_ID,
-            provider_id=GEMINI_PROVIDER_ID,
-            model_id=str(model_id),
-            credential_ref=GEMINI_CREDENTIAL_REF,
-            options={"reasoning_effort": reasoning},
-        )
-        preserved_profiles = tuple(item for item in self._loaded_settings.profiles if item.profile_id != GEMINI_PROFILE_ID)
-        return ai_platform.AISettings(
-            profiles=preserved_profiles + (profile,),
-            routing=_routing_with_default(self._loaded_settings.routing, GEMINI_PROFILE_ID),
-        )
-
-    def _refresh_status(self) -> None:
-        if self._settings_invalid:
-            self.status_label.setText("AI settings are invalid.")
-            return
-        if self._provider is None:
-            self.status_label.setText("Provider unavailable")
-            return
-        if self._credential_store.exists(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF):
+    def _refresh_status(self, prefix: str = "") -> None:
+        spec = ai_providers.get_spec(self._provider_id())
+        if self._has_key():
             self.key_edit.setPlaceholderText("Key saved locally — leave blank to keep it")
-            self.status_label.setText("Configured — key saved locally")
+            text = "Configured — key saved locally"
         else:
-            self.key_edit.setPlaceholderText("Paste Groq API key")
-            self.status_label.setText("Not configured")
+            self.key_edit.setPlaceholderText(spec.key_placeholder)
+            text = "No key saved yet"
+        if self.model_combo.count() == 0:
+            text = "Provider unavailable"
+        self.status_label.setText(f"{prefix}{text}")
+        self.test_button.setEnabled(self._has_key() and not self._test_in_progress)
+        self.save_button.setEnabled(not self._test_in_progress)
+        self.remove_button.setEnabled(not self._test_in_progress)
 
-    def _refresh_gemini_status(self) -> None:
-        if self._settings_invalid:
-            self.gemini_status_label.setText("AI settings are invalid.")
-            return
-        if self._gemini_provider is None:
-            self.gemini_status_label.setText("Provider unavailable")
-            return
-        if self._credential_store.exists(GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF):
-            self.gemini_key_edit.setPlaceholderText("Key saved locally — leave blank to keep it")
-            self.gemini_status_label.setText("Configured — key saved locally")
-        else:
-            self.gemini_key_edit.setPlaceholderText("Paste Gemini API key")
-            self.gemini_status_label.setText("Not configured")
-
-    def save_settings(self) -> None:
-        if self._settings_invalid:
-            self.status_label.setText("AI settings are invalid.")
-            return
-        entered_key = self.key_edit.text()
+    def save(self) -> bool:
+        provider_id = self._provider_id()
+        spec = ai_providers.get_spec(provider_id)
+        model = self.model_combo.currentData() or (self.connection.model_id if self.connection else spec.default_model)
+        options = {"reasoning_effort": self.reasoning_combo.currentText()} if "reasoning_effort" in spec.options else {}
         try:
-            if entered_key.strip():
-                self._credential_store.write_secret(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF, entered_key.strip())
-            settings = self._current_settings()
-            if settings is not None:
-                self._settings_store.save(settings)
-                self._loaded_settings = settings
-        except Exception:
+            connection_id = self.connection.connection_id if self.connection is not None else self._store.new_connection_id(provider_id)
+            connection = ai_connections.Connection(connection_id, provider_id, self.name_edit.text(), str(model), options)
+            self._store.upsert(connection, self.key_edit.text())
+        except ai_connections.ConnectionsError as exc:
+            self.status_label.setText(f"Not saved: {exc}")
+            return False
+        except (ai_platform.AIPlatformError, ValueError, OSError):
             self.status_label.setText("Save failed")
-            return
+            return False
+        self.connection = connection
+        self.changed = True
+        self._auto_name = False
         self.key_edit.clear()
-        self._refresh_status()
+        self.provider_combo.setEnabled(False)
+        self.remove_button.setVisible(True)
+        self.setWindowTitle("Edit Connection")
+        self._refresh_status("Saved. ")
+        return True
 
-    def save_gemini_settings(self) -> None:
-        if self._settings_invalid:
-            self.gemini_status_label.setText("AI settings are invalid.")
-            return
-        entered_key = self.gemini_key_edit.text()
-        try:
-            if entered_key.strip():
-                self._credential_store.write_secret(GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF, entered_key.strip())
-            settings = self._current_gemini_settings()
-            if settings is not None:
-                self._settings_store.save(settings)
-                self._loaded_settings = settings
-        except Exception:
-            self.gemini_status_label.setText("Save failed")
-            return
-        self.gemini_key_edit.clear()
-        self._refresh_gemini_status()
-
-    def remove_key(self) -> None:
+    def remove(self) -> bool:
+        if self.connection is None or self._test_in_progress:
+            return False
+        users = self._users_of(self.connection.connection_id)
+        if users:
+            self.status_label.setText(f"Used by: {', '.join(users)}. Choose another connection there first.")
+            return False
         answer = QMessageBox.question(
             self,
-            "Remove Groq key?",
-            "Remove the locally saved Groq API key?",
+            "Remove connection?",
+            f"Remove '{self.connection.name}' and its locally saved API key?",
             QMessageBox.Ok | QMessageBox.Cancel,
             QMessageBox.Cancel,
         )
         if answer != QMessageBox.Ok:
-            return
+            return False
         try:
-            self._credential_store.delete_secret(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF)
-        except Exception:
-            self.status_label.setText("Remove failed")
-            return
-        self.key_edit.clear()
-        self._refresh_status()
-
-    def remove_gemini_key(self) -> None:
-        answer = QMessageBox.question(
-            self,
-            "Remove Gemini key?",
-            "Remove the locally saved Gemini API key?",
-            QMessageBox.Ok | QMessageBox.Cancel,
-            QMessageBox.Cancel,
-        )
-        if answer != QMessageBox.Ok:
-            return
-        try:
-            self._credential_store.delete_secret(GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF)
-        except Exception:
-            self.gemini_status_label.setText("Remove failed")
-            return
-        self.gemini_key_edit.clear()
-        self._refresh_gemini_status()
+            self._store.remove(self.connection.connection_id)
+        except ai_platform.AIPlatformError as exc:
+            self.status_label.setText(f"Not removed: {exc}")
+            return False
+        self.removed = True
+        self.changed = True
+        self.accept()
+        return True
 
     def test_connection(self) -> None:
-        if self._test_in_progress or self._gemini_test_in_progress:
+        if self._test_in_progress:
             return
-        if self._provider is None:
-            self.status_label.setText("Provider unavailable")
+        if not self._has_key():
+            self.status_label.setText("Save a key first")
             return
-        if not self._credential_store.exists(GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF):
-            self.status_label.setText("No key saved")
-            return
-        self._set_testing_controls(True)
-        self.status_label.setText("Testing Groq...")
+        connection = self.connection
+        recorder = self._usage_recorder
+        factory = self._provider_factory
+        credentials = self._store.credentials
+        self._set_testing(True)
+        self.status_label.setText(f"Testing {connection.name}...")
 
         def run_action() -> ai_platform.Availability:
-            provider = self._provider_factory(self._credential_store)
             import asyncio
 
-            return asyncio.run(provider.test_connection(GROQ_CREDENTIAL_REF))
+            kwargs = {"usage_recorder": recorder} if recorder is not None else {}
+            provider = factory(connection.provider_id, credentials, **kwargs)
+            return asyncio.run(provider.test_connection(connection.connection_id))
 
         self._start_worker(run_action, self._finish_test_connection)
 
-    def test_gemini_connection(self) -> None:
-        if self._gemini_test_in_progress or self._test_in_progress:
-            return
-        if self._gemini_provider is None:
-            self.gemini_status_label.setText("Provider unavailable")
-            return
-        if not self._credential_store.exists(GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF):
-            self.gemini_status_label.setText("No key saved")
-            return
-        self._set_gemini_testing_controls(True)
-        self.gemini_status_label.setText("Testing Gemini...")
-
-        def run_action() -> ai_platform.Availability:
-            provider = self._gemini_provider_factory(self._credential_store)
-            import asyncio
-
-            return asyncio.run(provider.test_connection(GEMINI_CREDENTIAL_REF))
-
-        self._start_worker(run_action, self._finish_gemini_test_connection)
-
     def _finish_test_connection(self, result: ActionResult) -> None:
-        self._set_testing_controls(False)
-        if not result.ok or not isinstance(result.value, ai_platform.Availability):
-            self.status_label.setText("Network unavailable")
-            return
-        availability = result.value
-        if availability.state == ai_platform.AvailabilityState.AVAILABLE:
-            self.status_label.setText("Connected")
-        elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_INVALID:
-            self.status_label.setText("Invalid API key")
-        elif availability.state == ai_platform.AvailabilityState.ACCESS_FORBIDDEN:
-            self.status_label.setText("Access forbidden")
-        elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_MISSING:
-            self.status_label.setText("No key saved")
-        elif "rate" in availability.message.lower() or "quota" in availability.message.lower():
-            self.status_label.setText("Rate limit / quota reached")
-        elif "unexpected" in availability.message.lower():
-            self.status_label.setText("Unexpected provider response")
-        else:
-            self.status_label.setText("Network unavailable")
+        self._set_testing(False)
+        self.status_label.setText(availability_text(result))
 
-    def _finish_gemini_test_connection(self, result: ActionResult) -> None:
-        self._set_gemini_testing_controls(False)
-        self._set_availability_status(self.gemini_status_label, result)
-
-    def _set_availability_status(self, label: QLabel, result: ActionResult) -> None:
-        if not result.ok or not isinstance(result.value, ai_platform.Availability):
-            label.setText("Network unavailable")
-            return
-        availability = result.value
-        if availability.state == ai_platform.AvailabilityState.AVAILABLE:
-            label.setText("Connected")
-        elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_INVALID:
-            label.setText("Invalid API key")
-        elif availability.state == ai_platform.AvailabilityState.ACCESS_FORBIDDEN:
-            label.setText("Access forbidden")
-        elif availability.state == ai_platform.AvailabilityState.CREDENTIAL_MISSING:
-            label.setText("No key saved")
-        elif "rate" in availability.message.lower() or "quota" in availability.message.lower():
-            label.setText("Rate limit / quota reached")
-        elif "unexpected" in availability.message.lower():
-            label.setText("Unexpected provider response")
-        else:
-            label.setText("Network unavailable")
-
-    def _set_testing_controls(self, testing: bool) -> None:
+    def _set_testing(self, testing: bool) -> None:
         self._test_in_progress = testing
-        self.test_button.setEnabled(not testing)
-        self.gemini_test_button.setEnabled(not testing and not self._gemini_test_in_progress)
-        self.close_button.setEnabled(not testing and not self._gemini_test_in_progress)
-        self.save_button.setEnabled(not testing and not self._settings_invalid)
+        self.close_button.setEnabled(not testing)
+        self.test_button.setEnabled(not testing and self._has_key())
+        self.save_button.setEnabled(not testing)
         self.remove_button.setEnabled(not testing)
 
-    def _set_gemini_testing_controls(self, testing: bool) -> None:
-        self._gemini_test_in_progress = testing
-        self.gemini_test_button.setEnabled(not testing)
-        self.test_button.setEnabled(not testing and not self._test_in_progress)
-        self.close_button.setEnabled(not testing and not self._test_in_progress)
-        self.gemini_save_button.setEnabled(not testing and not self._settings_invalid)
-        self.gemini_remove_button.setEnabled(not testing)
+    def _testing_blocks_close(self) -> bool:
+        if self._test_in_progress:
+            self.status_label.setText("Test connection is still in progress")
+            return True
+        return False
 
     def closeEvent(self, event) -> None:
-        if self._test_in_progress or self._gemini_test_in_progress:
-            self.status_label.setText("Test connection is still in progress")
-            self.gemini_status_label.setText("Test connection is still in progress")
+        if self._testing_blocks_close():
             event.ignore()
             return
         event.accept()
 
     def reject(self) -> None:
-        if self._test_in_progress or self._gemini_test_in_progress:
-            self.status_label.setText("Test connection is still in progress")
-            self.gemini_status_label.setText("Test connection is still in progress")
-            return
-        super().reject()
+        if not self._testing_blocks_close():
+            super().reject()
 
     def accept(self) -> None:
-        if self._test_in_progress or self._gemini_test_in_progress:
-            self.status_label.setText("Test connection is still in progress")
-            self.gemini_status_label.setText("Test connection is still in progress")
-            return
-        super().accept()
+        if not self._testing_blocks_close():
+            super().accept()
 
     def done(self, result: int) -> None:
-        if self._test_in_progress or self._gemini_test_in_progress:
-            self.status_label.setText("Test connection is still in progress")
-            self.gemini_status_label.setText("Test connection is still in progress")
-            return
-        super().done(result)
+        if not self._testing_blocks_close():
+            super().done(result)
 
     def _start_worker(self, action: Callable[[], object], finished: Callable[[ActionResult], None]) -> None:
         thread = QThread(self)
@@ -1150,7 +842,8 @@ BOT_TYPE_HINTS = {
     ADMIN_BOT_TYPE_ID: "Server administration with slash commands and the AI assistant.",
     GAME_PRESENCE_BOT_TYPE_ID: (
         "Suggests that members playing the same game get together. Needs its OWN Discord application and "
-        "token (create a second application in the Developer Portal) and its own optional AI keys."
+        "token (create a second application in the Developer Portal). AI wording is optional: it uses the "
+        "Base Set or the bot's own connections (AI Providers)."
     ),
 }
 
@@ -1797,9 +1490,13 @@ class ManagerMainWindow(QMainWindow):
         self._allow_close = False
         self._shutdown_in_progress = False
 
-        # Keyed by (bot instance ID, provider ID): every bot has its own keys.
-        self._provider_tests: dict[tuple[str, str], tuple[bool, str]] = {}
-        self._provider_tests_running: set[tuple[str, str]] = set()
+        # Shared provider connections (ai_connections) and Test Connection results.
+        self.connection_store = ai_connections.ConnectionStore()
+        self.manager_usage = ai_usage.AIUsageStore(ai_connections.manager_usage_path())
+        self._connection_tests: dict[str, tuple[bool, str]] = {}
+        self._connection_tests_running: set[str] = set()
+        self._loaded_base: ai_connections.RouteSelection | None = None
+        self._loaded_bot: tuple | None = None
         self.ai_bot_combo = QComboBox()
         self.ai_bot_combo.setMinimumWidth(260)
         self.ai_bot_combo.currentIndexChanged.connect(lambda _index: self.refresh_ai_overview())
@@ -1817,6 +1514,13 @@ class ManagerMainWindow(QMainWindow):
         self.remove_group_button.clicked.connect(self.remove_current_group)
         self._reload_group_tabs()
         self._version_text = dash.app_version_text(runtime_layout)
+        # Self-update from GitHub Releases: installed (packaged) app only.
+        self.installed_app = app_updates.current_install()
+        self.available_update: app_updates.AvailableUpdate | None = None
+        self._update_check_running = False
+        self._update_installing = False
+        self._update_error = ""
+        self._update_checked_at: datetime | None = None
 
         self.setWindowTitle("DarkAbyss Bot Manager")
         self.instance_table = QTableWidget(0, 5)
@@ -1840,7 +1544,7 @@ class ManagerMainWindow(QMainWindow):
         self.edit_config_button = QPushButton("Advanced JSON...")
         self.edit_config_button.setToolTip("Advanced/developer settings. Normal bot setup does not require editing JSON.")
         self.create_admin_button = QPushButton("Add Bot")
-        self.ai_providers_button = QPushButton("AI Providers...")
+        self.add_connection_button = QPushButton("＋  Add Connection")
 
         self.refresh_button.clicked.connect(self.refresh_instances)
         self.start_button.clicked.connect(self.start_selected)
@@ -1849,7 +1553,7 @@ class ManagerMainWindow(QMainWindow):
         self.setup_button.clicked.connect(self.setup_selected_bot)
         self.edit_config_button.clicked.connect(self.edit_selected_config)
         self.create_admin_button.clicked.connect(self.create_bot_instance)
-        self.ai_providers_button.clicked.connect(self.open_ai_providers)
+        self.add_connection_button.clicked.connect(self.add_connection)
 
         self.pages = QStackedWidget()
         self.nav_buttons: dict[str, QPushButton] = {}
@@ -1887,8 +1591,16 @@ class ManagerMainWindow(QMainWindow):
         if auto_refresh:
             self.refresh_timer.start()
 
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(app_updates.CHECK_INTERVAL_SECONDS * 1000)
+        self.update_timer.timeout.connect(lambda: self.check_for_updates(silent=True))
+        if auto_refresh and self.installed_app is not None:
+            self.update_timer.start()
+            QTimer.singleShot(UPDATE_FIRST_CHECK_MS, lambda: self.check_for_updates(silent=True))
+
         self.refresh_instances()
         self.refresh_ai_overview()
+        self._refresh_update_widgets()
 
     # -- layout ------------------------------------------------------------
 
@@ -1930,6 +1642,17 @@ class ManagerMainWindow(QMainWindow):
         settings_nav.setCheckable(False)
         layout.addWidget(settings_nav)
         layout.addStretch(1)
+
+        self.update_install_button = dash.styled_button("", "primary")
+        self.update_install_button.clicked.connect(self.install_available_update)
+        self.update_install_button.hide()
+        self.update_check_button = dash.styled_button("Check for updates", "link")
+        self.update_check_button.clicked.connect(lambda: self.check_for_updates(silent=False))
+        self.update_label = dash.muted("")
+        self.update_label.setWordWrap(True)
+        layout.addWidget(self.update_install_button)
+        layout.addWidget(self.update_check_button, 0, Qt.AlignLeft)
+        layout.addWidget(self.update_label)
 
         status = QFrame()
         status.setObjectName("sideStatus")
@@ -1997,7 +1720,7 @@ class ManagerMainWindow(QMainWindow):
         self.discord_card.clicked.connect(lambda: self.show_page("bots"))
         self.ai_card.clicked.connect(lambda: self.show_page("ai"))
         self.commands_card.clicked.connect(lambda: self.show_page("commands"))
-        self.routing_card.clicked.connect(lambda: self.open_ai_providers("Routing"))
+        self.routing_card.clicked.connect(lambda: self.show_page("ai"))
         cards = QHBoxLayout()
         cards.setSpacing(14)
         for card in (self.discord_card, self.ai_card, self.commands_card, self.routing_card):
@@ -2055,13 +1778,17 @@ class ManagerMainWindow(QMainWindow):
 
         providers_panel = dash.Panel("\U0001f9e0", "AI Providers")
         configure = providers_panel.add_header_button("Configure")
-        configure.clicked.connect(lambda: self.open_ai_providers())
+        configure.clicked.connect(lambda: self.show_page("ai"))
         self.dashboard_ai_bot_label = dash.muted("")
         self.dashboard_ai_bot_label.setWordWrap(True)
         providers_panel.body.addWidget(self.dashboard_ai_bot_label)
-        self.provider_rows: list[dash.ProviderRow] = []
-        for row in self._make_provider_rows():
-            providers_panel.body.addWidget(row)
+        self.dashboard_no_ai_label = dash.muted("No AI connection for this bot yet. Open AI Providers to add one.")
+        self.dashboard_no_ai_label.setWordWrap(True)
+        providers_panel.body.addWidget(self.dashboard_no_ai_label)
+        self.dashboard_connections_box = QVBoxLayout()
+        self.dashboard_connections_box.setSpacing(10)
+        providers_panel.body.addLayout(self.dashboard_connections_box)
+        self.dashboard_connection_rows: dict[str, dash.ProviderRow] = {}
 
         quick_panel = dash.Panel("⚡", "Quick Actions")
         self.quick_toggle_button = dash.styled_button("▶  Start Bot", "primary")
@@ -2115,6 +1842,25 @@ class ManagerMainWindow(QMainWindow):
             self._all_bots, self._config_api, self.restart_instance
         )
         return self.presence_panel
+
+    def _presence_summary(self, info: manager_core.InstanceInfo) -> str | None:
+        """One line for the dashboard: the Game Presence bot's current reason/state."""
+        if info.bot_type != GAME_PRESENCE_BOT_TYPE_ID:
+            return None
+        if info.state == manager_core.STATE_RUNNING:
+            status = admin_terminal.read_runtime_json(
+                admin_terminal.runtime_dir_for_logs(info.logs_dir), manager_game_presence.STATUS_FILE_NAME
+            )
+            diagnosis = status.get("diagnosis") if isinstance(status, dict) else None
+            if isinstance(diagnosis, dict) and diagnosis.get("text"):
+                return str(diagnosis["text"])
+        try:
+            data = game_presence.normalize_bot_config(self._config_api.get_config_snapshot(info.instance_id).effective)
+        except Exception:
+            return "Config problem: open the Game Presence page."
+        if not game_presence.is_configured(data):
+            return "Not configured: choose a server and a channel on the Game Presence page."
+        return None if info.state == manager_core.STATE_RUNNING else "Stopped."
 
     def restart_instance(self, instance_id: str) -> None:
         """Restart one bot through the normal lifecycle path (used by module pages)."""
@@ -2218,19 +1964,6 @@ class ManagerMainWindow(QMainWindow):
         self._reload_group_tabs(select=manager_groups.DEFAULT_GROUP)
         self.refresh_instances()
 
-    def _make_provider_rows(self) -> list[dash.ProviderRow]:
-        rows = []
-        for provider_id, name, logo, tab in (
-            (GROQ_PROVIDER_ID, "Groq", "groq", "Groq"),
-            (GEMINI_PROVIDER_ID, "Gemini", "✦", "Gemini"),
-        ):
-            row = dash.ProviderRow(provider_id, name, logo)
-            row.test_button.clicked.connect(lambda _checked=False, pid=provider_id: self.test_provider(pid))
-            row.settings_button.clicked.connect(lambda _checked=False, tab_name=tab: self.open_ai_providers(tab_name))
-            self.provider_rows.append(row)
-            rows.append(row)
-        return rows
-
     def _build_bots_page(self) -> QWidget:
         title = QLabel("Bots")
         title.setObjectName("heroSubtitle")
@@ -2278,26 +2011,85 @@ class ManagerMainWindow(QMainWindow):
         title = QLabel("AI Providers")
         title.setObjectName("heroSubtitle")
         description = dash.muted(
-            "Every bot has its OWN AI keys, models and routing (separate quotas). Choose the bot first. Keys stay "
-            "on this PC. The planning engine reads a short tool catalog and writes the plan; the execution engine "
-            "runs it with only the planned tools. A Game Presence bot uses AI only to vary message wording."
+            "Connections are provider accounts (key + model). The base set is what every bot uses by default; any bot "
+            "can get its own connections instead. Bots on the same connection share its key and limits. Keys stay on "
+            "this PC. Planning writes the plan from a short tool catalog; execution runs it with only the planned tools."
         )
         description.setWordWrap(True)
+
+        connections_panel = dash.Panel("\U0001f50c", "Connections")
+        connections_panel.header.addWidget(self.add_connection_button)
+        self.connections_status = dash.muted("")
+        self.connections_status.setWordWrap(True)
+        connections_panel.body.addWidget(self.connections_status)
+        self.connections_box = QVBoxLayout()
+        self.connections_box.setSpacing(10)
+        connections_panel.body.addLayout(self.connections_box)
+        self.connection_rows: dict[str, dash.ProviderRow] = {}
+
+        base_panel = dash.Panel("⭐", "Base set (default for every bot)")
+        self.base_planner_combo = QComboBox()
+        self.base_executor_combo = QComboBox()
+        self.base_fallback_combo = QComboBox()
+        self.base_cross_checkbox = QCheckBox("If planning or execution fails, the other one takes over")
+        self.base_save_button = dash.styled_button("Save Base Set", "primary")
+        self.base_save_button.clicked.connect(self.save_base_set)
+        self.base_status_label = dash.muted("")
+        self.base_status_label.setWordWrap(True)
+        base_form = QFormLayout()
+        base_form.addRow("Planning (thinks):", self.base_planner_combo)
+        base_form.addRow("Execution (acts):", self.base_executor_combo)
+        base_form.addRow("Extra fallback:", self.base_fallback_combo)
+        base_form.addRow("", self.base_cross_checkbox)
+        base_panel.body.addLayout(base_form)
+        base_buttons = QHBoxLayout()
+        base_buttons.addWidget(self.base_save_button)
+        base_buttons.addStretch(1)
+        base_panel.body.addLayout(base_buttons)
+        base_panel.body.addWidget(self.base_status_label)
+
+        bot_panel = dash.Panel("\U0001f916", "AI of a bot")
         bot_row = QHBoxLayout()
         bot_row.addWidget(QLabel("Bot:"))
         bot_row.addWidget(self.ai_bot_combo, 1)
+        bot_panel.body.addLayout(bot_row)
         self.ai_bot_hint = dash.muted("")
         self.ai_bot_hint.setWordWrap(True)
-        routing_panel = dash.Panel("\U0001f500", "Routing")
-        routing_button = routing_panel.add_header_button("Change Routing")
-        routing_button.clicked.connect(lambda: self.open_ai_providers("Routing"))
+        bot_panel.body.addWidget(self.ai_bot_hint)
+        self.bot_mode_base_radio = QRadioButton("Use the base set")
+        self.bot_mode_custom_radio = QRadioButton("Choose connections for this bot")
+        self.bot_mode_group = QButtonGroup(self)
+        self.bot_mode_group.addButton(self.bot_mode_base_radio)
+        self.bot_mode_group.addButton(self.bot_mode_custom_radio)
+        self.bot_mode_base_radio.toggled.connect(lambda _checked: self._update_bot_controls())
+        self.bot_planner_combo = QComboBox()
+        self.bot_executor_combo = QComboBox()
+        self.bot_fallback_combo = QComboBox()
+        self.bot_cross_checkbox = QCheckBox("If planning or execution fails, the other one takes over")
+        self.bot_save_button = dash.styled_button("Save for this bot", "primary")
+        self.bot_save_button.clicked.connect(self.save_bot_ai)
+        self.bot_status_label = dash.muted("")
+        self.bot_status_label.setWordWrap(True)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.bot_mode_base_radio)
+        mode_row.addWidget(self.bot_mode_custom_radio)
+        mode_row.addStretch(1)
+        bot_panel.body.addLayout(mode_row)
+        bot_form = QFormLayout()
+        bot_form.addRow("Planning (thinks):", self.bot_planner_combo)
+        bot_form.addRow("Execution (acts):", self.bot_executor_combo)
+        bot_form.addRow("Extra fallback:", self.bot_fallback_combo)
+        bot_form.addRow("", self.bot_cross_checkbox)
+        bot_panel.body.addLayout(bot_form)
+        bot_buttons = QHBoxLayout()
+        bot_buttons.addWidget(self.bot_save_button)
+        bot_buttons.addStretch(1)
+        bot_panel.body.addLayout(bot_buttons)
         self.ai_routing_label = QLabel("")
         self.ai_routing_label.setWordWrap(True)
-        routing_panel.body.addWidget(self.ai_routing_label)
-        providers_panel = dash.Panel("\U0001f9e0", "Providers")
-        providers_panel.header.addWidget(self.ai_providers_button)
-        for row in self._make_provider_rows():
-            providers_panel.body.addWidget(row)
+        bot_panel.body.addWidget(self.ai_routing_label)
+        bot_panel.body.addWidget(self.bot_status_label)
+
         safety_panel = dash.Panel("\U0001f6e1", "How the AI acts on your server")
         safety = QLabel(
             "• Only Discord actions through the bot's tools: no Windows commands, files or browser.\n"
@@ -2305,7 +2097,8 @@ class ManagerMainWindow(QMainWindow):
             "• Confirmations: 'plan once' (default) or 'every change' in Bot Setup; deletions, bans, kicks "
             "and permission changes always ask with exact data.\n"
             "• Nobody can use the bot to act on roles or members at or above their own highest role, "
-            "and Administrator is never granted."
+            "and Administrator is never granted.\n"
+            "• A bot only ever uses the connections of its base set or of its own choice."
         )
         safety.setWordWrap(True)
         safety_panel.body.addWidget(safety)
@@ -2315,11 +2108,9 @@ class ManagerMainWindow(QMainWindow):
         layout.setSpacing(14)
         layout.addWidget(title)
         layout.addWidget(description)
-        layout.addLayout(bot_row)
-        layout.addWidget(self.ai_bot_hint)
-        layout.addWidget(routing_panel)
-        layout.addWidget(providers_panel)
-        layout.addWidget(safety_panel)
+        for panel in (connections_panel, base_panel, bot_panel, safety_panel):
+            panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+            layout.addWidget(panel)
         layout.addStretch(1)
         return self._scroll_page(inner)
 
@@ -2473,6 +2264,10 @@ class ManagerMainWindow(QMainWindow):
             capabilities = BOT_TYPE_CAPABILITIES.get(info.bot_type)
             if capabilities:
                 facts.append(f"Can do: {capabilities}")
+            presence = self._presence_summary(info)
+            if presence:
+                # "Online" alone said nothing about whether suggestions can happen.
+                facts.append(f"Game Presence: {presence}")
             if info.pid is not None:
                 facts.append(f"PID: {info.pid}")
             if info.uptime_seconds is not None:
@@ -2511,7 +2306,7 @@ class ManagerMainWindow(QMainWindow):
         return next((info for info in self._last_infos if info.instance_id == instance_id), None)
 
     def ai_stores_for(self, instance_id: str) -> ai_storage.InstanceAIStores:
-        """AI settings + keys of ONE bot instance (never another bot's files)."""
+        """AI of ONE bot: its selection, its usage and the shared connections."""
         return ai_storage.for_instance_id(instance_id, must_exist=False)
 
     def _ai_stores(self) -> ai_storage.InstanceAIStores | None:
@@ -2523,124 +2318,459 @@ class ManagerMainWindow(QMainWindow):
         except (ai_storage.AIStorageError, instance_store.InstanceStoreError):
             return None
 
+    # -- connections: data ------------------------------------------------------
+
+    def _load_connections(self) -> ai_connections.ConnectionsConfig | None:
+        try:
+            return self.connection_store.load()
+        except ai_platform.AIPlatformError:
+            return None
+
+    def _bot_selection(self, instance_id: str) -> ai_connections.BotSelection | None:
+        try:
+            return self.ai_stores_for(instance_id).selection.load()
+        except (ai_platform.AIPlatformError, instance_store.InstanceStoreError):
+            return None
+
+    def _usage_stores(self) -> list[ai_usage.AIUsageStore]:
+        """Every bot's usage + the Manager's (Test Connection): limits are per key."""
+        stores = []
+        for info in self._last_infos:
+            try:
+                stores.append(self.ai_stores_for(info.instance_id).usage)
+            except (ai_storage.AIStorageError, instance_store.InstanceStoreError):
+                continue
+        stores.append(self.manager_usage)
+        return stores
+
+    def _bots_using(self, connection_id: str, config: ai_connections.ConnectionsConfig) -> list[str]:
+        """Bots whose current route (base set or own choice) includes the connection."""
+        names = []
+        for info in self._last_infos:
+            selection = self._bot_selection(info.instance_id) or ai_connections.BotSelection()
+            if connection_id in selection.route(config).connection_ids():
+                names.append(info.display_name)
+        return names
+
+    def users_of(self, connection_id: str) -> list[str]:
+        """Who uses a connection: the base set and bots with their own choice."""
+        config = self._load_connections()
+        users = []
+        base_bots = []
+        custom_bots = []
+        for info in self._last_infos:
+            selection = self._bot_selection(info.instance_id) or ai_connections.BotSelection()
+            if selection.mode == ai_connections.MODE_BASE:
+                base_bots.append(info.display_name)
+            elif connection_id in selection.custom.connection_ids():
+                custom_bots.append(info.display_name)
+        if config is not None and connection_id in config.base.connection_ids():
+            users.append(f"Base set ({', '.join(base_bots)})" if base_bots else "Base set")
+        return users + custom_bots
+
+    def _connection_label(self, config: ai_connections.ConnectionsConfig, connection_id: str | None) -> str:
+        connection = config.get(connection_id) if connection_id else None
+        if connection is None:
+            return "not set"
+        return f"{connection.name} ({ai_providers.model_display_name(connection.provider_id, connection.model_id)})"
+
+    @staticmethod
+    def _fill_combo(combo: QComboBox, config: ai_connections.ConnectionsConfig, none_label: str) -> None:
+        signature = (none_label,) + tuple((item.connection_id, item.name) for item in config.connections)
+        if combo.property("signature") == signature:
+            return
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(none_label, None)
+        for item in config.connections:
+            combo.addItem(item.name, item.connection_id)
+        index = combo.findData(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+        combo.setProperty("signature", signature)
+
+    @staticmethod
+    def _select(combo: QComboBox, connection_id: str | None) -> None:
+        index = combo.findData(connection_id)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _sync_rows(
+        self,
+        box: QVBoxLayout,
+        rows: dict[str, dash.ProviderRow],
+        connections: list[ai_connections.Connection],
+    ) -> None:
+        wanted = [(item.connection_id, item.name, item.provider_id) for item in connections]
+        current = [(cid, row.property("connection_name"), row.provider_id) for cid, row in rows.items()]
+        if wanted == current:
+            return
+        for row in rows.values():
+            box.removeWidget(row)
+            # Hide and detach now: deleteLater alone leaves the old row painted
+            # over the panel until the event loop runs.
+            row.hide()
+            row.setParent(None)
+            row.deleteLater()
+        rows.clear()
+        for connection in connections:
+            spec = ai_providers.get_spec(connection.provider_id)
+            row = dash.ProviderRow(connection.provider_id, connection.name, spec.logo)
+            row.connection_id = connection.connection_id
+            row.setProperty("connection_name", connection.name)
+            row.settings_button.setText("⚙  Edit")
+            row.test_button.clicked.connect(lambda _checked=False, cid=connection.connection_id: self.test_connection(cid))
+            row.settings_button.clicked.connect(lambda _checked=False, cid=connection.connection_id: self.edit_connection(cid))
+            box.addWidget(row)
+            rows[connection.connection_id] = row
+
+    def _row_state(self, config: ai_connections.ConnectionsConfig, connection: ai_connections.Connection) -> tuple[str, str]:
+        if connection.connection_id in self._connection_tests_running:
+            return "Testing...", "warn"
+        tested = self._connection_tests.get(connection.connection_id)
+        if tested is not None:
+            return (tested[1], "ok") if tested[0] else (tested[1], "bad")
+        if self.connection_store.has_key(connection):
+            return "Configured", "info"
+        return "No key saved", "muted"
+
+    # -- connections: overview -----------------------------------------------------
+
     def refresh_ai_overview(self) -> None:
+        config = self._load_connections()
         info = self._ai_info()
-        stores = self._ai_stores()
         bot_text = f"Showing AI of: {info.display_name} ({info.instance_id})" if info is not None else "Add a bot first."
         self.dashboard_ai_bot_label.setText(bot_text)
+        if config is None:
+            self.connections_status.setText(
+                f"{ai_connections.CONNECTIONS_FILE_NAME} is unreadable. AI is unavailable for every bot until it is "
+                "restored (the file is kept as it is)."
+            )
+            dash.colored(self.connections_status, "bad")
+            self.ai_card.update_card("Settings invalid", "bad", "Connections file unreadable")
+            self.routing_card.update_card("plan: not set", "muted", "run: not set", "muted")
+            for button in (self.add_connection_button, self.base_save_button, self.bot_save_button):
+                button.setEnabled(False)
+            return
+        for button in (self.add_connection_button, self.base_save_button):
+            button.setEnabled(True)
+        connections = list(config.connections)
+        self.connections_status.setText(
+            "" if connections else "No connections yet. Add one: provider, API key and model."
+        )
+        dash.colored(self.connections_status, "muted")
+        names = {item.connection_id: item.name for item in connections}
+
+        # All connections: total usage of every bot + Manager tests (limits belong to the key).
+        self._sync_rows(self.connections_box, self.connection_rows, connections)
+        stores = self._usage_stores()
+        for connection in connections:
+            row = self.connection_rows[connection.connection_id]
+            text, color = self._row_state(config, connection)
+            model = ai_providers.model_display_name(connection.provider_id, connection.model_id)
+            row.set_state(text, color, f"{model} · {ai_providers.get_spec(connection.provider_id).display_name}", [])
+            users = self.users_of(connection.connection_id)
+            row.role_label.setText(f"Used by: {', '.join(users)}" if users else "Not used by any bot")
+            usage_rows = ai_usage.merged_usage(stores, connection.provider_id, connection.connection_id)
+            row.set_usage(ai_usage.rows_text(usage_rows, {connection.model_id: model}), dash.CONNECTION_USAGE_TOOLTIP)
+            row.test_button.setEnabled(self.connection_store.has_key(connection) and connection.connection_id not in self._connection_tests_running)
+
+        # Base set editor (only reset to the saved state when that state changes).
+        for combo, none_label in (
+            (self.base_planner_combo, "— same as execution —"),
+            (self.base_executor_combo, "— not set —"),
+            (self.base_fallback_combo, "— none —"),
+        ):
+            self._fill_combo(combo, config, none_label)
+        if self._loaded_base != config.base:
+            self._loaded_base = config.base
+            self._select(self.base_planner_combo, config.base.planner)
+            self._select(self.base_executor_combo, config.base.executor)
+            self._select(self.base_fallback_combo, config.base.fallback)
+            self.base_cross_checkbox.setChecked(config.base.cross_fallback)
+        base_users = [item.display_name for item in self._last_infos if (self._bot_selection(item.instance_id) or ai_connections.BotSelection()).mode == ai_connections.MODE_BASE]
+        self.base_status_label.setText(
+            f"Planning: {self._connection_label(config, config.base.planner or config.base.executor)} · "
+            f"Execution: {self._connection_label(config, config.base.executor or config.base.planner)}\n"
+            f"Bots on the base set: {', '.join(base_users) if base_users else 'none'}"
+        )
+
+        self._refresh_bot_ai(config, info)
+        self._refresh_ai_cards(config, info)
+        self._refresh_dashboard_connections(config, info, stores)
+
+    def _refresh_bot_ai(self, config: ai_connections.ConnectionsConfig, info: manager_core.InstanceInfo | None) -> None:
         if info is not None and info.bot_type == GAME_PRESENCE_BOT_TYPE_ID:
             self.ai_bot_hint.setText(
-                "This Game Presence bot uses its own keys only to vary suggestion wording (execution engine, no tools). "
-                "Without keys it posts the built-in templates."
+                "Game Presence uses only the Execution connection, to vary suggestion wording (no tools). "
+                "Without a working connection it posts the built-in templates."
             )
         else:
             self.ai_bot_hint.setText("")
-        if stores is None:
-            for row in self.provider_rows:
-                row.set_state("No bot selected", "muted", None, [])
-                row.test_button.setEnabled(False)
-            self.ai_card.update_card("No bot", "muted", "Add a bot first")
-            self.routing_card.update_card("plan: not set", "muted", "run: not set", "muted")
-            self.ai_routing_label.setText("Add a bot first; AI keys and routing are stored per bot.")
+        self.ai_bot_hint.setVisible(bool(self.ai_bot_hint.text()))
+        for combo, none_label in (
+            (self.bot_planner_combo, "— same as execution —"),
+            (self.bot_executor_combo, "— not set —"),
+            (self.bot_fallback_combo, "— none —"),
+        ):
+            self._fill_combo(combo, config, none_label)
+        if info is None:
+            self.bot_save_button.setEnabled(False)
+            self.bot_mode_base_radio.setEnabled(False)
+            self.bot_mode_custom_radio.setEnabled(False)
+            self.ai_routing_label.setText("Add a bot first.")
+            self.bot_status_label.setText("")
+            self._loaded_bot = None
+            self._update_bot_controls()
             return
-        overview = dash.provider_overview(
-            stores.settings,
-            stores.credentials,
-            (
-                (GROQ_PROVIDER_ID, GROQ_PROFILE_ID, GROQ_CREDENTIAL_REF),
-                (GEMINI_PROVIDER_ID, GEMINI_PROFILE_ID, GEMINI_CREDENTIAL_REF),
-            ),
-        )
-        names = {GROQ_PROFILE_ID: "Groq", GEMINI_PROFILE_ID: "Gemini"}
-        providers = overview["providers"]
-        configured = [name for pid, name in ((GROQ_PROVIDER_ID, "Groq"), (GEMINI_PROVIDER_ID, "Gemini")) if providers[pid]["configured"]]
-        for row in self.provider_rows:
-            facts = providers[row.provider_id]
-            test_key = (stores.instance_id, row.provider_id)
-            tested = self._provider_tests.get(test_key)
-            if test_key in self._provider_tests_running:
-                text, color = "Testing...", "warn"
-            elif tested is not None:
-                text, color = (tested[1], "ok") if tested[0] else (tested[1], "bad")
-            elif facts["configured"]:
-                text, color = "Configured", "info"
-            else:
-                text, color = "Not configured", "muted"
-            row.set_state(text, color, facts["model"], facts["roles"])
-            row.test_button.setEnabled(facts["configured"] and test_key not in self._provider_tests_running)
-        if not overview["valid"]:
-            self.ai_card.update_card("Settings invalid", "bad", "Open AI Providers to fix")
-        else:
-            self.ai_card.update_card(
-                f"{len(configured)} configured", "ok" if configured else "muted", ", ".join(configured) or "Add a Groq or Gemini key"
+        self.bot_mode_base_radio.setEnabled(True)
+        self.bot_mode_custom_radio.setEnabled(True)
+        selection = self._bot_selection(info.instance_id)
+        if selection is None:
+            self.ai_routing_label.setText(
+                f"{ai_connections.SELECTION_FILE_NAME} of this bot is unreadable: its AI is unavailable (fail closed). "
+                "Save a choice below to replace it."
             )
-        planner = names.get(overview["planner"] or "", overview["planner"] or "not set")
-        executor = names.get(overview["executor"] or "", overview["executor"] or "not set")
-        routed = bool(overview["planner"] and overview["executor"])
-        self.routing_card.update_card(f"plan: {planner}", "accent" if routed else "muted", f"run: {executor}", "ok" if routed else "muted")
-        self.ai_routing_label.setText(
-            f"Planning (thinks): {planner}\nExecution (acts): {executor}\n"
-            "Change it in AI Providers → Routing. Using one engine for both is fine too."
+            dash.colored(self.ai_routing_label, "bad")
+            selection = ai_connections.BotSelection()
+            state = (info.instance_id, None)
+        else:
+            dash.colored(self.ai_routing_label, "muted")
+            state = (info.instance_id, selection)
+            route = selection.route(config).restricted_to(config.ids())
+            fallback = []
+            if route.cross_fallback:
+                fallback.append("the other one")
+            if route.fallback:
+                fallback.append(self._connection_label(config, route.fallback))
+            source = "base set" if selection.mode == ai_connections.MODE_BASE else "own choice"
+            self.ai_routing_label.setText(
+                f"In use ({source}):\n"
+                f"Planning (thinks): {self._connection_label(config, route.planner or route.executor)}\n"
+                f"Execution (acts): {self._connection_label(config, route.executor or route.planner)}\n"
+                f"Fallback: {', '.join(fallback) if fallback else 'none'}"
+            )
+        if self._loaded_bot != state:
+            self._loaded_bot = state
+            (self.bot_mode_custom_radio if selection.mode == ai_connections.MODE_CUSTOM else self.bot_mode_base_radio).setChecked(True)
+            self._select(self.bot_planner_combo, selection.custom.planner)
+            self._select(self.bot_executor_combo, selection.custom.executor)
+            self._select(self.bot_fallback_combo, selection.custom.fallback)
+            self.bot_cross_checkbox.setChecked(selection.custom.cross_fallback)
+            self.bot_status_label.setText("")
+        self.bot_save_button.setEnabled(True)
+        self._update_bot_controls()
+
+    def _update_bot_controls(self) -> None:
+        custom = self.bot_mode_custom_radio.isChecked() and self.bot_mode_custom_radio.isEnabled()
+        for widget in (self.bot_planner_combo, self.bot_executor_combo, self.bot_fallback_combo, self.bot_cross_checkbox):
+            widget.setEnabled(custom)
+
+    def _refresh_ai_cards(self, config: ai_connections.ConnectionsConfig, info: manager_core.InstanceInfo | None) -> None:
+        keyed = [item.name for item in config.connections if self.connection_store.has_key(item)]
+        if not config.connections:
+            self.ai_card.update_card("No connections", "muted", "Add a Groq or Gemini connection")
+        else:
+            self.ai_card.update_card(f"{len(config.connections)} connection(s)", "ok" if keyed else "muted", ", ".join(keyed) or "No key saved yet")
+        selection = self._bot_selection(info.instance_id) if info is not None else None
+        if selection is None:
+            self.routing_card.update_card("plan: not set", "muted", "run: not set", "muted")
+            return
+        route = selection.route(config).restricted_to(config.ids())
+        planner = config.get(route.planner or route.executor)
+        executor = config.get(route.executor or route.planner)
+        routed = planner is not None and executor is not None
+        self.routing_card.update_card(
+            f"plan: {planner.name if planner else 'not set'}",
+            "accent" if routed else "muted",
+            f"run: {executor.name if executor else 'not set'}",
+            "ok" if routed else "muted",
         )
 
-    # -- AI provider tests ---------------------------------------------------
+    def _refresh_dashboard_connections(
+        self,
+        config: ai_connections.ConnectionsConfig,
+        info: manager_core.InstanceInfo | None,
+        stores: list[ai_usage.AIUsageStore],
+    ) -> None:
+        """Dashboard: the selected bot's connections with THIS bot's usage."""
+        selection = self._bot_selection(info.instance_id) if info is not None else None
+        route = selection.route(config).restricted_to(config.ids()) if selection is not None else ai_connections.RouteSelection()
+        roles: dict[str, list[str]] = {}
+        for name, connection_id in (
+            ("planning", route.planner or route.executor),
+            ("execution", route.executor or route.planner),
+            ("fallback", route.fallback),
+        ):
+            if connection_id:
+                roles.setdefault(connection_id, []).append(name)
+        if route.cross_fallback and route.planner and route.executor and route.planner != route.executor:
+            for connection_id in (route.planner, route.executor):
+                roles.setdefault(connection_id, []).append("fallback")
+        used = [config.get(connection_id) for connection_id in roles]
+        self._sync_rows(self.dashboard_connections_box, self.dashboard_connection_rows, [item for item in used if item is not None])
+        bot_usage = self.ai_stores_for(info.instance_id).usage if info is not None else None
+        for connection in [item for item in used if item is not None]:
+            row = self.dashboard_connection_rows[connection.connection_id]
+            text, color = self._row_state(config, connection)
+            model = ai_providers.model_display_name(connection.provider_id, connection.model_id)
+            row.set_state(text, color, model, roles[connection.connection_id])
+            others = [name for name in self._bots_using(connection.connection_id, config) if info is None or name != info.display_name]
+            if others:
+                # Shared key: the other bots spend the same provider limits.
+                row.role_label.setText(f"{row.role_label.text()} · also used by {', '.join(others)}")
+            try:
+                own_rows = bot_usage.day_usage(connection.provider_id, None, connection.connection_id) if bot_usage else []
+            except (OSError, ValueError):
+                own_rows = None
+            if own_rows is None:
+                row.set_usage("Usage data unreadable", dash.BOT_USAGE_TOOLTIP)
+            else:
+                freshest = {item.model_id: item.rate_limits for item in ai_usage.merged_usage(stores, connection.provider_id, connection.connection_id)}
+                own_rows = [replace(item, rate_limits=freshest.get(item.model_id, item.rate_limits)) for item in own_rows]
+                row.set_usage(ai_usage.rows_text(own_rows, {connection.model_id: model}), dash.BOT_USAGE_TOOLTIP)
+            row.test_button.setEnabled(self.connection_store.has_key(connection) and connection.connection_id not in self._connection_tests_running)
+        self.dashboard_no_ai_label.setVisible(not used)
 
-    def test_provider(self, provider_id: str) -> None:
-        stores = self._ai_stores()
-        name = "Groq" if provider_id == GROQ_PROVIDER_ID else "Gemini"
-        if stores is None:
-            self._set_light_error(f"{name}: add a bot first; AI keys are stored per bot.")
+    # -- connections: actions -------------------------------------------------------------
+
+    def _connection_dialog(self, connection: ai_connections.Connection | None) -> ConnectionDialog:
+        return ConnectionDialog(
+            self.connection_store,
+            connection,
+            usage_store=self.manager_usage,
+            users_of=self.users_of,
+            parent=self,
+        )
+
+    def add_connection(self) -> None:
+        dialog = self._connection_dialog(None)
+        dialog.exec()
+        self._after_connection_dialog(dialog)
+
+    def edit_connection(self, connection_id: str) -> None:
+        config = self._load_connections()
+        connection = config.get(connection_id) if config is not None else None
+        if connection is None:
+            self._set_light_error("This connection no longer exists.")
+            self.refresh_ai_overview()
             return
-        test_key = (stores.instance_id, provider_id)
-        if test_key in self._provider_tests_running:
-            return
-        credential_ref = GROQ_CREDENTIAL_REF if provider_id == GROQ_PROVIDER_ID else GEMINI_CREDENTIAL_REF
-        factory = create_groq_provider if provider_id == GROQ_PROVIDER_ID else create_gemini_provider
-        # The selected bot's own key; another bot's key is never used.
-        credential_store = stores.credentials
-        if not credential_store.exists(provider_id, credential_ref):
-            self._set_light_error(f"{name}: no API key saved for this bot. Open AI Providers to add one.")
-            return
-        self._provider_tests_running.add(test_key)
+        dialog = self._connection_dialog(connection)
+        dialog.exec()
+        self._after_connection_dialog(dialog)
+
+    def _after_connection_dialog(self, dialog: ConnectionDialog) -> None:
+        if getattr(dialog, "changed", False) and dialog.connection is not None:
+            # Key or model may have changed: an earlier test result is stale.
+            self._connection_tests.pop(dialog.connection.connection_id, None)
+            config = self._load_connections()
+            if config is not None and not config.base.connection_ids() and not dialog.removed:
+                # The first working connection becomes the base set, so bots can use AI at once.
+                self.connection_store.set_base(ai_connections.RouteSelection(executor=dialog.connection.connection_id))
+            self.activity.add("AI", f"Connection {'removed' if dialog.removed else 'saved'}: {dialog.connection.name}.")
         self.refresh_ai_overview()
+
+    def save_base_set(self) -> None:
+        route = ai_connections.RouteSelection(
+            self.base_planner_combo.currentData(),
+            self.base_executor_combo.currentData(),
+            self.base_fallback_combo.currentData(),
+            self.base_cross_checkbox.isChecked(),
+        )
+        if route.connection_ids() and not (route.executor or route.planner):
+            self.base_status_label.setText("Choose the execution connection.")
+            return
+        try:
+            self.connection_store.set_base(route)
+        except ai_platform.AIPlatformError as exc:
+            self.base_status_label.setText(f"Not saved: {exc}")
+            return
+        self.activity.add("AI", "Base AI set saved.")
+        self.refresh_ai_overview()
+
+    def save_bot_ai(self) -> None:
+        info = self._ai_info()
+        if info is None:
+            return
+        if self.bot_mode_custom_radio.isChecked():
+            route = ai_connections.RouteSelection(
+                self.bot_planner_combo.currentData(),
+                self.bot_executor_combo.currentData(),
+                self.bot_fallback_combo.currentData(),
+                self.bot_cross_checkbox.isChecked(),
+            )
+            if not (route.executor or route.planner):
+                self.bot_status_label.setText("Choose at least the execution connection, or use the base set.")
+                return
+            selection = ai_connections.BotSelection(ai_connections.MODE_CUSTOM, route)
+        else:
+            # Keep the custom route stored, so switching back restores it.
+            previous = self._bot_selection(info.instance_id) or ai_connections.BotSelection()
+            selection = ai_connections.BotSelection(ai_connections.MODE_BASE, previous.custom)
+        try:
+            self.ai_stores_for(info.instance_id).selection.save(selection)
+        except (ai_platform.AIPlatformError, OSError) as exc:
+            self.bot_status_label.setText(f"Not saved: {exc}")
+            return
+        self._loaded_bot = None
+        self.activity.add("AI", f"AI of {info.display_name}: {'own choice' if selection.mode == ai_connections.MODE_CUSTOM else 'base set'}.")
+        self.refresh_ai_overview()
+        self.bot_status_label.setText("Saved. Running bots use it from their next AI request.")
+
+    def test_connection(self, connection_id: str) -> None:
+        config = self._load_connections()
+        connection = config.get(connection_id) if config is not None else None
+        if connection is None:
+            return
+        if connection_id in self._connection_tests_running:
+            return
+        if not self.connection_store.has_key(connection):
+            self._set_light_error(f"{connection.name}: no API key saved. Edit the connection to add one.")
+            return
+        self._connection_tests_running.add(connection_id)
+        self.refresh_ai_overview()
+        credentials = self.connection_store.credentials
+        # A real API request on this key: counted as Manager usage of the connection.
+        recorder = self.manager_usage.recorder()
 
         def run_action() -> ai_platform.Availability:
             import asyncio
 
-            return asyncio.run(factory(credential_store).test_connection(credential_ref))
+            provider = create_provider(connection.provider_id, credentials, usage_recorder=recorder)
+            return asyncio.run(provider.test_connection(connection_id))
 
-        self._start_worker(run_action, lambda result: self._finish_provider_test(test_key, name, result))
+        self._start_worker(run_action, lambda result: self._finish_connection_test(connection, result))
 
     def test_all_providers(self) -> None:
-        stores = self._ai_stores()
-        if stores is None:
-            self._set_light_error("Add a bot first; AI keys are stored per bot.")
+        """Quick action: test every connection the selected bot uses."""
+        info = self._ai_info()
+        config = self._load_connections()
+        if info is None or config is None:
+            self._set_light_error("Add a bot first.")
             return
-        credential_store = stores.credentials
+        selection = self._bot_selection(info.instance_id)
+        route = selection.route(config).restricted_to(config.ids()) if selection is not None else ai_connections.RouteSelection()
         started = False
-        for provider_id, credential_ref in ((GROQ_PROVIDER_ID, GROQ_CREDENTIAL_REF), (GEMINI_PROVIDER_ID, GEMINI_CREDENTIAL_REF)):
-            if credential_store.exists(provider_id, credential_ref):
-                self.test_provider(provider_id)
+        for connection_id in route.connection_ids():
+            connection = config.get(connection_id)
+            if connection is not None and self.connection_store.has_key(connection):
+                self.test_connection(connection_id)
                 started = True
         if not started:
-            self._set_light_error("No AI provider key is saved for this bot yet. Open AI Providers to add one.")
+            self._set_light_error("This bot has no connection with a saved key yet. Open AI Providers to add one.")
 
-    def _finish_provider_test(self, test_key: tuple[str, str], name: str, result: ActionResult) -> None:
-        self._provider_tests_running.discard(test_key)
-        availability = result.value if result.ok else None
-        if isinstance(availability, ai_platform.Availability) and availability.ok:
-            self._provider_tests[test_key] = (True, "Connected")
-            self.activity.add("AI", f"{name} connection test successful.")
+    def _finish_connection_test(self, connection: ai_connections.Connection, result: ActionResult) -> None:
+        self._connection_tests_running.discard(connection.connection_id)
+        text = availability_text(result)
+        self._connection_tests[connection.connection_id] = (text == "Connected", text)
+        if text == "Connected":
+            self.activity.add("AI", f"{connection.name}: connection test successful.")
         else:
-            state = getattr(availability, "state", None)
-            reason = {
-                ai_platform.AvailabilityState.CREDENTIAL_INVALID: "Invalid API key",
-                ai_platform.AvailabilityState.ACCESS_FORBIDDEN: "Access forbidden",
-                ai_platform.AvailabilityState.CREDENTIAL_MISSING: "No key saved",
-            }.get(state, "Unavailable")
-            self._provider_tests[test_key] = (False, reason)
-            self.activity.add("Error", f"{name} connection test failed: {reason}.")
+            self.activity.add("Error", f"{connection.name}: connection test failed: {text}.")
         self.refresh_ai_overview()
+
+    def open_ai_providers(self, tab: str | None = None) -> None:
+        self.show_page("ai")
 
     # -- logs ------------------------------------------------------------------
 
@@ -2713,6 +2843,9 @@ class ManagerMainWindow(QMainWindow):
         self._update_selected_details()
         self._refresh_dashboard()
         self._refresh_ai_choices()
+        # Keys, models, routing and usage of the selected bot change outside the
+        # Manager too (the bot records usage): re-read them on every refresh.
+        self.refresh_ai_overview()
 
     def start_selected(self) -> None:
         self._dispatch_lifecycle_action("start", lambda instance_id: self.manager.start(instance_id))
@@ -2766,29 +2899,172 @@ class ManagerMainWindow(QMainWindow):
         self._select_instance_by_id(instance_id)
         self.setup_selected_bot()
 
-    def open_ai_providers(self, tab: str | None = None) -> None:
-        info = self._ai_info()
-        stores = self._ai_stores()
-        if info is None or stores is None:
-            self._show_error("Add a bot first. AI keys, models and routing are stored per bot.")
+    # -- self-update -------------------------------------------------------
+
+    def _refresh_update_widgets(self) -> None:
+        if not hasattr(self, "update_check_button"):
             return
-        dialog = AIProviderSettingsDialog(
-            settings_store=stores.settings,
-            credential_store=stores.credentials,
-            parent=self,
-            bot_label=f"{info.display_name} ({info.instance_id})",
+        update = self.available_update
+        busy = self._update_check_running or self._update_installing
+        self.update_install_button.setVisible(update is not None)
+        self.update_install_button.setEnabled(update is not None and not busy)
+        if update is not None:
+            self.update_install_button.setText("Updating..." if self._update_installing else f"⬆  Update to v{update.version}")
+            self.update_install_button.setToolTip(update.url)
+        self.update_check_button.setEnabled(self.installed_app is not None and not busy)
+        self.update_check_button.setText("Checking..." if self._update_check_running else "Check for updates")
+        if self.installed_app is None:
+            self.update_check_button.setToolTip(UPDATES_SOURCE_TEXT)
+            text, tooltip = "Updates: packaged app only", UPDATES_SOURCE_TEXT
+        elif self._update_installing:
+            text, tooltip = "Installing the update: bots restart automatically.", ""
+        elif self._update_error:
+            text, tooltip = "Update check failed (retrying later).", self._update_error
+        elif update is not None:
+            text, tooltip = f"v{update.version} is available.", update.url
+        elif self._update_checked_at is not None:
+            text, tooltip = f"Up to date · checked {self._update_checked_at:%H:%M}", app_updates.RELEASES_URL
+        else:
+            text, tooltip = "", ""
+        self.update_label.setText(text)
+        self.update_label.setToolTip(tooltip)
+
+    def check_for_updates(self, silent: bool = False) -> None:
+        """Ask GitHub for a newer release in the background (installed app only)."""
+        if self.installed_app is None:
+            if not silent:
+                self._set_light_error(UPDATES_SOURCE_TEXT)
+            return
+        if self._update_check_running or self._update_installing:
+            return
+        self._update_check_running = True
+        self._refresh_update_widgets()
+        current = self.installed_app.version
+        self._start_worker(
+            lambda: app_updates.check_for_update(current),
+            lambda result: self._finish_update_check(result, silent),
         )
-        if tab:
-            tabs = getattr(dialog, "provider_tabs", None)
-            if isinstance(tabs, QTabWidget):
-                for index in range(tabs.count()):
-                    if tabs.tabText(index) == tab:
-                        tabs.setCurrentIndex(index)
-                        break
-        dialog.exec()
-        # Keys, models or routing may have changed; earlier test results may be stale.
-        self._provider_tests.clear()
-        self.refresh_ai_overview()
+
+    def _finish_update_check(self, result: ActionResult, silent: bool) -> None:
+        self._update_check_running = False
+        self._update_checked_at = datetime.now()
+        if not result.ok:
+            self._update_error = result.message
+            self._refresh_update_widgets()
+            if not silent:
+                self._show_error(result.message)
+            return
+        self._update_error = ""
+        previous = self.available_update
+        self.available_update = result.value if isinstance(result.value, app_updates.AvailableUpdate) else None
+        update = self.available_update
+        if update is not None and (previous is None or previous.version != update.version):
+            self.activity.add("Update", f"Version {update.version} is available: use '⬆ Update' in the sidebar.")
+        if not silent:
+            self._set_status(f"Version {update.version} is available." if update else "You have the newest version.")
+        self._refresh_update_widgets()
+
+    def _running_instance_ids(self) -> list[str]:
+        return [info.instance_id for info in self.manager.list_instance_info() if info.state == manager_core.STATE_RUNNING]
+
+    def install_available_update(self) -> None:
+        update, installed = self.available_update, self.installed_app
+        if update is None or installed is None or self._update_installing:
+            return
+        if self._operation_in_progress():
+            self._set_light_error("Wait for the current operation to finish, then update.")
+            return
+        try:
+            running = self._running_instance_ids()
+        except manager_core.ManagerCoreError as exc:
+            self._show_error(f"Unable to check running bots before the update: {exc}")
+            return
+        bots_line = (
+            f"Running bots ({', '.join(running)}) are stopped for the switch and started again by the new version."
+            if running
+            else "No bots are running."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Update DarkAbyss Bot Manager",
+            f"Install v{update.version}? You have v{installed.version}.\n\n"
+            "The Manager downloads it from GitHub, verifies it, installs it next to the current version "
+            "and restarts.\n"
+            f"{bots_line}\n\n"
+            "Bots, tokens, AI connections and keys, settings and logs are kept: they live in "
+            f"{app_paths.DATA_ROOT}, and the update contains program files only.",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Ok:
+            return
+        self._update_installing = True
+        self._refresh_update_widgets()
+        self._set_status(f"Downloading and installing v{update.version}...")
+        self.activity.add("Update", f"Installing v{update.version}...")
+
+        def run_update() -> dict[str, str]:
+            # Nothing changes until the new version is verified and active; only
+            # then are the bots stopped (they restart under the new version).
+            app_updates.install_update(update, installed.install_root)
+            running_now = self._running_instance_ids()
+            app_updates.save_resume(running_now, update.version)
+            stopped = self.manager.shutdown_all()
+            return {instance_id: str(value) for instance_id, value in stopped.items() if isinstance(value, Exception)}
+
+        self._start_worker(run_update, lambda result: self._finish_update_install(update, result))
+
+    def _finish_update_install(self, update: app_updates.AvailableUpdate, result: ActionResult) -> None:
+        installed = self.installed_app
+        if not result.ok:
+            self._update_installing = False
+            self._refresh_update_widgets()
+            self.refresh_instances()
+            if isinstance(result.value, app_updates.AppUpdateError):
+                self._show_error(f"{result.message}\n\nNothing was changed: this version keeps running.")
+            else:
+                self._show_error(
+                    f"v{update.version} was installed, but the switch did not finish: {result.message}\n"
+                    "Close the Manager and start Launcher.exe to open the new version."
+                )
+            return
+        failures = result.value or {}
+        if failures:
+            self._update_installing = False
+            self._refresh_update_widgets()
+            self.refresh_instances()
+            self._show_error(
+                f"v{update.version} is installed, but some bots did not stop:\n"
+                + "\n".join(f"{instance_id}: {message}" for instance_id, message in failures.items())
+                + "\n\nStop them, then close the Manager and start Launcher.exe."
+            )
+            return
+        try:
+            app_updates.start_launcher(installed)
+        except (app_updates.AppUpdateError, OSError) as exc:
+            self._update_installing = False
+            self._refresh_update_widgets()
+            self.refresh_instances()
+            self._show_error(f"v{update.version} is installed. Start Launcher.exe to open it ({exc}).")
+            return
+        self._allow_close = True
+        self.close()
+
+    def resume_bots_after_update(self) -> list[str]:
+        """Start the bots that were running when the previous version installed this one."""
+        resume = app_updates.take_resume()
+        known = {info.instance_id for info in self._last_infos}
+        started = [instance_id for instance_id in resume if instance_id in known and instance_id not in self._busy_instances]
+        if resume:
+            self.activity.add("Update", f"Updated to {self._version_text}." + (f" Starting again: {', '.join(started)}." if started else ""))
+        for instance_id in started:
+            self._busy_instances.add(instance_id)
+            self._start_worker(
+                lambda instance_id=instance_id: self.manager.start(instance_id),
+                lambda result, instance_id=instance_id: self._finish_lifecycle_action(instance_id, "start", result),
+            )
+        self._update_buttons()
+        return started
 
     def closeEvent(self, event) -> None:
         if self._allow_close:
@@ -2951,11 +3227,10 @@ class ManagerMainWindow(QMainWindow):
 def bootstrap_for_gui() -> None:
     app_paths.ensure_user_data()
     admin_instance.ensure_admin_instance()
-    # One-time copy of the old global AI keys/settings into the single Admin
-    # bot (never into a Game Presence bot); safe to run on every start.
-    result = ai_storage.migrate_legacy_global_ai()
-    if result.status in ("migrated", "ambiguous", "failed"):
-        print(result.message)
+    # One-time conversion of older AI layouts into connections (copy only,
+    # idempotent): the single bot's keys become the base set.
+    for message in ai_storage.run_migrations():
+        print(message)
 
 
 def main(manager: manager_core.BotProcessManager | None = None) -> int:
@@ -2970,6 +3245,7 @@ def main(manager: manager_core.BotProcessManager | None = None) -> int:
     window.setMinimumSize(1100, 720)
     window.resize(1400, 900)
     window.show()
+    window.resume_bots_after_update()
     return app.exec()
 
 

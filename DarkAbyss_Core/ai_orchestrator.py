@@ -342,28 +342,26 @@ class _StoredCompare:
 
 def build_default_provider_registry(
     credential_store: ai_platform.CredentialStore,
+    usage_store: Any = None,
 ) -> ai_platform.LazyProviderRegistry:
-    """Shared Groq/Gemini adapters bound to ONE bot instance's credentials."""
+    """Shared Groq/Gemini adapters bound to ONE bot instance's credentials
+    (and, when given, that instance's ai_usage store)."""
     if not isinstance(credential_store, ai_platform.CredentialStore):
         raise ValueError("A bot instance's CredentialStore is required.")
+    import ai_providers
+
     credentials = credential_store
+    recorder = usage_store.recorder() if usage_store is not None else None
     registry = ai_platform.LazyProviderRegistry()
 
-    # Bot requests retry transient provider failures (rate limit, 5xx, network);
-    # explicit Manager "Test Connection" calls build their own providers and
-    # fail fast.
-    def create_groq() -> ai_platform.AIProvider:
-        import ai_groq
+    # One lazily created adapter per catalog provider (ai_providers); a new
+    # provider only needs its catalog entry. Bot requests retry transient
+    # provider failures; Manager "Test Connection" calls fail fast.
+    def factory_for(provider_id: str):
+        return lambda: ai_providers.create_provider(provider_id, credentials, usage_recorder=recorder, retry=True)
 
-        return ai_groq.GroqProvider(credentials, retry_delays=ai_groq.DEFAULT_RETRY_DELAYS)
-
-    def create_gemini() -> ai_platform.AIProvider:
-        import ai_gemini
-
-        return ai_gemini.GeminiProvider(credentials, retry_delays=ai_gemini.DEFAULT_RETRY_DELAYS)
-
-    registry.register_factory("groq", create_groq)
-    registry.register_factory("gemini", create_gemini)
+    for provider_id in ai_providers.provider_ids():
+        registry.register_factory(provider_id, factory_for(provider_id))
     return registry
 
 
@@ -376,11 +374,13 @@ class AIOrchestrator:
         credential_store: ai_platform.CredentialStore | None = None,
         clock: Callable[[], float] | None = None,
         stores: Any = None,
+        usage_store: Any = None,
     ) -> None:
         if stores is not None:
             # ai_storage.InstanceAIStores of one bot instance.
             settings_store = settings_store or stores.settings
             credential_store = credential_store or stores.credentials
+            usage_store = usage_store or getattr(stores, "usage", None)
         # AI settings and credentials belong to one bot instance (ai_storage);
         # there is no global fallback, so a bot can never pick up another
         # bot's keys or routing by accident.
@@ -391,11 +391,13 @@ class AIOrchestrator:
         # Use explicit None checks: an injected empty ProviderRegistry has len()==0
         # and is falsy, but it is a valid caller choice (zero providers) and must
         # never be silently replaced by the default Groq/Gemini registry.
-        self._providers = (
-            provider_registry
-            if provider_registry is not None
-            else build_default_provider_registry(self._credential_store)
-        )
+        self._usage_store = usage_store
+        if provider_registry is not None:
+            self._providers = provider_registry
+        elif usage_store is not None:
+            self._providers = build_default_provider_registry(self._credential_store, usage_store=usage_store)
+        else:
+            self._providers = build_default_provider_registry(self._credential_store)
         if clock is not None and not callable(clock):
             raise ValueError("clock must be callable.")
         # Monotonic clock for pending-state expiry; injectable for tests.

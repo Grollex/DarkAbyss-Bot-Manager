@@ -87,11 +87,14 @@ class GeminiProvider:
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         retry_delays: tuple[float, ...] = (),
         sleep: Any = None,
+        usage_recorder: Any = None,
     ) -> None:
         parsed = urlparse(GEMINI_API_BASE)
         if parsed.scheme != "https":
             raise ValueError("Gemini API endpoint must use HTTPS.")
         self._credential_store = credential_store
+        # ai_usage recorder of the bot instance whose key this is (None = off).
+        self._usage_recorder = usage_recorder
         self._api_base = GEMINI_API_BASE
         self._transport = transport or UrllibGeminiHTTPTransport()
         self._timeout_seconds = float(timeout_seconds)
@@ -178,7 +181,7 @@ class GeminiProvider:
         while True:
             try:
                 try:
-                    status, response_bytes = await asyncio.to_thread(
+                    result = await asyncio.to_thread(
                         self._transport.post_json,
                         url=url,
                         headers=headers,
@@ -186,6 +189,7 @@ class GeminiProvider:
                         timeout_seconds=self._timeout_seconds,
                         max_response_bytes=self._max_response_bytes,
                     )
+                    status, response_bytes = result[0], result[1]
                 except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
                     raise GeminiNetworkError("Gemini network request failed.") from exc
             except GeminiNetworkError:
@@ -194,6 +198,8 @@ class GeminiProvider:
                 await self._sleep(self._retry_delays[attempt])
                 attempt += 1
                 continue
+            # Every received response counts (retries, 429 and 503 included).
+            await self._record_usage(request.model_id, credential_ref, status, response_bytes)
             if status in RETRYABLE_STATUSES and attempt < len(self._retry_delays):
                 wait = _retry_wait_seconds(response_bytes, self._retry_delays[attempt])
                 if wait is not None:
@@ -204,6 +210,18 @@ class GeminiProvider:
         if status < 200 or status >= 300:
             raise _error_for_status(status, response_bytes)
         return _parse_response(response_bytes, model_id=request.model_id)
+
+    async def _record_usage(self, model_id: str, credential_ref: str, status: int, response_bytes: bytes) -> None:
+        """One received response: usageMetadata token counts only (Gemini sends
+        no rate-limit headers). Recording problems never affect the request."""
+        if self._usage_recorder is None:
+            return
+        try:
+            import ai_usage
+
+            await asyncio.to_thread(self._usage_recorder, ai_usage.gemini_event(model_id, status, response_bytes, credential_ref))
+        except Exception:
+            pass
 
     def _load_api_key(self, credential_ref: str) -> str:
         try:

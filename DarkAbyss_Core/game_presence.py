@@ -422,16 +422,45 @@ class SuggestionPolicy(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class Diagnosis:
+    """Why there is (no) suggestion right now; shown in the Manager, never decides anything."""
+
+    code: str
+    text: str
+
+    def public_dict(self) -> dict[str, str]:
+        return {"code": self.code, "text": self.text}
+
+
+def _minutes(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 class DefaultSuggestionPolicy:
     """MVP policy: >= 2 settled players, not all in one voice, opt-out and cooldowns respected."""
 
     def evaluate(self, group: CandidateGroup, context: PolicyContext) -> Suggestion | None:
+        return self.decide(group, context)[0]
+
+    def decide(self, group: CandidateGroup, context: PolicyContext) -> tuple[Suggestion | None, Diagnosis | None]:
+        """The decision of ``evaluate`` plus the reason when it is "no"."""
         config, now, ledger = context.config, context.now, context.ledger
+        game = group.game_display_name
         settled = [record for record in group.members if now - record.started_at >= config.delay_seconds]
         if len(settled) < MIN_GROUP_SIZE:
-            return None
+            return None, Diagnosis("settling", f"Waiting: players must be in {game} for {_minutes(config.delay_seconds)} first.")
         if not ledger.guild_available(group.guild_id, now, config):
-            return None
+            last = self._last(context, group.guild_id, "guild_at")
+            left = config.guild_cooldown_seconds - (now - last) if last is not None else 0
+            return None, Diagnosis("guild_cooldown", f"Server cooldown: next suggestion possible in {_minutes(left)}.")
+        muted = [record for record in group.members if context.is_muted(group.guild_id, record.user_id)]
+        cooling = [
+            record
+            for record in group.members
+            if record not in muted and not ledger.user_available(group.guild_id, record.user_id, now, config)
+        ]
         eligible = [
             record
             for record in group.members
@@ -439,15 +468,30 @@ class DefaultSuggestionPolicy:
             and ledger.user_available(group.guild_id, record.user_id, now, config)
         ]
         if len(eligible) < MIN_GROUP_SIZE:
-            return None
+            parts = []
+            if muted:
+                parts.append(f"{len(muted)} muted")
+            if cooling:
+                parts.append(f"{len(cooling)} pinged recently (per-user cooldown)")
+            code = "user_muted" if muted and not cooling else "user_cooldown"
+            return None, Diagnosis(code, f"Not enough players to ping in {game}: {', '.join(parts)}.")
         # Everyone eligible already together in one voice channel: nothing to suggest.
         channels = {record.voice_channel_id for record in eligible}
         if len(channels) == 1 and None not in channels:
-            return None
+            return None, Diagnosis("same_voice", f"All players of {game} are already together in one voice channel.")
         eligible = eligible[:MAX_MENTIONS]
         target_ids = tuple(record.user_id for record in eligible)
         if ledger.group_recently_suggested(group.guild_id, group.game_key, target_ids, now, config):
-            return None
+            return None, Diagnosis("group_cooldown", f"These players were already invited to {game} recently (group cooldown).")
+        return self._suggestion(group, config, eligible, target_ids), None
+
+    @staticmethod
+    def _last(context: PolicyContext, guild_id: int, key: str) -> float | None:
+        value = context.ledger._store.load(guild_id).get(key)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    @staticmethod
+    def _suggestion(group: CandidateGroup, config: GamePresenceConfig, eligible: list[ActivityRecord], target_ids: tuple[int, ...]) -> Suggestion:
         if config.voice_aware:
             cluster_channel, cluster = _largest_voice_cluster(eligible)
             if cluster_channel is not None and len(cluster) >= MIN_GROUP_SIZE:
@@ -638,6 +682,8 @@ class GamePresenceEngine:
         self.preferences = PreferenceBook(self.store, self.clock)
         self.ledger = CooldownLedger(self.store)
         self._pending: dict[tuple[int, str], _Pending] = {}
+        # Why the last tick produced no suggestion (diagnostics only).
+        self.diagnosis = Diagnosis("starting", "Starting: the first check runs within a few seconds.")
 
     # -- configuration ------------------------------------------------------
 
@@ -696,23 +742,67 @@ class GamePresenceEngine:
         config = self.config
         if not config.active:
             self._pending.clear()
+            self.diagnosis = Diagnosis("inactive", "Not active.")
             return []
         guild_id = config.guild_id
         groups = {group.game_key: group for group in self.selector.groups(self.tracker, self.sessions, guild_id, config)}
         for key in [key for key in self._pending if key[1] not in groups]:
             self._pending.pop(key, None)  # group fell apart: cancel silently
         suggestions = []
+        waiting: list[tuple[float, Diagnosis]] = []
+        blocked: list[Diagnosis] = []
+        decide = getattr(self.policy, "decide", None)
         for game_key, group in groups.items():
             pending = self._pending.setdefault((guild_id, game_key), _Pending(now))
             if now - pending.created_at < config.delay_seconds:
+                left = config.delay_seconds - (now - pending.created_at)
+                waiting.append(
+                    (left, Diagnosis("waiting_delay", f"Waiting: {len(group.members)} players in {group.game_display_name}, check in {_minutes(left)}."))
+                )
                 continue
             context = PolicyContext(now, config, self.preferences.is_muted, self.ledger)
-            suggestion = self.policy.evaluate(group, context)
+            if callable(decide):
+                suggestion, reason = decide(group, context)
+            else:
+                suggestion, reason = self.policy.evaluate(group, context), None
             # Re-arm: the next re-check happens one delay later at the earliest.
             self._pending[(guild_id, game_key)] = _Pending(now)
             if suggestion is not None:
                 suggestions.append(suggestion)
+            elif reason is not None:
+                blocked.append(reason)
+        if suggestions:
+            names = ", ".join(item.game_display_name for item in suggestions)
+            self.diagnosis = Diagnosis("suggesting", f"Suggestion ready for {names}.")
+        elif blocked:
+            self.diagnosis = blocked[0]
+        elif waiting:
+            self.diagnosis = min(waiting, key=lambda item: item[0])[1]
+        else:
+            self.diagnosis = self._idle_diagnosis(guild_id, config)
         return suggestions
+
+    def _idle_diagnosis(self, guild_id: int, config: GamePresenceConfig) -> Diagnosis:
+        """No group of >= 2 players: say whether nobody plays, everyone plays alone, or games are filtered."""
+        games = [(key, len(self.tracker.players(guild_id, key))) for key in self.tracker.game_keys(guild_id)]
+        games = [(key, count) for key, count in games if count]
+        if not games:
+            return Diagnosis("no_activity", "No Playing activity detected in the server right now.")
+        filtered = [key for key, count in games if not config.game_allowed(key)]
+        allowed = [(key, count) for key, count in games if config.game_allowed(key)]
+        if any(count >= MIN_GROUP_SIZE for key, count in games if key in filtered) and not any(count >= MIN_GROUP_SIZE for _key, count in allowed):
+            names = ", ".join(self._display(guild_id, key) for key, count in games if key in filtered and count >= MIN_GROUP_SIZE)
+            return Diagnosis("game_filtered", f"Players share only filtered games: {names} (allowlist / ignore list).")
+        top_key, top_count = max(allowed or games, key=lambda item: item[1])
+        return Diagnosis(
+            "single_player",
+            f"Nobody plays the same game together ({self._display(guild_id, top_key)}: {top_count} player{'' if top_count == 1 else 's'}).",
+        )
+
+    def _display(self, guild_id: int, game_key: str) -> str:
+        players = self.tracker.players(guild_id, game_key)
+        identity = self.tracker.game_of(guild_id, next(iter(players))) if players else None
+        return identity.display_name if identity else game_key
 
     def mark_sent(self, suggestion: Suggestion) -> None:
         self.ledger.record(suggestion, self.clock(), self.config)
@@ -734,6 +824,7 @@ class GamePresenceEngine:
             "top_games": games[:5],
             "pending_groups": len(self._pending),
             "last_suggestion": last,
+            "diagnosis": self.diagnosis.public_dict(),
         }
 
 

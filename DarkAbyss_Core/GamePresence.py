@@ -6,8 +6,8 @@ lives in its instance folder:
 
     instances/<id>/config.json            Game Presence settings (top-level keys)
     instances/<id>/secrets/token.txt      Discord token of THIS application
-    instances/<id>/secrets/ai/...         its own Groq/Gemini keys (optional)
-    instances/<id>/data/ai.json           its own AI models/routing (optional)
+    instances/<id>/data/ai_selection.json AI source: Base Set (default) or own connections
+    instances/<id>/data/ai_usage.json     this bot's provider-reported AI usage
     instances/<id>/data/game_presence_state.json   opt-outs, history, cooldowns
     instances/<id>/runtime/               lock, bot_status.json, game_presence_status.json
 
@@ -42,6 +42,7 @@ import config_store
 import game_presence
 import game_presence_discord
 import instance_store
+import runtime_layout
 
 BOT_TYPE_ID = "game_presence"
 LOCK_FILE_NAME = "game_presence_bot.lock"
@@ -158,15 +159,25 @@ class PresenceStateStore(admin_features.FeatureStore):
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
-                raise PresenceStateError(
-                    f"Game Presence state file is unreadable ({self.path.name}); posting is paused. "
-                    "Restore or remove the file, then restart the bot."
-                ) from exc
+                raise PresenceStateError(state_problem_text(self.path.name, "is unreadable")) from exc
             if not isinstance(raw, dict) or not isinstance(raw.get("guilds"), dict):
-                raise PresenceStateError(f"Game Presence state file has an invalid shape ({self.path.name}); posting is paused.")
+                raise PresenceStateError(state_problem_text(self.path.name, "has an invalid shape"))
             data = {"version": admin_features.STORE_VERSION, "guilds": raw["guilds"]}
         self._data = data
         return data
+
+    def verify(self) -> None:
+        """Raise PresenceStateError when the state cannot be used."""
+        with self._lock:
+            self._load()
+
+
+def state_problem_text(file_name: str, reason: str) -> str:
+    return (
+        f"Game Presence state file {file_name} {reason}. Posting is paused and Mute/Allow buttons answer "
+        "'unavailable' so nobody's opt-out is lost. Restore the file from a backup or remove it (removing "
+        "forgets opt-outs and cooldowns), then restart the bot."
+    )
 
 
 def state_store_for(data_dir: Path) -> PresenceStateStore:
@@ -174,7 +185,7 @@ def state_store_for(data_dir: Path) -> PresenceStateStore:
 
 
 # --------------------------------------------------------------------------
-# optional AI wording (this instance's own keys; never tools)
+# optional AI wording (Base Set or this bot's own connections; never tools)
 # --------------------------------------------------------------------------
 
 
@@ -190,7 +201,7 @@ class TextOnlyAI:
 
 
 class InstanceAI:
-    """Lazily builds the orchestrator over THIS instance's AI settings and keys."""
+    """Lazily builds the orchestrator over THIS bot's AI source (Base Set or own connections)."""
 
     def __init__(self, instance_id: str) -> None:
         self.instance_id = instance_id
@@ -254,11 +265,31 @@ class GamePresenceBot(discord.Client):
         except Exception as exc:  # pragma: no cover - status is best effort
             print(f"Status error: {type(exc).__name__}")
 
+    def state_problem(self) -> str | None:
+        """Explanation when the persisted state is unusable (fail closed), else None."""
+        try:
+            self.store.verify()
+        except PresenceStateError as exc:
+            return str(exc)
+        return None
+
+    def publish_state_problem(self) -> bool:
+        """Write the state problem into the status file for the Manager; True if there is one."""
+        problem = self.state_problem()
+        if problem is None:
+            return False
+        self.presence_runtime.problem = problem
+        self.presence_runtime.diagnose("state_problem", problem)
+        self.presence_runtime.write_status()
+        return True
+
     async def run_tick(self) -> None:
         self._ticks += 1
         if self._ticks % STATUS_REFRESH_EVERY_TICKS == 0:
             self.refresh_bot_status()
         self.reload_config()
+        if self.publish_state_problem():
+            return  # fail closed: nothing is evaluated or posted
         try:
             await self.presence_runtime.tick()
         except PresenceStateError as exc:
@@ -286,7 +317,8 @@ class GamePresenceBot(discord.Client):
         print(f"Game Presence Bot is online as {self.user}")
         self.refresh_bot_status()
         self.presence_runtime.seed()
-        self.presence_runtime.write_status()
+        if not self.publish_state_problem():
+            self.presence_runtime.write_status()
 
     # -- Discord events -----------------------------------------------------------
 
@@ -346,6 +378,7 @@ def acquire_single_instance_lock(runtime: GamePresenceRuntimeContext) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    runtime_layout.line_buffered_output()
     try:
         args = parse_args(argv)
         runtime = resolve_runtime(args.instance)
@@ -357,6 +390,11 @@ def main(argv: list[str] | None = None) -> int:
     client = GamePresenceBot(runtime)
     if client.presence_runtime.config_problem:
         print(client.presence_runtime.config_problem)
+    state_problem = client.state_problem()
+    if state_problem:
+        # The bot still connects (buttons answer, the Manager sees the status)
+        # but posts nothing until the file is fixed.
+        print(state_problem, file=sys.stderr)
     print("Game Presence Bot requests Discord intents: guilds, members, presences, voice states (no message content).")
 
     if not acquire_single_instance_lock(runtime):

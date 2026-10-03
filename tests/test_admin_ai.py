@@ -22,7 +22,7 @@ import tempfile as _tempfile  # noqa: E402
 if not _os.environ.get("DARKABYSS_DATA_DIR"):
     _os.environ["DARKABYSS_DATA_DIR"] = _tempfile.mkdtemp(prefix="darkabyss-test-")
 
-AI_MODULES = ("ai_orchestrator", "ai_platform", "ai_groq", "ai_gemini")
+AI_MODULES = ("ai_orchestrator", "ai_platform", "ai_providers", "ai_connections", "ai_storage", "ai_groq", "ai_gemini")
 
 
 def load_modules():

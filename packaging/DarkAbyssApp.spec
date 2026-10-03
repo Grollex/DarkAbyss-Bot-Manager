@@ -33,6 +33,16 @@ a = Analysis(
         "game_presence",
         "game_presence_discord",
         "ai_storage",
+        "ai_usage",
+        "ai_connections",
+        # Provider adapters are loaded by name from the ai_providers catalog.
+        "ai_providers",
+        "ai_groq",
+        "ai_gemini",
+        # Self-update from GitHub Releases (Manager).
+        "app_updates",
+        "github_updates",
+        "update_engine",
         "PySide6.QtCore",
         "PySide6.QtGui",
         "PySide6.QtWidgets",

@@ -29,7 +29,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.11"
           cache: "pip"
           cache-dependency-path: |
             requirements.txt
@@ -69,24 +69,12 @@ jobs:
         run: python -m pip install -r requirements-build.txt
 
       - name: Compile Python sources
-        run: |
-          python -m py_compile DarkAbyss_Core/Admin.py
-          python -m py_compile DarkAbyss_Core/app_entry.py
-          python -m py_compile DarkAbyss_Core/app_paths.py
-          python -m py_compile DarkAbyss_Core/bot_registry.py
-          python -m py_compile DarkAbyss_Core/config_store.py
-          python -m py_compile DarkAbyss_Core/github_updates.py
-          python -m py_compile DarkAbyss_Core/instance_store.py
-          python -m py_compile DarkAbyss_Core/launcher.py
-          python -m py_compile DarkAbyss_Core/manager_core.py
-          python -m py_compile DarkAbyss_Core/manager_gui.py
-          python -m py_compile DarkAbyss_Core/release_manifest.py
-          python -m py_compile DarkAbyss_Core/runtime_layout.py
-          python -m py_compile DarkAbyss_Core/update_engine.py
-          python -m py_compile packaging/assemble_distribution.py
-          python -m py_compile packaging/build_release_artifacts.py
+        run: python -m compileall -q DarkAbyss_Core packaging tests
 
       - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QPA_FONTDIR: C:\Windows\Fonts
         run: python -m unittest discover -s tests -v
 
       - name: Build packaged runtime

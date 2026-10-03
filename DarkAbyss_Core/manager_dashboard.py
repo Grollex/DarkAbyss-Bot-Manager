@@ -96,6 +96,11 @@ QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #6b5ca8; bor
 QCheckBox::indicator:hover { border-color: #a78bfa; }
 QCheckBox::indicator:checked { background-color: #8b5cf6; border-color: #c4b5fd; }
 QCheckBox::indicator:disabled { border-color: #3a3163; background-color: #15122a; }
+QRadioButton { spacing: 8px; background: transparent; }
+QRadioButton::indicator { width: 14px; height: 14px; border: 1px solid #6b5ca8; border-radius: 8px; background-color: #110e20; }
+QRadioButton::indicator:hover { border-color: #a78bfa; }
+QRadioButton::indicator:checked { background-color: #8b5cf6; border-color: #c4b5fd; }
+QRadioButton::indicator:disabled { border-color: #3a3163; background-color: #15122a; }
 QScrollArea { border: none; background: transparent; }
 QScrollBar:vertical { background: #110e20; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: #2f2752; border-radius: 5px; min-height: 30px; }
@@ -164,39 +169,6 @@ def bot_connection_state(info: Any) -> tuple[str, str]:
     if max(connected, resumed) > last_login:
         return "Online", "ok"
     return "Connecting...", "warn"
-
-
-def provider_overview(settings_store: Any, credential_store: Any, rows: tuple[tuple[str, str, str], ...]) -> dict[str, Any]:
-    """Local AI provider facts: key saved, model, routing role. No network."""
-    try:
-        settings = settings_store.load()
-    except Exception:
-        settings = None
-    profiles = {profile.profile_id: profile for profile in getattr(settings, "profiles", ())}
-    routing = getattr(settings, "routing", None)
-    overview: dict[str, Any] = {"providers": {}, "valid": settings is not None}
-    for provider_id, profile_id, credential_ref in rows:
-        try:
-            has_key = bool(credential_store.exists(provider_id, credential_ref))
-        except Exception:
-            has_key = False
-        profile = profiles.get(profile_id)
-        roles = []
-        if routing is not None:
-            if getattr(routing, "planner_profile_id", None) == profile_id:
-                roles.append("planning")
-            if getattr(routing, "routine_profile_id", None) == profile_id:
-                roles.append("execution")
-        overview["providers"][provider_id] = {
-            "configured": has_key,
-            "model": getattr(profile, "model_id", None),
-            "roles": roles,
-        }
-    planner = getattr(routing, "planner_profile_id", None) if routing is not None else None
-    executor = getattr(routing, "routine_profile_id", None) if routing is not None else None
-    overview["planner"] = planner
-    overview["executor"] = executor
-    return overview
 
 
 def ai_tool_summary() -> tuple[int, dict[str, list[tuple[str, str, str]]]]:
@@ -341,7 +313,11 @@ class ProviderRow(QFrame):
         self.status_label = QLabel("Not configured")
         self.model_label = muted("")
         self.role_label = muted("")
-        for label in (self.model_label, self.role_label):
+        # Today's provider-reported usage of the selected bot (ai_usage).
+        self.usage_label = muted("No usage yet")
+        self.usage_label.setObjectName("usage")
+        self.usage_label.setToolTip(USAGE_TOOLTIP)
+        for label in (self.model_label, self.role_label, self.usage_label):
             label.setWordWrap(True)
             label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         status_row = QHBoxLayout()
@@ -354,6 +330,7 @@ class ProviderRow(QFrame):
         text.addWidget(name)
         text.addLayout(status_row)
         text.addWidget(self.model_label)
+        text.addWidget(self.usage_label)
         text.addWidget(self.role_label)
         self.test_button = QPushButton("▷  Test Connection")
         self.settings_button = QPushButton("⚙  Settings")
@@ -374,11 +351,34 @@ class ProviderRow(QFrame):
         self.model_label.setText(f"Model: {model}" if model else "Model: not set")
         self.role_label.setText(("Role: " + " + ".join(roles)) if roles else "Role: not routed")
 
+    def set_usage(self, text: str, tooltip: str | None = None) -> None:
+        self.usage_label.setText(text or "No usage yet")
+        if tooltip:
+            self.usage_label.setToolTip(tooltip)
+
+
+_USAGE_RULES = (
+    "Every API response counts as a request (retries and rate-limit answers included; 'failed' = non-2xx). "
+    "Tokens only as the provider reported them. Remaining limits only when the provider sent rate-limit "
+    "headers (Groq), from the newest response on this key; Gemini does not report remaining quota."
+)
+# Connections list: the key's total, because limits belong to the key.
+CONNECTION_USAGE_TOOLTIP = (
+    "Today (local time), this connection in total: every bot that uses it plus Manager Test Connection calls. "
+    + _USAGE_RULES
+)
+# Dashboard: what the selected bot itself used.
+BOT_USAGE_TOOLTIP = (
+    "Today (local time), only the selected bot's own requests on this connection (other bots and Manager "
+    "Test Connection calls are not included; see AI Providers for the connection's total). " + _USAGE_RULES
+)
+USAGE_TOOLTIP = CONNECTION_USAGE_TOOLTIP
+
 
 class ActivityFeed(QWidget):
     """Recent Manager events (newest first): time, dot, kind, text."""
 
-    KIND_COLORS = {"Bot": "ok", "AI": "info", "Error": "bad", "Manager": "accent"}
+    KIND_COLORS = {"Bot": "ok", "AI": "info", "Error": "bad", "Manager": "accent", "Update": "accent"}
 
     def __init__(self, visible_rows: int = 6, parent: QWidget | None = None) -> None:
         super().__init__(parent)

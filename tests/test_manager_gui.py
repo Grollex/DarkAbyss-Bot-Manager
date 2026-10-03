@@ -34,9 +34,14 @@ def load_gui_module(data_root: Path):
         "app_paths",
         "admin_instance",
         "ai_platform",
+        "ai_connections",
+        "ai_providers",
         "ai_storage",
         "ai_groq",
         "ai_gemini",
+        "app_updates",
+        "github_updates",
+        "update_engine",
     ):
         sys.modules.pop(module_name, None)
     return importlib.import_module("manager_gui")
@@ -305,7 +310,7 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertIn("1 of 2 bot(s) running", window.discord_card.detail_label.text())
         self.assertIn("slash commands", window.commands_card.value_label.text())
         self.assertGreater(window.tools_tree.topLevelItemCount(), 5)
-        self.assertEqual(window.ai_providers_button.text(), "AI Providers...")
+        self.assertIn("Add Connection", window.add_connection_button.text())
 
         self.select_instance(window, "admin-main")  # running -> the toggle stops it
         self.assertIn("Stop", window.quick_toggle_button.text())
@@ -339,16 +344,6 @@ class ManagerGuiTests(unittest.TestCase):
         window.refresh_logs()
         self.assertIn("connected to Gateway", window.log_view.toPlainText())
         self.assertIn("(empty)", window.log_view.toPlainText())
-
-    def test_dashboard_provider_test_requires_a_saved_key(self):
-        window = self.make_window()
-        started = []
-        window._start_worker = lambda action, finished: started.append(action)
-        window.test_provider("groq")
-        self.assertEqual(started, [])
-        self.assertIn("no API key saved", window.last_error)
-        self.assertEqual(window.provider_rows[0].status_label.text(), "Not configured")
-        self.assertFalse(window.provider_rows[0].test_button.isEnabled())
 
     def test_bot_connection_state_and_log_tail_helpers(self):
         dash = self.manager_gui.dash
@@ -1100,436 +1095,6 @@ class ManagerGuiTests(unittest.TestCase):
         self.assertIn("Config path:", details)
         self.assertNotIn("token", details.lower())
 
-    def make_ai_dialog(self, provider_factory=None, gemini_provider_factory=None):
-        ai_platform = self.manager_gui.ai_platform
-        settings_store = ai_platform.AISettingsStore(Path(self.temp_dir.name) / "config" / "ai.json")
-        credential_store = ai_platform.CredentialStore(Path(self.temp_dir.name) / "secrets" / "ai")
-        provider_factory = provider_factory or self.fake_groq_provider_factory()
-        gemini_provider_factory = gemini_provider_factory or self.fake_gemini_provider_factory()
-        dialog = self.manager_gui.AIProviderSettingsDialog(
-            settings_store=settings_store,
-            credential_store=credential_store,
-            provider_factory=provider_factory,
-            gemini_provider_factory=gemini_provider_factory,
-        )
-        self.addCleanup(dialog.close)
-        return dialog, settings_store, credential_store
-
-    def fake_groq_provider_factory(self, state=None):
-        ai_platform = self.manager_gui.ai_platform
-
-        class FakeProvider:
-            metadata = ai_platform.ProviderMetadata(
-                provider_id="groq",
-                display_name="Groq",
-                models=(
-                    ai_platform.ProviderModel(
-                        model_id="openai/gpt-oss-120b",
-                        display_name="GPT-OSS 120B",
-                    ),
-                ),
-            )
-
-            async def test_connection(self, credential_ref):
-                return ai_platform.Availability(state or ai_platform.AvailabilityState.AVAILABLE, "SECRET must not show")
-
-        return lambda credential_store: FakeProvider()
-
-    def fake_gemini_provider_factory(self, state=None):
-        ai_platform = self.manager_gui.ai_platform
-
-        class FakeProvider:
-            metadata = ai_platform.ProviderMetadata(
-                provider_id="gemini",
-                display_name="Google Gemini",
-                models=(
-                    ai_platform.ProviderModel(
-                        model_id="gemini-3.8-flash",
-                        display_name="Gemini 3.8 Flash",
-                    ),
-                    ai_platform.ProviderModel(
-                        model_id="gemini-3.5-flash-lite",
-                        display_name="Gemini 3.5 Flash Lite",
-                    ),
-                ),
-            )
-
-            async def test_connection(self, credential_ref):
-                return ai_platform.Availability(state or ai_platform.AvailabilityState.AVAILABLE, "SECRET must not show")
-
-        return lambda credential_store: FakeProvider()
-
-    def test_ai_providers_button_exists_and_does_not_require_selection(self):
-        window = self.make_window()
-        self.assertEqual(window.ai_providers_button.text(), "AI Providers...")
-        window.instance_table.clearSelection()
-        fake_dialog = mock.Mock()
-        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
-        with mock.patch.object(self.manager_gui, "AIProviderSettingsDialog", return_value=fake_dialog) as dialog_class:
-            window.open_ai_providers()
-        dialog_class.assert_called_once()
-        fake_dialog.exec.assert_called_once()
-
-    def test_ai_provider_dialog_has_groq_and_gemini_tabs(self):
-        dialog, _, _ = self.make_ai_dialog()
-
-        labels = [dialog.provider_tabs.tabText(index) for index in range(dialog.provider_tabs.count())]
-
-        self.assertIn("Groq", labels)
-        self.assertIn("Gemini", labels)
-        self.assertEqual(dialog.gemini_model_combo.currentData(), "gemini-3.8-flash")
-        self.assertEqual(dialog.gemini_key_edit.text(), "")
-        self.assertEqual(dialog.gemini_key_edit.placeholderText(), "Paste Gemini API key")
-
-    def test_ai_provider_routing_tab_sets_planner_and_executor(self):
-        dialog, settings_store, _ = self.make_ai_dialog()
-        labels = [dialog.provider_tabs.tabText(index) for index in range(dialog.provider_tabs.count())]
-        self.assertIn("Routing", labels)
-        dialog.planner_combo.setCurrentIndex(dialog.planner_combo.findData("gemini-default"))
-        dialog.executor_combo.setCurrentIndex(dialog.executor_combo.findData("groq-default"))
-        dialog.routing_fallback_checkbox.setChecked(True)
-        dialog.save_routing()
-        settings = settings_store.load()
-        self.assertEqual(settings.routing.planner_profile_id, "gemini-default")
-        self.assertEqual(settings.routing.routine_profile_id, "groq-default")
-        self.assertEqual(settings.routing.creative_profile_id, "groq-default")
-        self.assertEqual(settings.routing.routine_fallback_profile_ids, ("gemini-default",))
-        self.assertEqual(settings.routing.planner_fallback_profile_ids, ("groq-default",))
-        self.assertEqual({profile.profile_id for profile in settings.profiles}, {"groq-default", "gemini-default"})
-        self.assertIn("planning = Gemini", dialog.routing_status_label.text())
-        reopened, _, _ = self.make_ai_dialog()
-        self.assertEqual(reopened.planner_combo.currentData(), "gemini-default")
-        self.assertTrue(reopened.routing_fallback_checkbox.isChecked())
-
-    def test_ai_provider_dialog_secret_save_preserve_remove_and_settings(self):
-        dialog, settings_store, credential_store = self.make_ai_dialog()
-        self.assertEqual(dialog.key_edit.echoMode(), self.manager_gui.QLineEdit.Password)
-        self.assertEqual(dialog.key_edit.text(), "")
-        self.assertEqual(dialog.model_combo.currentData(), "openai/gpt-oss-120b")
-
-        dialog.key_edit.setText("  SECRET_KEY\n")
-        dialog.reasoning_combo.setCurrentText("high")
-        dialog.save_settings()
-        self.assertEqual(dialog.key_edit.text(), "")
-        self.assertEqual(credential_store.read_secret("groq", "groq-default"), "SECRET_KEY")
-        settings_text = settings_store.path.read_text(encoding="utf-8")
-        self.assertIn("openai/gpt-oss-120b", settings_text)
-        self.assertIn('"reasoning_effort": "high"', settings_text)
-        self.assertNotIn("SECRET_KEY", settings_text)
-
-        reopened, _, same_store = self.make_ai_dialog()
-        self.assertEqual(reopened.key_edit.text(), "")
-        self.assertEqual(reopened.status_label.text(), "Configured — key saved locally")
-        self.assertEqual(reopened.key_edit.placeholderText(), "Key saved locally — leave blank to keep it")
-        self.assertIn("Configured", reopened.status_label.text())
-        self.assertIn("key saved locally", reopened.status_label.text())
-        self.assertIn("leave blank to keep it", reopened.key_edit.placeholderText())
-        reopened.save_settings()
-        self.assertEqual(same_store.read_secret("groq", "groq-default"), "SECRET_KEY")
-        self.assertEqual(reopened.key_edit.text(), "")
-        self.assertNotIn("SECRET_KEY", reopened.status_label.text())
-        self.assertNotIn("SECRET_KEY", reopened.key_edit.placeholderText())
-
-        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok):
-            reopened.remove_key()
-        self.assertFalse(same_store.exists("groq", "groq-default"))
-        self.assertEqual(reopened.key_edit.placeholderText(), "Paste Groq API key")
-
-    def test_ai_provider_save_preserves_other_profiles_and_existing_routing(self):
-        dialog, settings_store, credential_store = self.make_ai_dialog()
-        ai_platform = self.manager_gui.ai_platform
-        existing = ai_platform.AISettings(
-            profiles=(
-                ai_platform.AIProfile("gemini-default", "gemini", "gemini-model"),
-                ai_platform.AIProfile("openrouter-test", "openrouter", "openrouter-model"),
-            ),
-            routing=ai_platform.RoutingConfig(
-                routine_profile_id="gemini-default",
-                planner_profile_id="openrouter-test",
-                creative_profile_id="gemini-default",
-                routine_fallback_profile_ids=("openrouter-test",),
-                planner_fallback_profile_ids=("gemini-default",),
-                creative_fallback_profile_ids=("openrouter-test", "gemini-default"),
-            ),
-        )
-        settings_store.save(existing)
-
-        dialog.close()
-        dialog = self.manager_gui.AIProviderSettingsDialog(
-            settings_store=settings_store,
-            credential_store=credential_store,
-            provider_factory=self.fake_groq_provider_factory(),
-        )
-        self.addCleanup(dialog.close)
-        dialog.reasoning_combo.setCurrentText("low")
-        dialog.save_settings()
-
-        loaded = settings_store.load()
-        profile_ids = {profile.profile_id for profile in loaded.profiles}
-        self.assertEqual(profile_ids, {"gemini-default", "openrouter-test", "groq-default"})
-        self.assertEqual(loaded.routing.routine_profile_id, "gemini-default")
-        self.assertEqual(loaded.routing.planner_profile_id, "openrouter-test")
-        self.assertEqual(loaded.routing.creative_profile_id, "gemini-default")
-        self.assertEqual(loaded.routing.routine_fallback_profile_ids, ("openrouter-test",))
-        self.assertEqual(loaded.routing.planner_fallback_profile_ids, ("gemini-default",))
-        self.assertEqual(loaded.routing.creative_fallback_profile_ids, ("openrouter-test", "gemini-default"))
-
-    def test_gemini_secret_save_preserve_remove_and_settings(self):
-        dialog, settings_store, credential_store = self.make_ai_dialog()
-        self.assertEqual(dialog.gemini_key_edit.echoMode(), self.manager_gui.QLineEdit.Password)
-        self.assertEqual(dialog.gemini_key_edit.text(), "")
-        self.assertEqual(dialog.gemini_model_combo.currentData(), "gemini-3.8-flash")
-
-        dialog.gemini_key_edit.setText("  GEMINI_SECRET\n")
-        dialog.gemini_reasoning_combo.setCurrentText("high")
-        dialog.save_gemini_settings()
-        self.assertEqual(dialog.gemini_key_edit.text(), "")
-        self.assertEqual(credential_store.read_secret("gemini", "gemini-default"), "GEMINI_SECRET")
-        settings_text = settings_store.path.read_text(encoding="utf-8")
-        self.assertIn("gemini-default", settings_text)
-        self.assertIn("gemini-3.8-flash", settings_text)
-        self.assertIn('"reasoning_effort": "high"', settings_text)
-        self.assertNotIn("GEMINI_SECRET", settings_text)
-
-        reopened, _, same_store = self.make_ai_dialog()
-        self.assertEqual(reopened.gemini_key_edit.text(), "")
-        self.assertEqual(reopened.gemini_status_label.text(), "Configured — key saved locally")
-        self.assertEqual(reopened.gemini_key_edit.placeholderText(), "Key saved locally — leave blank to keep it")
-        self.assertIn("Configured", reopened.gemini_status_label.text())
-        self.assertIn("leave blank to keep it", reopened.gemini_key_edit.placeholderText())
-        reopened.save_gemini_settings()
-        self.assertEqual(same_store.read_secret("gemini", "gemini-default"), "GEMINI_SECRET")
-        self.assertNotIn("GEMINI_SECRET", reopened.gemini_status_label.text())
-        self.assertNotIn("GEMINI_SECRET", reopened.gemini_key_edit.placeholderText())
-
-        reopened.gemini_show_key_checkbox.setChecked(True)
-        self.assertEqual(reopened.gemini_key_edit.echoMode(), self.manager_gui.QLineEdit.Normal)
-        reopened.gemini_show_key_checkbox.setChecked(False)
-        self.assertEqual(reopened.gemini_key_edit.echoMode(), self.manager_gui.QLineEdit.Password)
-
-        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok):
-            reopened.remove_gemini_key()
-        self.assertFalse(same_store.exists("gemini", "gemini-default"))
-        self.assertEqual(reopened.gemini_key_edit.placeholderText(), "Paste Gemini API key")
-
-    def test_gemini_only_save_routes_unset_task_classes_to_gemini(self):
-        # Regression: saving only Gemini left routing empty ("No usable AI profile").
-        dialog, settings_store, _ = self.make_ai_dialog()
-        dialog.gemini_key_edit.setText("GEMINI_SECRET")
-        dialog.save_gemini_settings()
-
-        routing = settings_store.load().routing
-        self.assertEqual(routing.routine_profile_id, "gemini-default")
-        self.assertEqual(routing.planner_profile_id, "gemini-default")
-        self.assertEqual(routing.creative_profile_id, "gemini-default")
-
-        # A later Groq save fills nothing: every slot is already assigned.
-        reopened, same_store, _ = self.make_ai_dialog()
-        reopened.key_edit.setText("GROQ_SECRET")
-        reopened.save_settings()
-        self.assertEqual(same_store.load().routing.planner_profile_id, "gemini-default")
-
-    def test_gemini_save_preserves_groq_profiles_and_existing_routing(self):
-        dialog, settings_store, credential_store = self.make_ai_dialog()
-        ai_platform = self.manager_gui.ai_platform
-        existing = ai_platform.AISettings(
-            profiles=(
-                ai_platform.AIProfile("groq-default", "groq", "openai/gpt-oss-120b", "groq-default"),
-                ai_platform.AIProfile("openrouter-test", "openrouter", "openrouter-model"),
-            ),
-            routing=ai_platform.RoutingConfig(
-                routine_profile_id="groq-default",
-                planner_profile_id="openrouter-test",
-                creative_profile_id="groq-default",
-                routine_fallback_profile_ids=("openrouter-test",),
-                planner_fallback_profile_ids=("groq-default",),
-                creative_fallback_profile_ids=("openrouter-test", "groq-default"),
-            ),
-        )
-        settings_store.save(existing)
-
-        dialog.close()
-        dialog = self.manager_gui.AIProviderSettingsDialog(
-            settings_store=settings_store,
-            credential_store=credential_store,
-            provider_factory=self.fake_groq_provider_factory(),
-            gemini_provider_factory=self.fake_gemini_provider_factory(),
-        )
-        self.addCleanup(dialog.close)
-        dialog.gemini_reasoning_combo.setCurrentText("low")
-        dialog.save_gemini_settings()
-
-        loaded = settings_store.load()
-        profile_ids = {profile.profile_id for profile in loaded.profiles}
-        self.assertEqual(profile_ids, {"groq-default", "openrouter-test", "gemini-default"})
-        self.assertEqual(loaded.routing.routine_profile_id, "groq-default")
-        self.assertEqual(loaded.routing.planner_profile_id, "openrouter-test")
-        self.assertEqual(loaded.routing.creative_profile_id, "groq-default")
-        self.assertEqual(loaded.routing.routine_fallback_profile_ids, ("openrouter-test",))
-        self.assertEqual(loaded.routing.planner_fallback_profile_ids, ("groq-default",))
-        self.assertEqual(loaded.routing.creative_fallback_profile_ids, ("openrouter-test", "groq-default"))
-        self.assertEqual(_profile_by_id_for_test(loaded, "gemini-default").options["reasoning_effort"], "low")
-
-    def test_ai_provider_malformed_settings_not_overwritten_by_save(self):
-        dialog, settings_store, _credential_store = self.make_ai_dialog()
-        dialog.close()
-        settings_store.path.parent.mkdir(parents=True, exist_ok=True)
-        settings_store.path.write_bytes(b"{bad json")
-
-        dialog = self.manager_gui.AIProviderSettingsDialog(
-            settings_store=settings_store,
-            credential_store=self.manager_gui.ai_platform.CredentialStore(Path(self.temp_dir.name) / "secrets2" / "ai"),
-            provider_factory=self.fake_groq_provider_factory(),
-        )
-        self.addCleanup(dialog.close)
-        self.assertIn("AI settings are invalid", dialog.status_label.text())
-        self.assertFalse(dialog.save_button.isEnabled())
-        dialog.key_edit.setText("SECRET_KEY")
-        dialog.save_settings()
-        self.assertEqual(settings_store.path.read_bytes(), b"{bad json")
-        self.assertIn("AI settings are invalid", dialog.status_label.text())
-
-    def test_ai_provider_dialog_provider_unavailable_is_contained(self):
-        dialog, _, _ = self.make_ai_dialog(provider_factory=lambda _store: (_ for _ in ()).throw(RuntimeError("boom SECRET")))
-        self.assertIn("Provider unavailable", dialog.status_label.text())
-        self.assertFalse(dialog.test_button.isEnabled())
-
-    def test_gemini_provider_unavailable_is_contained(self):
-        dialog, _, _ = self.make_ai_dialog(
-            gemini_provider_factory=lambda _store: (_ for _ in ()).throw(RuntimeError("boom SECRET"))
-        )
-        self.assertIn("Provider unavailable", dialog.gemini_status_label.text())
-        self.assertFalse(dialog.gemini_test_button.isEnabled())
-
-    def test_ai_provider_test_connection_uses_worker_and_sanitized_status(self):
-        dialog, _, credential_store = self.make_ai_dialog()
-        credential_store.write_secret("groq", "groq-default", "SECRET_KEY")
-        dialog.test_connection()
-        self.assertFalse(dialog.test_button.isEnabled())
-        self.assertEqual(dialog.status_label.text(), "Testing Groq...")
-        self.wait_until(lambda: dialog.status_label.text() == "Connected")
-        self.assertTrue(dialog.test_button.isEnabled())
-        self.assertNotIn("SECRET_KEY", dialog.status_label.text())
-
-    def test_gemini_test_connection_uses_worker_and_sanitized_status(self):
-        dialog, _, credential_store = self.make_ai_dialog()
-        credential_store.write_secret("gemini", "gemini-default", "GEMINI_SECRET")
-        dialog.test_gemini_connection()
-        self.assertFalse(dialog.gemini_test_button.isEnabled())
-        self.assertEqual(dialog.gemini_status_label.text(), "Testing Gemini...")
-        self.wait_until(lambda: dialog.gemini_status_label.text() == "Connected")
-        self.assertTrue(dialog.gemini_test_button.isEnabled())
-        self.assertNotIn("GEMINI_SECRET", dialog.gemini_status_label.text())
-
-    def test_ai_provider_status_mapping_is_sanitized(self):
-        ai_platform = self.manager_gui.ai_platform
-        cases = [
-            (ai_platform.AvailabilityState.CREDENTIAL_INVALID, "Invalid API key"),
-            (ai_platform.AvailabilityState.ACCESS_FORBIDDEN, "Access forbidden"),
-            (ai_platform.AvailabilityState.CREDENTIAL_MISSING, "No key saved"),
-            (ai_platform.AvailabilityState.UNAVAILABLE, "Rate limit / quota reached", "quota"),
-            (ai_platform.AvailabilityState.UNAVAILABLE, "Unexpected provider response", "unexpected"),
-            (ai_platform.AvailabilityState.UNAVAILABLE, "Network unavailable", "plain unavailable"),
-        ]
-        for case in cases:
-            state = case[0]
-            expected = case[1]
-            message = case[2] if len(case) > 2 else "SECRET must not show"
-            with self.subTest(expected=expected):
-                dialog, _, _ = self.make_ai_dialog()
-                dialog._finish_test_connection(
-                    self.manager_gui.ActionResult(True, "OK", ai_platform.Availability(state, message))
-                )
-                self.assertEqual(dialog.status_label.text(), expected)
-                self.assertNotIn("SECRET", dialog.status_label.text())
-
-    def test_gemini_provider_status_mapping_is_sanitized(self):
-        ai_platform = self.manager_gui.ai_platform
-        cases = [
-            (ai_platform.AvailabilityState.CREDENTIAL_INVALID, "Invalid API key"),
-            (ai_platform.AvailabilityState.ACCESS_FORBIDDEN, "Access forbidden"),
-            (ai_platform.AvailabilityState.CREDENTIAL_MISSING, "No key saved"),
-            (ai_platform.AvailabilityState.UNAVAILABLE, "Rate limit / quota reached", "quota"),
-            (ai_platform.AvailabilityState.UNAVAILABLE, "Unexpected provider response", "unexpected"),
-            (ai_platform.AvailabilityState.UNAVAILABLE, "Network unavailable", "plain unavailable"),
-        ]
-        for case in cases:
-            state = case[0]
-            expected = case[1]
-            message = case[2] if len(case) > 2 else "SECRET must not show"
-            with self.subTest(expected=expected):
-                dialog, _, _ = self.make_ai_dialog()
-                dialog._finish_gemini_test_connection(
-                    self.manager_gui.ActionResult(True, "OK", ai_platform.Availability(state, message))
-                )
-                self.assertEqual(dialog.gemini_status_label.text(), expected)
-                self.assertNotIn("SECRET", dialog.gemini_status_label.text())
-
-    def test_ai_provider_close_rejected_while_test_in_progress(self):
-        dialog, _, _ = self.make_ai_dialog()
-
-        class FakeEvent:
-            def __init__(self):
-                self.accepted = False
-                self.ignored = False
-
-            def accept(self):
-                self.accepted = True
-
-            def ignore(self):
-                self.ignored = True
-
-        dialog._set_testing_controls(True)
-        event = FakeEvent()
-        dialog.closeEvent(event)
-        self.assertTrue(event.ignored)
-        self.assertFalse(event.accepted)
-        self.assertIn("still in progress", dialog.status_label.text())
-        self.assertTrue(dialog.isVisible() or dialog.result() == 0)
-
-        dialog.reject()
-        self.assertEqual(dialog.result(), 0)
-        self.assertIn("still in progress", dialog.status_label.text())
-
-        dialog.done(self.manager_gui.QDialog.Rejected)
-        self.assertEqual(dialog.result(), 0)
-        self.assertIn("still in progress", dialog.status_label.text())
-
-        dialog._set_testing_controls(False)
-        event = FakeEvent()
-        dialog.closeEvent(event)
-        self.assertTrue(event.accepted)
-        dialog.reject()
-        self.assertEqual(dialog.result(), self.manager_gui.QDialog.Rejected)
-
-    def test_gemini_close_rejected_while_test_in_progress(self):
-        dialog, _, _ = self.make_ai_dialog()
-
-        class FakeEvent:
-            def __init__(self):
-                self.accepted = False
-                self.ignored = False
-
-            def accept(self):
-                self.accepted = True
-
-            def ignore(self):
-                self.ignored = True
-
-        dialog._set_gemini_testing_controls(True)
-        event = FakeEvent()
-        dialog.closeEvent(event)
-        self.assertTrue(event.ignored)
-        self.assertFalse(event.accepted)
-        self.assertIn("still in progress", dialog.gemini_status_label.text())
-        dialog.reject()
-        self.assertEqual(dialog.result(), 0)
-        dialog._set_gemini_testing_controls(False)
-        event = FakeEvent()
-        dialog.closeEvent(event)
-        self.assertTrue(event.accepted)
-
-
 class PerInstanceManagerTests(unittest.TestCase):
     """Manager: AI settings per bot instance, bot types, Game Presence bots."""
 
@@ -1569,65 +1134,6 @@ class PerInstanceManagerTests(unittest.TestCase):
         index = window.ai_bot_combo.findData(instance_id)
         self.assertGreaterEqual(index, 0)
         window.ai_bot_combo.setCurrentIndex(index)
-
-    def test_ai_page_lists_every_bot_and_dialog_gets_that_bots_stores(self):
-        manager = FakeManager(self.manager_gui.manager_core)
-        manager.infos = [*manager.infos, self.gp_info(manager)]
-        window = self.make_window(manager=manager)
-        ids = [window.ai_bot_combo.itemData(i) for i in range(window.ai_bot_combo.count())]
-        self.assertEqual(ids, ["admin-main", "admin-second", "gp-main"])
-        self.assertEqual(window.ai_bot_combo.currentData(), "admin-main")
-
-        self.select_ai_bot(window, "gp-main")
-        self.assertIn("Games (gp-main)", window.dashboard_ai_bot_label.text())
-        self.assertIn("wording", window.ai_bot_hint.text())
-        fake_dialog = mock.Mock()
-        fake_dialog.exec.return_value = self.manager_gui.QDialog.Accepted
-        with mock.patch.object(self.manager_gui, "AIProviderSettingsDialog", return_value=fake_dialog) as dialog_class:
-            window.open_ai_providers()
-        kwargs = dialog_class.call_args.kwargs
-        instance_root = (self.data_root / "instances" / "gp-main").resolve()
-        self.assertEqual(kwargs["settings_store"].path, instance_root / "data" / "ai.json")
-        self.assertEqual(kwargs["credential_store"].root, instance_root / "secrets" / "ai")
-        self.assertIn("gp-main", kwargs["bot_label"])
-
-    def test_connection_test_uses_the_selected_bots_key(self):
-        window = self.make_window()
-        second = window.ai_stores_for("admin-second")
-        second.credentials.write_secret("groq", "groq-default", "test-key-second-bot")
-        started = []
-        window._start_worker = lambda action, finished: started.append(action)
-
-        window.test_provider("groq")  # admin-main is selected and has no key
-        self.assertEqual(started, [])
-        self.assertIn("no API key saved for this bot", window.last_error)
-        self.assertEqual(window.provider_rows[0].status_label.text(), "Not configured")
-
-        self.select_ai_bot(window, "admin-second")
-        self.assertEqual(window.provider_rows[0].status_label.text(), "Configured")
-        used = []
-
-        class FakeProvider:
-            async def test_connection(self, credential_ref):
-                return self.availability
-
-        def factory(credential_store):
-            used.append(credential_store.root)
-            provider = FakeProvider()
-            provider.availability = window_ai.Availability(window_ai.AvailabilityState.AVAILABLE, "ok")
-            return provider
-
-        window_ai = self.manager_gui.ai_platform
-        with mock.patch.object(self.manager_gui, "create_groq_provider", factory):
-            window.test_provider("groq")
-            self.assertEqual(len(started), 1)
-            started[0]()
-        self.assertEqual(used, [second.credentials.root])
-        self.assertNotEqual(used[0], window.ai_stores_for("admin-main").credentials.root)
-
-    def test_ai_dialog_has_no_global_default_store(self):
-        with self.assertRaises(ValueError):
-            self.manager_gui.AIProviderSettingsDialog()
 
     def test_dashboard_shows_capabilities_per_bot_type(self):
         manager = FakeManager(self.manager_gui.manager_core)
@@ -1716,6 +1222,569 @@ class PerInstanceManagerTests(unittest.TestCase):
         self.assertEqual(instance_api.token_path.read_text(encoding="utf-8"), "FAKE_GP_TOKEN\n")
         self.assertEqual(instance_api.display_names["gp-main"], "Game Pings")
         self.assertEqual(config_api.saved, [])  # Game Presence settings live on their own page
+
+
+class ConnectionsUITests(unittest.TestCase):
+    """Manager: shared provider connections, the base set and each bot's AI choice."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manager_gui = load_gui_module(Path(self.temp_dir.name))
+        self.app = get_qapplication()
+        self.data_root = Path(self.temp_dir.name)
+        self.ai_connections = self.manager_gui.ai_connections
+        self.ai_platform = self.manager_gui.ai_platform
+        self.store = self.ai_connections.ConnectionStore()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    # -- helpers ----------------------------------------------------------------------
+
+    def manager_with_presence(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        core = self.manager_gui.manager_core
+        gp = replace(
+            manager.info("gp-main", "Game Pings", core.STATE_STOPPED, None),
+            bot_type="game_presence",
+            bot_type_display_name="Game Presence Bot",
+        )
+        manager.infos = [*manager.infos, gp]
+        return manager
+
+    def make_window(self, manager=None):
+        window = self.manager_gui.ManagerMainWindow(
+            manager=manager or self.manager_with_presence(),
+            instance_api=FakeInstanceApi(),
+            config_api=FakeConfigApi(),
+            auto_refresh=False,
+        )
+
+        def close_without_prompt():
+            window._allow_close = True
+            window.close()
+
+        self.addCleanup(close_without_prompt)
+        return window
+
+    def add(self, connection_id, provider_id="groq", model="openai/gpt-oss-120b", key=None, name=None):
+        connection = self.ai_connections.Connection(connection_id, provider_id, name or connection_id, model, {"reasoning_effort": "medium"})
+        self.store.upsert(connection, key)
+        return connection
+
+    def standard_setup(self):
+        self.add("groq-main", key="test-key-a", name="Groq main")
+        self.add("gemini-main", "gemini", "gemini-3.8-flash", key="test-key-b", name="Gemini main")
+        self.add("groq-2", key="test-key-c", name="Groq backup")
+        self.store.set_base(self.ai_connections.RouteSelection("groq-main", "gemini-main", None, True))
+
+    def select_ai_bot(self, window, instance_id):
+        index = window.ai_bot_combo.findData(instance_id)
+        self.assertGreaterEqual(index, 0)
+        window.ai_bot_combo.setCurrentIndex(index)
+
+    def fake_factory(self, state=None, calls=None):
+        ai_platform = self.ai_platform
+
+        class FakeProvider:
+            def __init__(self, provider_id):
+                self.metadata = ai_platform.ProviderMetadata(
+                    provider_id=provider_id,
+                    display_name=provider_id,
+                    models=(
+                        ai_platform.ProviderModel("model-a", "Model A"),
+                        ai_platform.ProviderModel("model-b", "Model B"),
+                    ),
+                )
+
+            async def test_connection(self, credential_ref):
+                if calls is not None:
+                    calls.append(credential_ref)
+                return ai_platform.Availability(state or ai_platform.AvailabilityState.AVAILABLE, "SECRET provider text must not show")
+
+        def factory(provider_id, credential_store, usage_recorder=None):
+            if calls is not None:
+                calls.append(("created", provider_id, credential_store.root, usage_recorder is not None))
+            return FakeProvider(provider_id)
+
+        return factory
+
+    def dialog(self, connection=None, **kwargs):
+        kwargs.setdefault("provider_factory", self.fake_factory())
+        dialog = self.manager_gui.ConnectionDialog(self.store, connection, **kwargs)
+        self.addCleanup(dialog.close)
+        return dialog
+
+    # -- connection dialog -----------------------------------------------------------------
+
+    def test_new_connection_saves_key_without_showing_it_back(self):
+        dialog = self.dialog()
+        self.assertEqual([dialog.provider_combo.itemData(i) for i in range(dialog.provider_combo.count())], ["groq", "gemini"])
+        self.assertEqual(dialog.name_edit.text(), "Groq main")  # suggested name
+        self.assertEqual([dialog.model_combo.itemData(i) for i in range(dialog.model_combo.count())], ["model-a", "model-b"])
+        self.assertEqual(dialog.status_label.text(), "No key saved yet")
+        self.assertFalse(dialog.test_button.isEnabled())
+        dialog.key_edit.setText("  SECRET_TEST_KEY  ")
+        dialog.model_combo.setCurrentIndex(1)
+        dialog.reasoning_combo.setCurrentText("high")
+        self.assertTrue(dialog.save())
+        saved = self.store.load().get(dialog.connection.connection_id)
+        self.assertEqual((saved.connection_id, saved.provider_id, saved.model_id, saved.options), ("groq-1", "groq", "model-b", {"reasoning_effort": "high"}))
+        self.assertEqual(self.store.credentials.read_secret("groq", "groq-1"), "SECRET_TEST_KEY")
+        self.assertEqual(dialog.key_edit.text(), "")
+        self.assertIn("leave blank to keep it", dialog.key_edit.placeholderText())
+        self.assertIn("Configured", dialog.status_label.text())
+        self.assertNotIn("SECRET_TEST_KEY", dialog.status_label.text() + dialog.key_edit.placeholderText())
+        self.assertFalse(dialog.provider_combo.isEnabled())  # the key belongs to that provider
+        self.assertTrue(dialog.test_button.isEnabled())
+        self.assertNotIn("SECRET_TEST_KEY", self.store.path.read_text(encoding="utf-8"))
+
+        dialog.name_edit.setText("Groq renamed")
+        self.assertTrue(dialog.save())  # blank key keeps the saved one
+        self.assertEqual(self.store.credentials.read_secret("groq", "groq-1"), "SECRET_TEST_KEY")
+        self.assertEqual(self.store.load().get("groq-1").name, "Groq renamed")
+
+    def test_edit_loads_the_connection_and_invalid_input_is_not_saved(self):
+        connection = self.add("gemini-main", "gemini", "model-b", key="test-key", name="Gemini main")
+        dialog = self.dialog(connection)
+        self.assertEqual(dialog.provider_combo.currentData(), "gemini")
+        self.assertEqual(dialog.model_combo.currentData(), "model-b")
+        self.assertEqual(dialog.name_edit.text(), "Gemini main")
+        dialog.name_edit.setText("   ")
+        self.assertFalse(dialog.save())
+        self.assertIn("Not saved", dialog.status_label.text())
+        self.assertEqual(self.store.load().get("gemini-main").name, "Gemini main")
+
+    def test_test_connection_uses_this_connection_and_shows_sanitized_text(self):
+        calls = []
+        connection = self.add("groq-2", key="test-key")
+        usage = self.manager_gui.ai_usage.AIUsageStore(self.data_root / "config" / "ai_usage_manager.json")
+        dialog = self.dialog(connection, provider_factory=self.fake_factory(calls=calls), usage_store=usage)
+        started = []
+        dialog._start_worker = lambda action, finished: started.append((action, finished))
+        dialog.test_connection()
+        self.assertFalse(dialog.close_button.isEnabled())
+        action, finished = started[0]
+        finished(self.manager_gui.ActionResult(True, "OK", action()))
+        self.assertEqual(dialog.status_label.text(), "Connected")
+        self.assertIn("groq-2", calls)  # this connection's credential reference
+        self.assertIn(("created", "groq", self.store.credentials.root, True), calls)  # counted as Manager usage
+        ai_platform = self.ai_platform
+        for state, message, expected in (
+            (ai_platform.AvailabilityState.CREDENTIAL_INVALID, "SECRET", "Invalid API key"),
+            (ai_platform.AvailabilityState.ACCESS_FORBIDDEN, "SECRET", "Access forbidden"),
+            (ai_platform.AvailabilityState.UNAVAILABLE, "rate limit SECRET", "Rate limit / quota reached"),
+            (ai_platform.AvailabilityState.UNAVAILABLE, "SECRET", "Network unavailable"),
+        ):
+            result = self.manager_gui.ActionResult(True, "OK", ai_platform.Availability(state, message))
+            self.assertEqual(self.manager_gui.availability_text(result), expected)
+        self.assertEqual(self.manager_gui.availability_text(self.manager_gui.ActionResult(False, "boom SECRET", None)), "Network unavailable")
+
+    def test_close_is_refused_while_a_test_runs(self):
+        dialog = self.dialog(self.add("groq-2", key="test-key"))
+        dialog._set_testing(True)
+        event = mock.Mock()
+        dialog.closeEvent(event)
+        event.ignore.assert_called_once()
+        self.assertIn("still in progress", dialog.status_label.text())
+        dialog._set_testing(False)
+        event = mock.Mock()
+        dialog.closeEvent(event)
+        event.accept.assert_called_once()
+
+    def test_remove_is_refused_while_used_and_deletes_the_key_otherwise(self):
+        used = self.add("groq-main", key="test-key-a")
+        dialog = self.dialog(used, users_of=lambda _cid: ["Base set (Kairo)"])
+        self.assertFalse(dialog.remove())
+        self.assertIn("Used by: Base set (Kairo)", dialog.status_label.text())
+        self.assertTrue(self.store.credentials.exists("groq", "groq-main"))
+
+        spare = self.add("groq-2", key="test-key-c")
+        dialog = self.dialog(spare)
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok):
+            self.assertTrue(dialog.remove())
+        self.assertIsNone(self.store.load().get("groq-2"))
+        self.assertFalse(self.store.credentials.exists("groq", "groq-2"))
+        self.assertTrue(self.store.credentials.exists("groq", "groq-main"))
+
+    def test_unavailable_provider_is_contained(self):
+        def broken(provider_id, credential_store, usage_recorder=None):
+            raise self.ai_platform.AIPlatformError("adapter missing")
+
+        dialog = self.dialog(provider_factory=broken)
+        self.assertEqual(dialog.model_combo.count(), 0)
+        self.assertEqual(dialog.status_label.text(), "Provider unavailable")
+
+    # -- AI page -------------------------------------------------------------------------------
+
+    def test_page_lists_connections_with_users_and_total_usage(self):
+        self.standard_setup()
+        ai_usage = self.manager_gui.ai_usage
+        window = self.make_window()
+        window.ai_stores_for("gp-main").selection.save(
+            self.ai_connections.BotSelection("custom", self.ai_connections.RouteSelection(None, "groq-2"))
+        )
+        window.ai_stores_for("admin-main").usage.record(ai_usage.UsageEvent("groq", "openai/gpt-oss-120b", total_tokens=500, input_tokens=400, output_tokens=100, connection_id="groq-main"))
+        window.ai_stores_for("admin-second").usage.record(ai_usage.UsageEvent("groq", "openai/gpt-oss-120b", total_tokens=500, input_tokens=400, output_tokens=100, connection_id="groq-main"))
+        window.manager_usage.record(ai_usage.UsageEvent("groq", "openai/gpt-oss-120b", success=False, connection_id="groq-main"))
+        window.refresh_instances()
+        self.assertEqual(list(window.connection_rows), ["groq-main", "gemini-main", "groq-2"])
+        row = window.connection_rows["groq-main"]
+        self.assertEqual(row.status_label.text(), "Configured")
+        self.assertIn("GPT-OSS 120B · Groq", row.model_label.text())
+        self.assertEqual(row.role_label.text(), "Used by: Base set (Main, Second)")
+        # Total usage of the key: both bots + the Manager's (failed) test.
+        self.assertEqual(row.usage_label.text(), "GPT-OSS 120B · 3 req (1 failed) · 1k tok\n800 in / 200 out")
+        self.assertEqual(window.connection_rows["groq-2"].role_label.text(), "Used by: Game Pings")
+        self.assertEqual(window.connection_rows["groq-2"].usage_label.text(), "No usage yet")
+        self.assertIn("Bots on the base set: Main, Second", window.base_status_label.text())
+
+    def test_base_set_editor_saves_and_bots_on_it_follow(self):
+        self.standard_setup()
+        window = self.make_window()
+        self.assertEqual(window.base_planner_combo.currentData(), "groq-main")
+        self.assertEqual(window.base_executor_combo.currentData(), "gemini-main")
+        self.assertTrue(window.base_cross_checkbox.isChecked())
+        window.base_planner_combo.setCurrentIndex(window.base_planner_combo.findData(None))
+        window.base_executor_combo.setCurrentIndex(window.base_executor_combo.findData("groq-2"))
+        window.base_fallback_combo.setCurrentIndex(window.base_fallback_combo.findData("gemini-main"))
+        window.base_cross_checkbox.setChecked(False)
+        window.save_base_set()
+        self.assertEqual(self.store.load().base, self.ai_connections.RouteSelection(None, "groq-2", "gemini-main", False))
+        profiles = window.ai_stores_for("admin-main").settings.load().profiles
+        self.assertEqual([p.profile_id for p in profiles], ["groq-2", "gemini-main"])
+
+    def test_each_bot_can_use_the_base_set_or_its_own_connections(self):
+        self.standard_setup()
+        window = self.make_window()
+        self.select_ai_bot(window, "gp-main")
+        self.assertTrue(window.bot_mode_base_radio.isChecked())
+        self.assertFalse(window.bot_executor_combo.isEnabled())
+        self.assertIn("Execution connection", window.ai_bot_hint.text())
+        self.assertIn("In use (base set)", window.ai_routing_label.text())
+
+        window.bot_mode_custom_radio.setChecked(True)
+        self.assertTrue(window.bot_executor_combo.isEnabled())
+        window.save_bot_ai()
+        self.assertIn("Choose at least the execution connection", window.bot_status_label.text())
+        window.bot_executor_combo.setCurrentIndex(window.bot_executor_combo.findData("groq-2"))
+        window.save_bot_ai()
+        gp = window.ai_stores_for("gp-main")
+        self.assertEqual(gp.selection.load().mode, "custom")
+        self.assertEqual([p.profile_id for p in gp.settings.load().profiles], ["groq-2"])
+        self.assertIn("In use (own choice)", window.ai_routing_label.text())
+        self.assertIn("Groq backup", window.ai_routing_label.text())
+        # The admin bot is untouched and its controls load its own state.
+        self.select_ai_bot(window, "admin-main")
+        self.assertTrue(window.bot_mode_base_radio.isChecked())
+        self.assertEqual(window.ai_stores_for("admin-main").selection.load().mode, "base")
+        # Back to the base set: the custom route is kept for later.
+        self.select_ai_bot(window, "gp-main")
+        self.assertTrue(window.bot_mode_custom_radio.isChecked())
+        self.assertEqual(window.bot_executor_combo.currentData(), "groq-2")
+        window.bot_mode_base_radio.setChecked(True)
+        window.save_bot_ai()
+        selection = gp.selection.load()
+        self.assertEqual((selection.mode, selection.custom.executor), ("base", "groq-2"))
+        self.assertEqual(len(gp.settings.load().profiles), 2)
+
+    def test_periodic_refresh_keeps_unsaved_choices(self):
+        self.standard_setup()
+        window = self.make_window()
+        window.base_executor_combo.setCurrentIndex(window.base_executor_combo.findData("groq-2"))
+        self.select_ai_bot(window, "gp-main")
+        window.bot_mode_custom_radio.setChecked(True)
+        window.bot_executor_combo.setCurrentIndex(window.bot_executor_combo.findData("groq-2"))
+        window.refresh_instances()
+        window.refresh_instances()
+        self.assertEqual(window.base_executor_combo.currentData(), "groq-2")
+        self.assertTrue(window.bot_mode_custom_radio.isChecked())
+        self.assertEqual(window.bot_executor_combo.currentData(), "groq-2")
+        # A change saved elsewhere (another window, the store) is picked up.
+        self.store.set_base(self.ai_connections.RouteSelection(None, "groq-main"))
+        window.refresh_instances()
+        self.assertEqual(window.base_executor_combo.currentData(), "groq-main")
+
+    def test_dashboard_shows_the_selected_bots_connections_and_usage(self):
+        self.standard_setup()
+        ai_usage = self.manager_gui.ai_usage
+        window = self.make_window()
+        window.ai_stores_for("admin-main").usage.record(
+            ai_usage.UsageEvent("groq", "openai/gpt-oss-120b", input_tokens=900, output_tokens=80, total_tokens=980, connection_id="groq-main")
+        )
+        # Another bot hit the same key later: its fresher limit is shown (limits belong to the key).
+        window.ai_stores_for("admin-second").usage.record(
+            ai_usage.UsageEvent("groq", "openai/gpt-oss-120b", total_tokens=10, connection_id="groq-main",
+                                rate_limits={"remaining_tokens": 5000, "reset_tokens_seconds": 600.0})
+        )
+        self.select_ai_bot(window, "admin-main")
+        window.refresh_instances()
+        self.assertEqual(list(window.dashboard_connection_rows), ["groq-main", "gemini-main"])
+        row = window.dashboard_connection_rows["groq-main"]
+        self.assertIn("planning", row.role_label.text())
+        self.assertIn("fallback", row.role_label.text())
+        self.assertEqual(row.usage_label.text(), "GPT-OSS 120B · 1 req · 980 tok\n900 in / 80 out · TPM 5k left")
+        self.assertIn("Showing AI of: Main (admin-main)", window.dashboard_ai_bot_label.text())
+        self.assertIn("plan: Groq main", window.routing_card.value_label.text())
+        self.assertFalse(window.dashboard_no_ai_label.isVisible())
+
+    def test_window_test_connection_is_counted_as_manager_usage(self):
+        self.standard_setup()
+        ai_groq = importlib.import_module("ai_groq")
+        window = self.make_window()
+        body = json.dumps(
+            {"choices": [{"message": {"content": "KAIRO_GROQ_OK"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}}
+        ).encode("utf-8")
+        seen = []
+
+        class Transport:
+            def post_json(self, **kwargs):
+                seen.append(kwargs["headers"]["Authorization"])
+                return 200, body, {}
+
+        def factory(provider_id, credential_store, usage_recorder=None):
+            return ai_groq.GroqProvider(credential_store, transport=Transport(), usage_recorder=usage_recorder)
+
+        started = []
+        window._start_worker = lambda action, finished: started.append((action, finished))
+        with mock.patch.object(self.manager_gui, "create_provider", factory):
+            window.test_connection("groq-2")
+            self.assertEqual(window.connection_rows["groq-2"].status_label.text(), "Testing...")
+            action, finished = started[0]
+            finished(self.manager_gui.ActionResult(True, "OK", action()))
+        self.assertEqual(seen, ["Bearer test-key-c"])  # this connection's key only
+        self.assertEqual(window.connection_rows["groq-2"].status_label.text(), "Connected")
+        self.assertEqual(window.manager_usage.day_usage("groq", None, "groq-2")[0].requests, 1)
+        self.assertEqual(window.connection_rows["groq-2"].usage_label.text(), "GPT-OSS 120B · 1 req · 150 tok\n120 in / 30 out")
+
+    def test_test_requires_a_saved_key(self):
+        self.add("groq-nokey")
+        window = self.make_window()
+        started = []
+        window._start_worker = lambda action, finished: started.append(action)
+        window.test_connection("groq-nokey")
+        self.assertEqual(started, [])
+        self.assertIn("no API key saved", window.last_error)
+        self.assertEqual(window.connection_rows["groq-nokey"].status_label.text(), "No key saved")
+        self.assertFalse(window.connection_rows["groq-nokey"].test_button.isEnabled())
+
+    def test_first_saved_connection_becomes_the_base_set(self):
+        window = self.make_window()
+        self.assertIn("No connections yet", window.connections_status.text())
+        self.assertIn("No connections", window.ai_card.value_label.text())
+        connection = self.add("groq-1", key="test-key")
+        dialog = SimpleNamespace(changed=True, removed=False, connection=connection)
+        window._after_connection_dialog(dialog)
+        self.assertEqual(self.store.load().base.executor, "groq-1")
+        self.assertEqual([p.profile_id for p in window.ai_stores_for("gp-main").settings.load().profiles], ["groq-1"])
+
+    def test_add_and_edit_open_the_dialog_for_the_right_connection(self):
+        self.standard_setup()
+        window = self.make_window()
+        fake = mock.Mock(changed=False, removed=False, connection=None)
+        with mock.patch.object(self.manager_gui, "ConnectionDialog", return_value=fake) as dialog_class:
+            window.add_connection()
+            window.edit_connection("gemini-main")
+        self.assertIsNone(dialog_class.call_args_list[0].args[1])
+        self.assertEqual(dialog_class.call_args_list[1].args[1].connection_id, "gemini-main")
+        self.assertIs(dialog_class.call_args_list[1].kwargs["usage_store"], window.manager_usage)
+        self.assertEqual(fake.exec.call_count, 2)
+
+    def test_unreadable_connections_file_is_reported(self):
+        self.store.path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.path.write_text("{broken", encoding="utf-8")
+        window = self.make_window()
+        self.assertIn("unreadable", window.connections_status.text())
+        self.assertFalse(window.add_connection_button.isEnabled())
+        self.assertFalse(window.base_save_button.isEnabled())
+        self.assertEqual(self.store.path.read_text(encoding="utf-8"), "{broken")
+
+    def test_usage_tooltips_and_shared_connections_are_explicit(self):
+        self.standard_setup()
+        window = self.make_window()
+        self.select_ai_bot(window, "admin-main")
+        window.refresh_instances()
+        dash = self.manager_gui.dash
+        dashboard_row = window.dashboard_connection_rows["groq-main"]
+        self.assertEqual(dashboard_row.usage_label.toolTip(), dash.BOT_USAGE_TOOLTIP)
+        self.assertIn("only the selected bot's own requests", dashboard_row.usage_label.toolTip())
+        self.assertEqual(window.connection_rows["groq-main"].usage_label.toolTip(), dash.CONNECTION_USAGE_TOOLTIP)
+        self.assertIn("every bot that uses it plus Manager Test Connection", window.connection_rows["groq-main"].usage_label.toolTip())
+        # Kairo's dashboard row says who else spends the same key.
+        self.assertIn("also used by Second, Game Pings", dashboard_row.role_label.text())
+        self.assertNotIn("Main", dashboard_row.role_label.text().split("also used by")[1])
+
+    def test_no_stale_per_bot_key_wording(self):
+        window = self.make_window()
+        texts = [label.text() for label in window.findChildren(self.manager_gui.QLabel)]
+        texts += [box.text() for box in window.findChildren(self.manager_gui.QCheckBox)]
+        texts += [self.manager_gui.BOT_TYPE_HINTS[key] for key in self.manager_gui.BOT_TYPE_HINTS]
+        for text in texts:
+            for stale in ("own AI keys", "own optional AI keys", "keys are stored per bot", "stored per bot"):
+                self.assertNotIn(stale, text)
+        self.assertTrue(any("Base Set" in text for text in texts))
+
+    def test_dashboard_explains_what_the_game_presence_bot_is_doing(self):
+        core = self.manager_gui.manager_core
+        manager = self.manager_with_presence()
+        logs = self.data_root / "instances" / "gp-main" / "logs"
+        runtime = logs.parent / "runtime"
+        runtime.mkdir(parents=True)
+        manager.infos = [manager.infos[0], manager.infos[1], replace(manager.infos[2], state=core.STATE_RUNNING, pid=77, logs_dir=logs)]
+
+        class ConfigApi(FakeConfigApi):
+            def get_config_snapshot(self, instance_id):
+                if instance_id == "gp-main":
+                    return FakeSnapshot("gp-main", "game_presence", 1, {}, {}, {})
+                return super().get_config_snapshot(instance_id)
+
+        window = self.manager_gui.ManagerMainWindow(manager=manager, instance_api=FakeInstanceApi(), config_api=ConfigApi(), auto_refresh=False)
+        self.addCleanup(lambda: (setattr(window, "_allow_close", True), window.close()))
+        (runtime / "game_presence_status.json").write_text(
+            json.dumps({"diagnosis": {"code": "waiting_delay", "text": "Waiting: 2 players in Overwatch 2, check in 1:30."}}),
+            encoding="utf-8",
+        )
+        window.refresh_instances()
+        for row in range(window.instance_table.rowCount()):
+            if window.instance_table.item(row, 0).text() == "gp-main":
+                window.instance_table.selectRow(row)
+        window._refresh_dashboard()
+        self.assertIn("Game Presence: Waiting: 2 players in Overwatch 2", window.bot_facts_label.text())
+
+        # Stopped and never configured: said plainly instead of only "Offline".
+        manager.infos = [manager.infos[0], manager.infos[1], replace(manager.infos[2], state=core.STATE_STOPPED, pid=None)]
+        window.refresh_instances()
+        window._refresh_dashboard()
+        self.assertIn("Game Presence: Not configured: choose a server and a channel", window.bot_facts_label.text())
+
+
+class SelfUpdateUITests(unittest.TestCase):
+    """Sidebar update button: check, confirm, install, stop bots, restart, resume."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manager_gui = load_gui_module(Path(self.temp_dir.name))
+        self.app = get_qapplication()
+        self.app_updates = self.manager_gui.app_updates
+        self.installed = self.app_updates.InstalledApp(
+            install_root=Path(self.temp_dir.name) / "Programs" / "DarkAbyss",
+            version="1.0.0",
+            launcher=Path(self.temp_dir.name) / "Programs" / "DarkAbyss" / "Launcher.exe",
+        )
+        self.update = self.app_updates.AvailableUpdate("1.0.1", "v1.0.1", "DarkAbyss 1.0.1")
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def make_window(self, manager=None, installed=True):
+        with mock.patch.object(self.app_updates, "current_install", return_value=self.installed if installed else None):
+            window = self.manager_gui.ManagerMainWindow(
+                manager=manager or FakeManager(self.manager_gui.manager_core),
+                instance_api=FakeInstanceApi(),
+                config_api=FakeConfigApi(),
+                auto_refresh=False,
+            )
+
+        def close_without_prompt():
+            window._allow_close = True
+            window.close()
+
+        self.addCleanup(close_without_prompt)
+
+        def immediate(action, finished):
+            try:
+                value = action()
+            except Exception as exc:
+                finished(self.manager_gui.ActionResult(False, str(exc), exc))
+            else:
+                finished(self.manager_gui.ActionResult(True, "OK", value))
+
+        window._start_worker = immediate
+        return window
+
+    def test_source_build_does_not_offer_updates(self):
+        window = self.make_window(installed=False)
+        self.assertFalse(window.update_check_button.isEnabled())
+        self.assertTrue(window.update_install_button.isHidden())
+        self.assertEqual(window.update_label.text(), "Updates: packaged app only")
+        with mock.patch.object(self.app_updates, "check_for_update") as check:
+            window.check_for_updates(silent=True)
+        check.assert_not_called()
+
+    def test_check_shows_update_button_and_activity(self):
+        window = self.make_window()
+        with mock.patch.object(self.app_updates, "check_for_update", return_value=self.update) as check:
+            window.check_for_updates(silent=True)
+        check.assert_called_once_with("1.0.0")
+        self.assertFalse(window.update_install_button.isHidden())
+        self.assertEqual(window.update_install_button.text(), "⬆  Update to v1.0.1")
+        self.assertEqual(window.update_label.text(), "v1.0.1 is available.")
+        self.assertEqual(window.activity.entries[0][1:], ("Update", "Version 1.0.1 is available: use '⬆ Update' in the sidebar."))
+
+        with mock.patch.object(self.app_updates, "check_for_update", return_value=None):
+            window.check_for_updates(silent=False)
+        self.assertTrue(window.update_install_button.isHidden())
+        self.assertTrue(window.update_label.text().startswith("Up to date · checked "))
+        self.assertEqual(window.status_label.text(), "You have the newest version.")
+
+    def test_failed_background_check_is_quiet(self):
+        window = self.make_window()
+        error = self.app_updates.AppUpdateError("Update check failed: GitHub API request failed with HTTP status 503.")
+        with mock.patch.object(self.app_updates, "check_for_update", side_effect=error), mock.patch.object(
+            self.manager_gui.QMessageBox, "critical"
+        ) as critical:
+            window.check_for_updates(silent=True)
+        critical.assert_not_called()
+        self.assertEqual(window.update_label.text(), "Update check failed (retrying later).")
+        self.assertIn("503", window.update_label.toolTip())
+
+    def test_install_stops_bots_after_the_switch_restarts_and_resumes_them(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        window = self.make_window(manager)
+        window.available_update = self.update
+        order = []
+        manager.shutdown_all = lambda: order.append("shutdown") or {}
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok) as question, mock.patch.object(
+            self.app_updates, "install_update", side_effect=lambda update, root: order.append(("install", update.version, root))
+        ), mock.patch.object(self.app_updates, "start_launcher", side_effect=lambda installed: order.append("launcher")):
+            window.install_available_update()
+        prompt = question.call_args[0][2]
+        self.assertIn("Install v1.0.1? You have v1.0.0.", prompt)
+        self.assertIn("admin-main", prompt)
+        self.assertIn(str(self.manager_gui.app_paths.DATA_ROOT), prompt)
+        self.assertEqual(order, [("install", "1.0.1", self.installed.install_root), "shutdown", "launcher"])
+        self.assertTrue(window._allow_close)
+        self.assertFalse(window.isVisible())
+
+        # The next Manager starts the bots that were running before the update.
+        resumed = self.make_window(FakeManager(self.manager_gui.manager_core))
+        self.assertEqual(resumed.resume_bots_after_update(), ["admin-main"])
+        self.assertIn(("start", "admin-main"), resumed.manager.calls)
+        self.assertEqual(resumed.resume_bots_after_update(), [])
+
+    def test_cancelled_or_failed_install_keeps_everything_running(self):
+        manager = FakeManager(self.manager_gui.manager_core)
+        window = self.make_window(manager)
+        window.available_update = self.update
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Cancel), mock.patch.object(
+            self.app_updates, "install_update"
+        ) as install:
+            window.install_available_update()
+        install.assert_not_called()
+
+        error = self.app_updates.AppUpdateError("Update to 1.0.1 failed: GitHub asset digest mismatch.")
+        with mock.patch.object(self.manager_gui.QMessageBox, "question", return_value=self.manager_gui.QMessageBox.Ok), mock.patch.object(
+            self.app_updates, "install_update", side_effect=error
+        ), mock.patch.object(self.app_updates, "start_launcher") as launcher, mock.patch.object(
+            self.manager_gui.QMessageBox, "critical"
+        ) as critical:
+            window.install_available_update()
+        launcher.assert_not_called()
+        self.assertEqual(manager.shutdown_calls, 0)
+        self.assertIn("Nothing was changed", critical.call_args[0][2])
+        self.assertFalse(window._allow_close)
+        self.assertTrue(window.update_install_button.isEnabled())
+        self.assertFalse(self.app_updates.resume_path().exists())
 
 
 def replace_namespace(namespace, **changes):

@@ -31,6 +31,20 @@ import game_presence as gp
 CUSTOM_ID_MUTE = "dab:gp:mute"
 CUSTOM_ID_ALLOW = "dab:gp:allow"
 STATUS_FILE_NAME = "game_presence_status.json"
+# Diagnoses written to the bot log when they start (problems + successful posts).
+LOGGED_DIAGNOSES = frozenset(
+    {
+        "not_configured",
+        "config_problem",
+        "state_problem",
+        "intent_missing",
+        "guild_unavailable",
+        "channel_unavailable",
+        "permission_denied",
+        "send_failed",
+        "posted",
+    }
+)
 AI_REWRITE_TIMEOUT_SECONDS = 15.0
 MAX_MESSAGE_CHARS = 1500
 
@@ -265,6 +279,7 @@ class GamePresenceRuntime:
         rewriter: Rewriter | None = None,
         runtime_dir: Any = None,
         presence_intent: bool = False,
+        log: Callable[[str], None] | None = None,
     ) -> None:
         self.client = client
         self.engine = engine
@@ -272,6 +287,8 @@ class GamePresenceRuntime:
         self.rewriter = rewriter
         self.runtime_dir = runtime_dir
         self.presence_intent = presence_intent
+        self.log = log or (lambda text: print(text, flush=True))
+        self.diagnosis = gp.Diagnosis("starting", "Starting: the first check runs within a few seconds.")
         self.problem: str | None = None
         # Set by the bot when its config is invalid / not configured yet; it
         # survives tick() so the Manager sees why nothing is posted.
@@ -336,30 +353,90 @@ class GamePresenceRuntime:
         channel = guild.get_channel(config.channel_id) if guild is not None and config.channel_id else None
         return guild, channel
 
+    def diagnose(self, code: str, text: str) -> None:
+        """Current reason shown in the Manager; problems are logged once per change."""
+        previous = self.diagnosis
+        self.diagnosis = gp.Diagnosis(code, text)
+        if code in LOGGED_DIAGNOSES and (previous.code != code or previous.text != text):
+            try:
+                self.log(f"Game Presence: {text}")
+            except Exception:
+                pass
+
+    @staticmethod
+    def missing_permissions(guild: Any, channel: Any) -> list[str]:
+        """Permissions the bot lacks to post suggestions in ``channel`` (checked before posting)."""
+        me = getattr(guild, "me", None)
+        checker = getattr(channel, "permissions_for", None)
+        if me is None or not callable(checker):
+            return []
+        try:
+            permissions = checker(me)
+        except Exception:
+            return []
+        missing = []
+        if not getattr(permissions, "view_channel", True):
+            missing.append("View Channel")
+        if not getattr(permissions, "send_messages", True):
+            missing.append("Send Messages")
+        return missing
+
     async def tick(self) -> int:
         """Publish due suggestions; returns how many were posted."""
         config = self.engine.config
         self.problem = self.config_problem
         if config.enabled and not self.presence_intent:
             self.problem = "Restart the bot: Presence Intent is requested only at startup."
+            self.diagnose("intent_missing", self.problem)
             self.write_status()
             return 0
         posted = 0
-        if config.active:
+        if not config.active:
+            if self.config_problem == gp.NOT_CONFIGURED_TEXT:
+                self.diagnose("not_configured", "Not configured: choose a server and a suggestion channel on the Game Presence page and press Save. Nothing is posted until then.")
+            elif self.config_problem:
+                self.diagnose("config_problem", self.config_problem)
+            else:
+                self.diagnose("paused", "Paused: 'Post suggestions' is switched off on the Game Presence page.")
+        else:
             guild, channel = self._channel()
+            missing = self.missing_permissions(guild, channel) if guild is not None and channel is not None else []
             if guild is None:
                 self.problem = "The bot is not in the selected server."
+                self.diagnose("guild_unavailable", self.problem)
             elif channel is None or not hasattr(channel, "send"):
                 self.problem = "The selected text channel was not found."
+                self.diagnose("channel_unavailable", self.problem)
+            elif missing:
+                self.problem = f"Missing Discord permission in #{getattr(channel, 'name', channel.id)}: {', '.join(missing)}."
+                self.diagnose("permission_denied", self.problem)
             else:
+                posted_games = []
                 for suggestion in self.engine.tick():
                     try:
                         await self._publish(channel, guild, suggestion)
                         posted += 1
+                        posted_games.append(suggestion.game_display_name)
                     except discord.Forbidden:
                         self.problem = "Discord refused to post in the channel (check the bot's permissions)."
+                        self.diagnose("permission_denied", self.problem)
                     except Exception as exc:
                         self.problem = f"Posting failed: {type(exc).__name__}."
+                        self.diagnose("send_failed", self.problem)
+                if posted_games:
+                    self.diagnose("posted", f"Suggestion posted for {', '.join(posted_games)} in #{getattr(channel, 'name', channel.id)}.")
+                elif self.problem is None:
+                    diagnosis = self.engine.diagnosis
+                    if diagnosis.code == "no_activity":
+                        # Say what Discord does deliver, so "bot broken" and
+                        # "nobody shares a game" look different.
+                        snapshot = self.presence_snapshot()
+                        diagnosis = gp.Diagnosis(
+                            "no_activity",
+                            f"No game activity shared: {snapshot['online']} of {snapshot['visible']} members online, "
+                            "none shows 'Playing' in Discord.",
+                        )
+                    self.diagnose(diagnosis.code, diagnosis.text)
         self.write_status()
         return posted
 
@@ -382,6 +459,15 @@ class GamePresenceRuntime:
     def status(self) -> dict[str, Any]:
         config = self.engine.config
         guild, channel = self._channel() if config.active else (None, None)
+        problem = self.problem
+        try:
+            engine_status = self.engine.status()
+        except Exception as exc:
+            # The persisted state (cooldowns/history) could not be read: still
+            # report, so the Manager shows why nothing is posted.
+            engine_status = {"tracked_players": 0, "top_games": [], "pending_groups": 0, "last_suggestion": None}
+            problem = problem or f"Game Presence state is unavailable ({type(exc).__name__}); posting is paused."
+        snapshot = self.presence_snapshot()
         return {
             "enabled": config.enabled,
             "presence_intent": self.presence_intent,
@@ -389,9 +475,54 @@ class GamePresenceRuntime:
             "guild_name": getattr(guild, "name", None),
             "channel_id": str(config.channel_id) if config.channel_id else None,
             "channel_name": getattr(channel, "name", None),
-            "problem": self.problem,
-            **self.engine.status(),
+            "problem": problem,
+            **engine_status,
+            # Runtime-level reason (config, channel, permissions) wins over the engine's.
+            "diagnosis": self.diagnosis.public_dict(),
+            # What Discord actually delivers: members in the cache and how many
+            # of them show a Playing activity (0 visible = members/presence data missing).
+            "visible_members": snapshot["visible"],
+            "online_members": snapshot["online"],
+            "playing_members": snapshot["playing"],
+            "other_activities": snapshot["other_activities"],
         }
+
+    def presence_counts(self) -> tuple[int, int]:
+        snapshot = self.presence_snapshot()
+        return snapshot["visible"], snapshot["playing"]
+
+    def presence_snapshot(self) -> dict[str, Any]:
+        """What Discord delivers for the configured server (every server when
+        none is configured yet), counts only: non-bot members in the cache, how
+        many are online, how many show a Playing activity, and which other
+        activity types are present (custom status, listening, streaming...)."""
+        getter = getattr(self.client, "get_guild", None)
+        config = self.engine.config
+        if config.guild_id and callable(getter):
+            guild = getter(config.guild_id)
+            guilds = [guild] if guild is not None else []
+        else:
+            guilds = list(getattr(self.client, "guilds", None) or [])
+        visible = online = playing = 0
+        other: dict[str, int] = {}
+        for guild in guilds:
+            for member in getattr(guild, "members", None) or []:
+                if getattr(member, "bot", False):
+                    continue
+                visible += 1
+                status = getattr(member, "status", None)
+                # Anyone with an activity is online even if no status was reported.
+                if (status is not None and str(status) != "offline") or getattr(member, "activities", None):
+                    online += 1
+                if member_game(member) is not None:
+                    playing += 1
+                for activity in getattr(member, "activities", None) or ():
+                    kind = getattr(activity, "type", None)
+                    if kind is None or kind == discord.ActivityType.playing:
+                        continue
+                    name = str(getattr(kind, "name", kind))
+                    other[name] = other.get(name, 0) + 1
+        return {"visible": visible, "online": online, "playing": playing, "other_activities": other}
 
     def write_status(self) -> None:
         if self.runtime_dir is None:

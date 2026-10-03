@@ -21,7 +21,8 @@ if not _os.environ.get("DARKABYSS_DATA_DIR"):
 
 def load_ai_platform():
     sys.path.insert(0, str(CORE_ROOT))
-    sys.modules.pop("ai_platform", None)
+    for name in ("ai_platform", "ai_providers", "ai_connections"):
+        sys.modules.pop(name, None)
     return importlib.import_module("ai_platform")
 
 
