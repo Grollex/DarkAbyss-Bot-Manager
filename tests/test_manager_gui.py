@@ -49,6 +49,9 @@ def load_gui_module(data_root: Path):
         "stream_director_twitch",
         "manager_setup_state",
         "manager_kairo",
+        "manager_content_filter",
+        "content_filter",
+        "locked_json",
         "social_awareness",
         "social_memory",
     ):
@@ -2466,6 +2469,82 @@ class SettingsRoundTripTests(unittest.TestCase):
         reopened.bot_combo.setCurrentIndex(reopened.bot_combo.findData("admin-a"))
         self.assertFalse(reopened.lore_checkbox.isChecked())
         self.assertFalse(reopened.dirty)
+
+
+    # -- Content Filter page ------------------------------------------------------------------
+
+    def filter_page(self, states=None):
+        states = states or {}
+        bots = [(iid, label, self.info(iid, "admin", states.get(iid, "STOPPED"))) for iid, label in (("admin-a", "Main · Admin A"), ("admin-b", "Main · Admin B"))]
+        restarted = []
+        page = self.manager_gui.manager_content_filter.ContentFilterPanel(lambda: list(bots), self.config_store, restarted.append)
+        self.addCleanup(page.close)
+        return page, restarted
+
+    def test_content_filter_settings_round_trip(self):
+        cf = self.manager_gui.manager_content_filter.cf
+        page, _ = self.filter_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        self.assertTrue(page.enabled_checkbox.isChecked())
+        self.assertEqual({name for name, box in page.immediate_boxes.items() if box.isChecked()}, set(cf.DEFAULT_IMMEDIATE))
+        page.enabled_checkbox.setChecked(False)
+        page.immediate_boxes["family"].setChecked(False)
+        page.immediate_boxes["insult"].setChecked(True)
+        self.assertEqual(page.result_label.state, "dirty")
+        self.assertTrue(page.save())
+        effective = self.config_store.load_effective_config("admin-a")
+        self.assertEqual((effective[cf.CONFIG_ENABLED], effective[cf.CONFIG_IMMEDIATE]), (False, ["hate", "threat", "harassment", "insult"]))
+        self.assertTrue(self.config_store.load_effective_config("admin-b")[cf.CONFIG_ENABLED])  # the other Kairo is untouched
+        reopened, _ = self.filter_page()
+        reopened.bot_combo.setCurrentIndex(reopened.bot_combo.findData("admin-a"))
+        self.assertFalse(reopened.enabled_checkbox.isChecked())
+        self.assertEqual([name for name, box in reopened.immediate_boxes.items() if box.isChecked()], ["hate", "threat", "harassment", "insult"])
+        self.assertFalse(reopened.dirty)
+
+    def test_content_filter_members_and_log(self):
+        cf = self.manager_gui.manager_content_filter.cf
+        page, _ = self.filter_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        page.guild_combo.setEditText("111")
+        page.member_id_edit.setText("not a number")
+        self.assertFalse(page.add_member())
+        self.assertIn("must be a number", page.members_result.text())
+        page.member_id_edit.setText("222")
+        page.note_edit.setText("грубит")
+        self.assertTrue(page.add_member())
+        store = cf.FilterStore(self.instance_store.get_instance_paths("admin-a").data_dir / cf.FILE_NAME)
+        self.assertTrue(store.is_watched(111, 222))
+        self.assertEqual(store.guild(111).watched[222].added_by, "manager")
+        store.record(111, cf.FilterAction(1_700_000_000.0, 222, "Вася", 5, 6, "insult", 2, 45, "called him an idiot", "ты дебил", "muted"))
+        page.refresh_members()
+        self.assertEqual(page.guild_combo.currentData(), 111)
+        self.assertEqual(page.members_list.count(), 1)
+        self.assertIn("Вася (222) · грубит · mutes: 1", page.members_list.item(0).text())
+        self.assertIn("45 min · Direct insults, name-calling · called him an idiot · “ты дебил”", page.log_list.item(0).text())
+        # admin-b has its own list.
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-b"))
+        self.assertEqual(page.members_list.count(), 0)
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        page.members_list.setCurrentRow(0)
+        self.assertTrue(page.remove_selected())
+        self.assertFalse(store.is_watched(111, 222))
+        self.assertEqual(page.members_list.count(), 0)
+        self.assertEqual(page.log_list.count(), 1)  # the log stays
+
+    def test_content_filter_broken_list_is_locked_and_can_be_reset(self):
+        kairo = self.manager_gui.manager_content_filter
+        path = self.instance_store.get_instance_paths("admin-a").data_dir / kairo.cf.FILE_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{broken", encoding="utf-8")
+        page, _ = self.filter_page()
+        page.bot_combo.setCurrentIndex(page.bot_combo.findData("admin-a"))
+        self.assertIn("unreadable", page.store_problem_label.text())
+        self.assertFalse(page.add_button.isEnabled())
+        self.assertEqual(page.status_title.text(), "List problem")
+        with mock.patch.object(kairo.QMessageBox, "question", return_value=kairo.QMessageBox.Yes):
+            page.reset_store_button.click()
+        self.assertEqual(page.store_problem_label.text(), "")
+        self.assertTrue(page.add_button.isEnabled())
 
 
 def replace_namespace(namespace, **changes):

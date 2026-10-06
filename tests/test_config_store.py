@@ -36,6 +36,9 @@ AI_WHITELIST_DEFAULTS = {
     "social_awareness_channel_ids": [],
     "social_awareness_replies_per_hour": 4,
     "social_awareness_lore_enabled": True,
+    # Content filter: on, but it only checks members someone named.
+    "content_filter_enabled": True,
+    "content_filter_immediate": ["hate", "threat", "harassment", "family"],
 }
 
 

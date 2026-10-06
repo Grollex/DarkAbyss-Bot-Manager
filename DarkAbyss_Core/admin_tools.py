@@ -67,6 +67,8 @@ class AdminToolContext:
     # then arrives empty, so text-based filters must refuse instead of silently
     # matching nothing. None = unknown (no check).
     message_content: bool | None = None
+    # content_filter.FilterStore of this bot (who is filtered); None = unavailable.
+    content_filter: Any = None
 
 
 MESSAGE_CONTENT_HELP = (
@@ -1575,7 +1577,7 @@ def register_tool(definition: ToolDefinition, handler: Callable[[AdminToolContex
     _TOOL_HANDLERS[definition.name] = handler
 
 
-EXTENSION_MODULES = ("admin_tools_server", "admin_tools_content", "admin_blueprint", "admin_features")
+EXTENSION_MODULES = ("admin_tools_server", "admin_tools_content", "admin_blueprint", "admin_features", "admin_tools_filter")
 
 
 def _load_extension_tools() -> None:

@@ -506,6 +506,7 @@ class PackagedRuntimeTests(unittest.TestCase):
                 "stream_director", "stream_director_config", "stream_director_store", "stream_director_twitch", "stream_director_discord",
                 "bot_i18n", "bot_i18n_ru_admin", "bot_i18n_ru_game_presence", "bot_i18n_ru_stream_director",
                 "bot_events", "social_awareness", "social_memory", "social_signals", "manager_kairo",
+                "content_filter", "admin_tools_filter", "manager_content_filter", "locked_json",
             ):
                 self.assertIn(f'"{module}"', spec_text)
 

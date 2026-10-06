@@ -50,6 +50,11 @@ a = Analysis(
         "social_memory",
         "social_signals",
         "manager_kairo",
+        # Kairo's content filter; admin_tools loads its AI tools by name.
+        "content_filter",
+        "admin_tools_filter",
+        "manager_content_filter",
+        "locked_json",
         "ai_storage",
         "ai_usage",
         "ai_connections",

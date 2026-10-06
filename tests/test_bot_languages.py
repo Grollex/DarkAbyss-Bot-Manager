@@ -21,7 +21,10 @@ if not os.environ.get("DARKABYSS_DATA_DIR"):
 import bot_i18n  # noqa: E402
 import bot_i18n_keys  # noqa: E402
 
-ADMIN_MODULES = ("Admin.py", "admin_ai.py", "admin_tools.py", "admin_tools_server.py", "admin_tools_content.py", "admin_features.py", "admin_blueprint.py", "social_awareness.py")
+ADMIN_MODULES = (
+    "Admin.py", "admin_ai.py", "admin_tools.py", "admin_tools_server.py", "admin_tools_content.py", "admin_features.py", "admin_blueprint.py",
+    "social_awareness.py", "content_filter.py", "admin_tools_filter.py",
+)
 
 
 def reset_language(test):
@@ -54,6 +57,9 @@ class CatalogTests(unittest.TestCase):
             )
         } | {admin_tools.MESSAGE_CONTENT_HELP, admin_tools.PERMISSION_NAMES_HINT}
         constants |= {"Deleted role menu {menu_id}.", "Deleted role menu {menu_id} and its message.", "Deleted role menu {menu_id} (its message was already gone)."}
+        import content_filter
+
+        constants |= set(content_filter.CATEGORY_LABELS.values())
         self.check(ADMIN_MODULES, bot_i18n_ru_admin.RU, constants)
 
     def test_game_presence_catalog(self):

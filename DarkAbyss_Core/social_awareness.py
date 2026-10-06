@@ -875,6 +875,11 @@ class SocialAwareness:
             return  # this channel was looked at a moment ago
         self.pending[key] = PendingAnalysis(guild_id, channel_id, now, now + debounce, reason, focus_user_id)
 
+    def moderated(self, guild_id: int, channel_id: int, user_id: int) -> None:
+        """The content filter just muted someone here: Kairo has already spoken."""
+        self.pending.pop((guild_id, channel_id), None)
+        self.thoughts.pop((guild_id, channel_id), None)
+
     def _drop_thought(self, guild_id: int, channel_id: int) -> None:
         thought = self.thoughts.pop((guild_id, channel_id), None)
         if thought is not None:

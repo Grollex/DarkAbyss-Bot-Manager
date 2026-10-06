@@ -58,6 +58,7 @@ import app_updates
 import bot_i18n
 import game_presence
 import manager_dashboard as dash
+import manager_content_filter
 import manager_game_presence
 import manager_kairo
 import manager_setup_state
@@ -1791,6 +1792,7 @@ class ManagerMainWindow(QMainWindow):
             ("ai", self._build_ai_page),
             ("terminal", self._build_terminal_page),
             ("kairo", self._build_kairo_page),
+            ("filter", self._build_filter_page),
             ("presence", self._build_presence_page),
             ("stream", self._build_stream_page),
             ("commands", self._build_commands_page),
@@ -1861,6 +1863,7 @@ class ManagerMainWindow(QMainWindow):
             ("ai", "\U0001f9e0   AI Providers"),
             ("terminal", "\U0001f4ac   AI Terminal"),
             ("kairo", "\U0001f9ed   Kairo"),
+            ("filter", "\U0001f6e1   Content Filter"),
             ("presence", "\U0001f3ae   Game Presence"),
             ("stream", "\U0001f3ac   Stream Director"),
             ("commands", "∕   Commands && Tools"),
@@ -2078,6 +2081,11 @@ class ManagerMainWindow(QMainWindow):
         # Admin (Kairo) bots: language and Social Awareness.
         self.kairo_panel = manager_kairo.KairoPanel(self._all_bots, self._config_api, self.restart_instance)
         return self.kairo_panel
+
+    def _build_filter_page(self) -> QWidget:
+        # Kairo's content filter: settings, who is filtered, the mute log.
+        self.filter_panel = manager_content_filter.ContentFilterPanel(self._all_bots, self._config_api, self.restart_instance)
+        return self.filter_panel
 
     def _build_stream_page(self) -> QWidget:
         self.stream_panel = manager_stream_director.StreamDirectorPanel(
@@ -2456,6 +2464,8 @@ class ManagerMainWindow(QMainWindow):
             self.stream_panel.refresh(keep_edits=True)
         if name == "kairo":
             self.kairo_panel.refresh(keep_edits=True)
+        if name == "filter":
+            self.filter_panel.refresh(keep_edits=True)
 
     def _open_setup_from_nav(self) -> None:
         if self.selected_instance_id() is None and self.instance_table.rowCount() > 0:

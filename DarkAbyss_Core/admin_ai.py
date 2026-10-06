@@ -502,7 +502,7 @@ KEYWORD_ROUTES: dict[str, tuple[str, ...]] = {
     "roles": ("рол", "role", "цвет", "color", "colour", "иерарх", "прав", "permission", "доступ"),
     "blueprint": ("сервер", "структур", "с нуля", "шаблон", "blueprint", "server", "structure", "template", "setup", "настрой", "спроектир", "построй", "откат", "undo"),
     "members": ("участник", "member", "ник", "nick", "перемест", "move", "заглуш", "deafen", "выдай", "give", "забер", "сними", "всем"),
-    "moderation": ("бан", "ban", "кик", "kick", "мут", "mute", "тайм", "timeout", "очист", "удали сообщ", "purge", "аудит", "audit", "журнал", "локдаун", "lockdown", "заблок", "lock", "разблок"),
+    "moderation": ("бан", "ban", "кик", "kick", "мут", "mute", "тайм", "timeout", "очист", "удали сообщ", "purge", "аудит", "audit", "журнал", "локдаун", "lockdown", "заблок", "lock", "разблок", "фильтр", "filter", "оскорб", "insult", "токсич", "toxic"),
     "messages": ("сообщ", "напиш", "отправ", "embed", "эмбед", "опрос", "poll", "закреп", "pin", "реакц", "react", "анонс", "announce", "message", "send", "say", "скажи", "опублик"),
     "threads": ("ветк", "тред", "thread", "форум", "forum", "пост", "post", "тег", "tag"),
     "server": ("сервер", "иконк", "аватар", "баннер", "icon", "avatar", "banner", "название", "верификац", "verification", "онбординг", "onboarding", "welcome screen", "правил", "rules", "afk", "описание"),
@@ -1071,6 +1071,8 @@ class AITransport:
         self.planning = planning is True
         # ai_storage.InstanceAIStores of THIS bot instance (set by Admin.main).
         self.ai_stores = ai_stores
+        # content_filter.FilterStore of this bot (set by Admin.main) for the filter tools.
+        self.content_filter = None
         self._orchestrator_factory = orchestrator_factory or (lambda: _default_orchestrator_factory(self.ai_stores))
         self._view_factory = view_factory or ConfirmationView
         self._orchestrator: Any = None
@@ -1272,6 +1274,7 @@ class AITransport:
                 attachments=dict(attachments or {}),
                 feature_store=self.feature_store,
                 message_content=self.message_content_enabled,
+                content_filter=self.content_filter,
             )
             result = await admin_tools.execute_tool(context, tool_name, arguments)
             audit_failure = await self._safe_audit(source, config, tool_name, result.message)

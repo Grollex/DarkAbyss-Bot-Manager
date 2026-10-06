@@ -1405,7 +1405,9 @@ class MessageContentIntentTests(unittest.TestCase):
             if run_side_effect is not None:
                 raise run_side_effect
 
-        runtime = types.SimpleNamespace(instance_id="admin-main", config_path=Path("x"), token_path=Path("y"), lock_path=Path("z"))
+        temp = tempfile.TemporaryDirectory()  # also called with self=None: cleaned up below
+        # A real folder: the bot writes its status files next to the lock.
+        runtime = types.SimpleNamespace(instance_id="admin-main", config_path=Path("x"), token_path=Path("y"), lock_path=Path(temp.name) / "admin_bot.lock")
         patches = {
             "resolve_runtime": lambda instance_id: runtime,
             "load_config": lambda runtime=None: admin.validate_config(dict(config)),
@@ -1424,6 +1426,7 @@ class MessageContentIntentTests(unittest.TestCase):
             for name, value in originals.items():
                 setattr(admin, name, value)
             admin.bot.run = original_run
+            temp.cleanup()
         return code, seen
 
     def base_config(self, **extra):

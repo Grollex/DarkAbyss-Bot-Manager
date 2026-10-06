@@ -2,7 +2,7 @@ import argparse
 import msvcrt
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,6 +19,7 @@ import bot_events
 import bot_i18n
 import bot_registry
 import config_store
+import content_filter
 import instance_store
 import runtime_layout
 import social_awareness
@@ -183,6 +184,8 @@ def validate_config(config: dict) -> dict:
 
     # Social Awareness (optional): null = never chosen (off; the Manager asks once).
     social_awareness.validate_config_fields(config, parse_snowflake_list)
+    # Content filter: on by default, but it only checks members someone named.
+    content_filter.validate_config_fields(config)
 
     return config
 
@@ -369,7 +372,7 @@ def message_content_requested(config: dict) -> bool:
 
 PRIVILEGED_INTENTS_HELP = (
     "Discord refused a privileged gateway intent. With the AI control channel, @mention requests, "
-    "'AI can read message text' or Social Awareness enabled this bot requires BOTH privileged intents: "
+    "'AI can read message text', Social Awareness or a content filter with named members this bot requires BOTH privileged intents: "
     "'Server Members Intent' (always required by the Admin bot) and 'Message Content Intent' (required "
     "only for the AI control channel, @mention requests, AI message reading and Social Awareness). Enable "
     "the missing one(s) in Discord Developer Portal -> Application -> Bot -> Privileged Gateway Intents. "
@@ -441,6 +444,11 @@ feature_store: admin_features.FeatureStore | None = None
 # Kairo Social Awareness (social_awareness.py). Set in main() when the AI
 # transport exists; it stays silent while switched off in the config.
 social: social_awareness.SocialAwareness | None = None
+
+# Content filter (content_filter.py): who is filtered, and the runtime that
+# judges their messages. Set in main(); None when the bot has no data folder.
+filter_store: content_filter.FilterStore | None = None
+content_filter_runtime: content_filter.ContentFilter | None = None
 
 # This bot on the DarkAbyss bot event bus (heartbeat: "Kairo is running"). Set in main().
 events_publisher: bot_events.EventPublisher | None = None
@@ -525,6 +533,8 @@ def refresh_live_config() -> dict | None:
         config = None  # invalid config: keep the language, Social Awareness fails closed
     if social is not None:
         social.apply_config(config)
+    if content_filter_runtime is not None:
+        content_filter_runtime.apply_config(config)
     return config
 
 
@@ -714,6 +724,151 @@ async def ai_reset(interaction: discord.Interaction) -> None:
     await ai_transport.handle_reset_command(interaction)
 
 
+@bot.listen("on_message")
+async def content_filter_listener(message: discord.Message) -> None:
+    # Only members named with /filter add (or in the Manager) are judged.
+    if content_filter_runtime is None:
+        return
+    try:
+        await content_filter_runtime.observe(message)
+    except Exception as exc:  # pragma: no cover - never let the filter break the event loop
+        print(f"Content filter error: {type(exc).__name__}")
+
+
+@bot.listen("on_message_edit")
+async def content_filter_edit_listener(before: discord.Message, after: discord.Message) -> None:
+    # An insult added by editing counts like a new message.
+    if content_filter_runtime is None or getattr(before, "content", None) == getattr(after, "content", None):
+        return
+    try:
+        await content_filter_runtime.observe(after)
+    except Exception as exc:  # pragma: no cover
+        print(f"Content filter error: {type(exc).__name__}")
+
+
+async def filter_timeout(member: Any, minutes: int, reason: str) -> None:
+    await member.timeout(timedelta(minutes=minutes), reason=reason)
+
+
+async def filter_reply(message: Any, text: str, member: Any) -> Any:
+    """Reply to the offending message; only the muted member is pinged."""
+    mentions = discord.AllowedMentions(everyone=False, roles=False, replied_user=False, users=[member])
+    try:
+        return await message.reply(text, mention_author=False, allowed_mentions=mentions)
+    except discord.HTTPException:
+        return await message.channel.send(text, allowed_mentions=mentions)
+
+
+async def filter_audit(guild: Any, text: str) -> None:
+    channel_id = content_filter_runtime.settings.audit_channel_id if content_filter_runtime is not None else None
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if not isinstance(channel, discord.TextChannel):
+        return
+    embed = discord.Embed(title=t("Content filter"), description=text[:4000], color=0xE67E22, timestamp=datetime.now(timezone.utc))
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+filter_commands = app_commands.Group(name="filter", description="Content filter: mute named members for insults and hostility", guild_only=True)
+
+
+async def _filter_access(interaction: discord.Interaction) -> dict | None:
+    """The config when the user may manage the filter here; otherwise answers and returns None."""
+    try:
+        config = load_config()
+    except RuntimeError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return None
+    if not actor_has_access(interaction, config):
+        await interaction.response.send_message(t("Access denied."), ephemeral=True)
+        return None
+    if filter_store is None:
+        await interaction.response.send_message(t("The content filter is not available on this bot."), ephemeral=True)
+        return None
+    return config
+
+
+def filter_notes(config: dict) -> str:
+    if config.get(content_filter.CONFIG_ENABLED) is False:
+        return "\n" + t("The content filter is switched off on the Manager's Content Filter page: nothing is checked until it is on.")
+    if content_filter_runtime is not None and not content_filter_runtime.message_content:
+        return "\n" + t(
+            "Restart the bot once: it needs the Message Content Intent to read messages (enable it in the Discord Developer Portal)."
+        )
+    return ""
+
+
+@filter_commands.command(name="add", description="Start filtering a member's messages")
+@app_commands.describe(member="Member to filter", note="Optional note: why this member is filtered")
+async def filter_add(interaction: discord.Interaction, member: discord.Member, note: Optional[str] = None) -> None:
+    config = await _filter_access(interaction)
+    if config is None:
+        return
+    if member.bot:
+        await interaction.response.send_message(t("Bots are not filtered."), ephemeral=True)
+        return
+    context = admin_tools.AdminToolContext(
+        guild=interaction.guild,
+        source="/filter",
+        requesting_user_id=interaction.user.id,
+        requesting_user_name=str(interaction.user),
+        enforce_hierarchy=True,
+    )
+    try:
+        admin_tools.ensure_member_actionable(context, member, action="filter")
+        added = filter_store.watch(interaction.guild.id, member.id, name=member.display_name, added_by=str(interaction.user.id), note=note or "")
+    except (admin_tools.AdminToolError, ValueError, content_filter.FilterStoreError) as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        return
+    text = (
+        t("Now filtering {member}: insults and hostility get a mute of 30 minutes to 3 hours.", member=member.mention)
+        if added
+        else t("{member} is already filtered.", member=member.mention)
+    )
+    await interaction.response.send_message(text + filter_notes(config), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    await send_audit(interaction, config, "/filter add", t("Now filtering {member}", member=f"{member} ({member.id})"))
+
+
+@filter_commands.command(name="remove", description="Stop filtering a member")
+@app_commands.describe(member="Member to stop filtering")
+async def filter_remove(interaction: discord.Interaction, member: discord.User) -> None:
+    config = await _filter_access(interaction)
+    if config is None:
+        return
+    try:
+        removed = filter_store.unwatch(interaction.guild.id, member.id)
+    except content_filter.FilterStoreError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    text = t("Stopped filtering {member}.", member=member.mention) if removed else t("{member} was not filtered.", member=member.mention)
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    if removed:
+        await send_audit(interaction, config, "/filter remove", t("Stopped filtering {member}.", member=f"{member} ({member.id})"))
+
+
+@filter_commands.command(name="list", description="Show the filtered members of this server")
+async def filter_list(interaction: discord.Interaction) -> None:
+    config = await _filter_access(interaction)
+    if config is None:
+        return
+    try:
+        guild = filter_store.guild(interaction.guild.id)
+    except content_filter.FilterStoreError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    if not guild.watched:
+        text = t("Nobody is filtered on this server.")
+    else:
+        lines = [t("Filtered members:")]
+        for member in guild.watched.values():
+            mutes = sum(1 for action in guild.actions if action.user_id == member.user_id and action.result == "muted")
+            lines.append(f"- <@{member.user_id}>" + (f" ({member.note})" if member.note else "") + t(" — mutes: {count}", count=mutes))
+        text = "\n".join(lines)
+    await interaction.response.send_message(clip_discord_message(text + filter_notes(config)), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+bot.tree.add_command(filter_commands)
+
+
 @bot.listen("on_raw_reaction_add")
 async def social_reaction_listener(payload: discord.RawReactionActionEvent) -> None:
     # How people react to Kairo's own autonomous messages (feedback for Social Awareness).
@@ -874,8 +1029,10 @@ def main(argv: list[str] | None = None) -> int:
         print(exc)
         return 1
 
-    global feature_store, terminal, social, events_publisher, instance_display_name
+    global feature_store, terminal, social, events_publisher, instance_display_name, filter_store, content_filter_runtime
     feature_store = admin_features.store_for_data_dir(getattr(runtime, "data_dir", None))
+    data_dir = getattr(runtime, "data_dir", None)
+    filter_store = content_filter.FilterStore(Path(data_dir) / content_filter.FILE_NAME) if data_dir is not None else None
     try:
         events_publisher = bot_events.EventPublisher(runtime.instance_id, admin_instance.ADMIN_BOT_TYPE_ID)
         instance_display_name = instance_store.load_instance(runtime.instance_id).display_name
@@ -883,13 +1040,15 @@ def main(argv: list[str] | None = None) -> int:
         instance_display_name = instance_display_name or ""
     if ai_transport is not None:
         ai_transport.feature_store = feature_store
+        ai_transport.content_filter = filter_store
         ai_transport.ai_stores = resolve_ai_stores(runtime)
         lock_path = getattr(runtime, "lock_path", None)
         if lock_path is not None:
             terminal = admin_terminal.BotTerminal(Path(lock_path).parent, ai_transport, bot)
 
     natural_ai = natural_ai_enabled(config) and ai_transport is not None
-    read_content = message_content_requested(config) and ai_transport is not None
+    filter_needs_content = content_filter.needs_message_content(config, filter_store)
+    read_content = (message_content_requested(config) and ai_transport is not None) or filter_needs_content
     configure_message_content_intent(bot, read_content)
     if ai_transport is not None:
         ai_transport.set_control_channel(config.get("ai_control_channel_id") if natural_ai else None)
@@ -899,6 +1058,20 @@ def main(argv: list[str] | None = None) -> int:
         print("AI control channel enabled; requesting Discord Message Content Intent.")
     elif read_content:
         print("AI message reading enabled; requesting Discord Message Content Intent.")
+    if filter_needs_content:
+        print("Content filter has named members; requesting Discord Message Content Intent.")
+    content_filter_runtime = content_filter.ContentFilter(
+        store=filter_store,
+        get_orchestrator=(ai_transport.get_orchestrator if ai_transport is not None else (lambda: None)),
+        timeout=filter_timeout,
+        reply=filter_reply,
+        audit=filter_audit,
+        message_content=read_content,
+        runtime_dir=Path(runtime.lock_path).parent,
+        write_status=admin_terminal.write_runtime_json,
+        on_mute=lambda guild_id, channel_id, user_id: social.moderated(guild_id, channel_id, user_id) if social is not None else None,
+    )
+    content_filter_runtime.apply_config(config)
     social = build_social_awareness(runtime, read_content)
     if social is not None:
         social.apply_config(config)

@@ -29,10 +29,11 @@ import os
 import re
 import secrets
 import time
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
+
+import locked_json
 
 FILE_NAME = "social_memory.json"
 VERSION = 1
@@ -216,39 +217,6 @@ def _dump_guild(memory: GuildMemory) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-@contextmanager
-def _locked(path: Path) -> Iterator[None]:
-    """Short cross-process lock (bot and Manager) around one read-modify-write."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path.with_name(f".{path.name}.lock"), "a+b")
-    locked = False
-    try:
-        try:
-            import msvcrt
-        except ImportError:  # pragma: no cover - the app runs on Windows
-            msvcrt = None
-        if msvcrt is not None:
-            for _ in range(100):
-                try:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    locked = True
-                    break
-                except OSError:
-                    time.sleep(0.02)
-            if not locked:
-                raise SocialMemoryError("The social memory file is busy; try again.")
-        yield
-    finally:
-        if locked:
-            try:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
-        handle.close()
-
-
 class SocialMemory:
     """Server Lore, autonomy outcomes and quiet wishes of one Kairo instance."""
 
@@ -259,12 +227,11 @@ class SocialMemory:
 
     # -- file ------------------------------------------------------------------------
 
+    def _locked(self):
+        return locked_json.locked(self.path, error=SocialMemoryError)
+
     def _signature(self) -> tuple[int, int] | None:
-        try:
-            stat = self.path.stat()
-        except OSError:
-            return None
-        return stat.st_mtime_ns, stat.st_size
+        return locked_json.signature(self.path)
 
     def _read(self) -> dict[str, GuildMemory]:
         signature = self._signature()
@@ -284,20 +251,11 @@ class SocialMemory:
 
     def _write(self, guilds: dict[str, GuildMemory]) -> None:
         payload = {"version": VERSION, "guilds": {key: _dump_guild(value) for key, value in sorted(guilds.items())}}
-        temp = self.path.with_name(f".{self.path.name}.{secrets.token_hex(6)}.tmp")
-        try:
-            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
-            os.replace(temp, self.path)
-        finally:
-            try:
-                if temp.exists():
-                    temp.unlink()
-            except OSError:
-                pass
+        locked_json.atomic_write_json(self.path, payload)
         self._cache = (self._signature(), guilds)
 
     def _change(self, guild_id: Any, change: Callable[[GuildMemory, float], Any]) -> Any:
-        with _locked(self.path):
+        with self._locked():
             self._cache = None  # always the latest file inside the lock
             guilds = {key: value for key, value in self._read().items()}
             key = str(int(guild_id))
@@ -486,7 +444,7 @@ class SocialMemory:
 
     def reset(self) -> Path | None:
         """Start over after an unreadable file; the old file is kept next to it."""
-        with _locked(self.path):
+        with self._locked():
             backup = None
             if self.path.exists():
                 backup = self.path.with_name(f"{self.path.stem}.corrupt-{int(time.time())}.json")

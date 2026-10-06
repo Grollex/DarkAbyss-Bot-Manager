@@ -637,6 +637,30 @@ quiet wishes and heartbeats are deterministic.
   names, mentions, or "Group Up"/"Stream Director" when that bot acted here within 2 h) as a trigger, so "Group Up опять
   охуел" is linked to that instance's latest invitation. Awareness only: Kairo cannot control another bot through it.
 
+## Kairo Content Filter (`content_filter.py`)
+
+Only named members are filtered, per server. The list and the mute log are `instances/<id>/data/content_filter.json`
+(`FilterStore`, shared with the Manager through `locked_json`: lock file + atomic replace; an unreadable file is never
+overwritten and means nobody is punished until it is reset). Members are named with `/filter add | remove | list`
+(Admin access like `/execute`, anti-escalation via `admin_tools.ensure_member_actionable`), by asking Kairo (AI tools
+`content_filter_watch` / `_unwatch` / `_list` in `admin_tools_filter.py`, normal risk = plan approval, hierarchy
+enforced) or on the Manager's Content Filter page (by user ID).
+
+Every text message of a named member is classified by the bot's AI on the ROUTINE route (normal effort, no tools) with
+the reply target and the last channel messages as context: category (hate, threat, harassment, family, insult,
+toxicity, profanity, none), target, joking, severity 1-5, confidence. Local RU/EN word lists are hints; they decide
+alone only when the AI is unavailable, and then only slurs and threats. The decision is deterministic
+(`mute_minutes`): categories in `content_filter_immediate` (default hate, threat, harassment, family) are punished even
+as a joke (confidence >= 0.6); the others only when meant (not joking, aimed at people, confidence >= 0.7); profanity
+never. Duration 30/45/60/120/180 min by severity (zero tolerance at least 60), +30 min per mute in the last 7 days,
+clamped to 30-180. The only punishment is a Discord timeout; Kairo replies to the message pinging only that member
+(allowed mentions = that user) with a template in the bot language, logs it and posts to the audit channel. Owner,
+administrators and members with a role at or above the bot are never muted (logged as failed with the reason). Bursts
+are judged once, members already timed out are skipped, at most 20 AI checks per member per 10 min (beyond: only
+messages with local signals). Edited messages are judged again. Config: `content_filter_enabled` (default true; it does
+nothing until someone is named) and `content_filter_immediate`; the Message Content Intent is requested at start when
+the filter is on and the list is not empty. After a mute Social Awareness drops its pending analysis of that channel.
+
 ## Shared AI Access And Runtime Ownership
 
 Access policy and runtime host ownership are separate problems.

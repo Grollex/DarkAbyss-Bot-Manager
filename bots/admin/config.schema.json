@@ -153,6 +153,16 @@
     },
     "social_awareness_lore_enabled": {
       "type": "boolean"
+    },
+    "content_filter_enabled": {
+      "type": "boolean"
+    },
+    "content_filter_immediate": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(hate|threat|harassment|family|insult|toxicity)$"
+      }
     }
   }
 }
