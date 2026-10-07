@@ -23,7 +23,7 @@ import bot_i18n_keys  # noqa: E402
 
 ADMIN_MODULES = (
     "Admin.py", "admin_ai.py", "admin_tools.py", "admin_tools_server.py", "admin_tools_content.py", "admin_features.py", "admin_blueprint.py",
-    "social_awareness.py", "content_filter.py", "admin_tools_filter.py",
+    "social_awareness.py", "content_filter.py", "admin_tools_filter.py", "message_policy.py",
 )
 
 

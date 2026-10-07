@@ -20,6 +20,7 @@ import bot_i18n
 import bot_registry
 import config_store
 import content_filter
+import message_policy
 import instance_store
 import runtime_layout
 import social_awareness
@@ -186,6 +187,8 @@ def validate_config(config: dict) -> dict:
     social_awareness.validate_config_fields(config, parse_snowflake_list)
     # Content filter: on by default, but it only checks members someone named.
     content_filter.validate_config_fields(config)
+    # Admin-defined custom message rules (generic engine; the rules live in the local config).
+    message_policy.validate_config_fields(config)
 
     return config
 
@@ -449,6 +452,7 @@ social: social_awareness.SocialAwareness | None = None
 # judges their messages. Set in main(); None when the bot has no data folder.
 filter_store: content_filter.FilterStore | None = None
 content_filter_runtime: content_filter.ContentFilter | None = None
+message_policy_runtime: message_policy.MessagePolicyEngine | None = None
 
 # This bot on the DarkAbyss bot event bus (heartbeat: "Kairo is running"). Set in main().
 events_publisher: bot_events.EventPublisher | None = None
@@ -535,6 +539,8 @@ def refresh_live_config() -> dict | None:
         social.apply_config(config)
     if content_filter_runtime is not None:
         content_filter_runtime.apply_config(config)
+    if message_policy_runtime is not None:
+        message_policy_runtime.apply_config(config)
     return config
 
 
@@ -735,6 +741,17 @@ async def content_filter_listener(message: discord.Message) -> None:
         print(f"Content filter error: {type(exc).__name__}")
 
 
+@bot.listen("on_message")
+async def message_policy_listener(message: discord.Message) -> None:
+    # Admin-defined custom rules (off and empty by default).
+    if message_policy_runtime is None:
+        return
+    try:
+        await message_policy_runtime.observe(message)
+    except Exception as exc:  # pragma: no cover
+        print(f"Message policy error: {type(exc).__name__}")
+
+
 @bot.listen("on_message_edit")
 async def content_filter_edit_listener(before: discord.Message, after: discord.Message) -> None:
     # An insult added by editing counts like a new message.
@@ -744,6 +761,11 @@ async def content_filter_edit_listener(before: discord.Message, after: discord.M
         await content_filter_runtime.observe(after)
     except Exception as exc:  # pragma: no cover
         print(f"Content filter error: {type(exc).__name__}")
+    if message_policy_runtime is not None and getattr(before, "content", None) != getattr(after, "content", None):
+        try:
+            await message_policy_runtime.observe(after)
+        except Exception as exc:  # pragma: no cover
+            print(f"Message policy error: {type(exc).__name__}")
 
 
 async def filter_timeout(member: Any, minutes: int, reason: str) -> None:
@@ -751,12 +773,18 @@ async def filter_timeout(member: Any, minutes: int, reason: str) -> None:
 
 
 async def filter_reply(message: Any, text: str, member: Any) -> Any:
-    """Reply to the offending message; only the muted member is pinged."""
+    """Reply to the offending message; only that member is pinged."""
     mentions = discord.AllowedMentions(everyone=False, roles=False, replied_user=False, users=[member])
     try:
         return await message.reply(text, mention_author=False, allowed_mentions=mentions)
     except discord.HTTPException:
         return await message.channel.send(text, allowed_mentions=mentions)
+
+
+async def policy_delete(message: Any) -> bool:
+    """Delete the original message so the reply shows over a 'deleted message'."""
+    await message.delete()
+    return True
 
 
 async def filter_audit(guild: Any, text: str) -> None:
@@ -1029,7 +1057,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc)
         return 1
 
-    global feature_store, terminal, social, events_publisher, instance_display_name, filter_store, content_filter_runtime
+    global feature_store, terminal, social, events_publisher, instance_display_name, filter_store, content_filter_runtime, message_policy_runtime
     feature_store = admin_features.store_for_data_dir(getattr(runtime, "data_dir", None))
     data_dir = getattr(runtime, "data_dir", None)
     filter_store = content_filter.FilterStore(Path(data_dir) / content_filter.FILE_NAME) if data_dir is not None else None
@@ -1048,7 +1076,8 @@ def main(argv: list[str] | None = None) -> int:
 
     natural_ai = natural_ai_enabled(config) and ai_transport is not None
     filter_needs_content = content_filter.needs_message_content(config, filter_store)
-    read_content = (message_content_requested(config) and ai_transport is not None) or filter_needs_content
+    policy_needs_content = message_policy.needs_message_content(config) and ai_transport is not None
+    read_content = (message_content_requested(config) and ai_transport is not None) or filter_needs_content or policy_needs_content
     configure_message_content_intent(bot, read_content)
     if ai_transport is not None:
         ai_transport.set_control_channel(config.get("ai_control_channel_id") if natural_ai else None)
@@ -1060,6 +1089,8 @@ def main(argv: list[str] | None = None) -> int:
         print("AI message reading enabled; requesting Discord Message Content Intent.")
     if filter_needs_content:
         print("Content filter has named members; requesting Discord Message Content Intent.")
+    if policy_needs_content:
+        print("Custom message rules are on; requesting Discord Message Content Intent.")
     content_filter_runtime = content_filter.ContentFilter(
         store=filter_store,
         get_orchestrator=(ai_transport.get_orchestrator if ai_transport is not None else (lambda: None)),
@@ -1072,6 +1103,16 @@ def main(argv: list[str] | None = None) -> int:
         on_mute=lambda guild_id, channel_id, user_id: social.moderated(guild_id, channel_id, user_id) if social is not None else None,
     )
     content_filter_runtime.apply_config(config)
+    message_policy_runtime = message_policy.MessagePolicyEngine(
+        get_orchestrator=(ai_transport.get_orchestrator if ai_transport is not None else (lambda: None)),
+        reply=filter_reply,
+        delete=policy_delete,
+        audit=filter_audit,
+        message_content=read_content,
+        runtime_dir=Path(runtime.lock_path).parent,
+        write_status=admin_terminal.write_runtime_json,
+    )
+    message_policy_runtime.apply_config(config)
     social = build_social_awareness(runtime, read_content)
     if social is not None:
         social.apply_config(config)

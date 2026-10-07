@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 import admin_terminal
 import content_filter as cf
+import message_policy as mp
 import instance_store
 import manager_dashboard as dash
 
@@ -109,6 +110,12 @@ class ContentFilterPanel(QWidget):
         help_label.setWordWrap(True)
         settings_panel.body.addLayout(form)
         settings_panel.body.addWidget(help_label)
+        self.policy_checkbox = QCheckBox("Custom message rules (defined locally in Bots → Advanced JSON)")
+        self.policy_checkbox.setToolTip(
+            "Turns on any custom \"message_policies\" rules kept in this bot's config. They are not part of the program or "
+            "its releases — you define them yourself in Advanced JSON. Off here means they never run."
+        )
+        settings_panel.body.addWidget(self.policy_checkbox)
         self.save_button = dash.styled_button("Save", "primary")
         self.save_restart_button = dash.styled_button("Save && Restart Bot", "secondary")
         self.save_button.clicked.connect(lambda: self.save())
@@ -184,6 +191,7 @@ class ContentFilterPanel(QWidget):
         outer.addWidget(scroll)
 
         self.enabled_checkbox.toggled.connect(lambda _checked: self._update_dirty())
+        self.policy_checkbox.toggled.connect(lambda _checked: self._update_dirty())
         for box in self.immediate_boxes.values():
             box.toggled.connect(lambda _checked: self._update_dirty())
         self.refresh()
@@ -225,7 +233,7 @@ class ContentFilterPanel(QWidget):
         return admin_terminal.read_runtime_json(runtime, cf.STATUS_FILE_NAME)
 
     def _set_enabled(self, enabled: bool) -> None:
-        for widget in (self.save_button, self.save_restart_button, self.enabled_checkbox, *self.immediate_boxes.values()):
+        for widget in (self.save_button, self.save_restart_button, self.enabled_checkbox, self.policy_checkbox, *self.immediate_boxes.values()):
             widget.setEnabled(enabled)
 
     # -- loading ---------------------------------------------------------------------------
@@ -272,6 +280,7 @@ class ContentFilterPanel(QWidget):
             effective = dict(self._config_api.get_config_snapshot(bot[0]).effective)
             checked = {key: effective[key] for key in (cf.CONFIG_ENABLED, cf.CONFIG_IMMEDIATE) if key in effective}
             cf.validate_config_fields(checked)
+            checked[mp.CONFIG_ENABLED] = effective.get(mp.CONFIG_ENABLED) is True
             self._loaded = checked
         except Exception as exc:
             self._loaded = {}
@@ -282,6 +291,7 @@ class ContentFilterPanel(QWidget):
             immediate = set(self._loaded.get(cf.CONFIG_IMMEDIATE, cf.DEFAULT_IMMEDIATE))
             for category, box in self.immediate_boxes.items():
                 box.setChecked(category in immediate)
+            self.policy_checkbox.setChecked(self._loaded.get(mp.CONFIG_ENABLED, False) is True)
         finally:
             self._loading = False
         self._config_ok = problem is None
@@ -301,13 +311,18 @@ class ContentFilterPanel(QWidget):
         return {
             cf.CONFIG_ENABLED: self.enabled_checkbox.isChecked(),
             cf.CONFIG_IMMEDIATE: [category for category, box in self.immediate_boxes.items() if box.isChecked()],
+            mp.CONFIG_ENABLED: self.policy_checkbox.isChecked(),
         }
 
     @property
     def dirty(self) -> bool:
         if self._current_bot is None or not self._config_ok:
             return False
-        saved = {cf.CONFIG_ENABLED: self._loaded.get(cf.CONFIG_ENABLED, True), cf.CONFIG_IMMEDIATE: list(self._loaded.get(cf.CONFIG_IMMEDIATE, cf.DEFAULT_IMMEDIATE))}
+        saved = {
+            cf.CONFIG_ENABLED: self._loaded.get(cf.CONFIG_ENABLED, True),
+            cf.CONFIG_IMMEDIATE: list(self._loaded.get(cf.CONFIG_IMMEDIATE, cf.DEFAULT_IMMEDIATE)),
+            mp.CONFIG_ENABLED: self._loaded.get(mp.CONFIG_ENABLED, False),
+        }
         return self.current_settings() != saved
 
     def _update_dirty(self) -> None:

@@ -51,6 +51,7 @@ def load_gui_module(data_root: Path):
         "manager_kairo",
         "manager_content_filter",
         "content_filter",
+        "message_policy",
         "locked_json",
         "social_awareness",
         "social_memory",

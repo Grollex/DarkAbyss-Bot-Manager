@@ -39,6 +39,9 @@ AI_WHITELIST_DEFAULTS = {
     # Content filter: on, but it only checks members someone named.
     "content_filter_enabled": True,
     "content_filter_immediate": ["hate", "threat", "harassment", "family"],
+    # Custom message rules: generic engine, off and empty by default.
+    "message_policies_enabled": False,
+    "message_policies": [],
 }
 
 

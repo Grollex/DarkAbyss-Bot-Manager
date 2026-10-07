@@ -55,6 +55,7 @@ a = Analysis(
         "admin_tools_filter",
         "manager_content_filter",
         "locked_json",
+        "message_policy",
         "ai_storage",
         "ai_usage",
         "ai_connections",

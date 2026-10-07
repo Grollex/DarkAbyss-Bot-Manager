@@ -661,6 +661,27 @@ messages with local signals). Edited messages are judged again. Config: `content
 nothing until someone is named) and `content_filter_immediate`; the Message Content Intent is requested at start when
 the filter is on and the list is not empty. After a mute Social Awareness drops its pending analysis of that channel.
 
+## Custom Message Rules (`message_policy.py`)
+
+A generic engine that ships inert: it carries no rule of its own, is off by default (`message_policies_enabled`),
+and an empty `message_policies` means it never runs. An instance defines rules in its own config, so a rule can be
+kept purely local to one install and never appears in the program or a release. Each rule is plain config: `id`,
+`enabled`, `applies_to` (`"everyone"` or a list of user IDs), `channel_ids` (empty = every channel), `description`
+(what counts as a violation, in words), `reply_templates` (one is chosen at random; `{user}` is the author mention),
+`min_confidence` (0.5-1.0, default 0.75).
+
+For a message in scope the engine makes ONE AI call (ROUTINE route, normal effort, no tools) asking whether the
+message breaks that one rule, with the reply target and recent channel messages as context. On a confident violation
+it replies to the message (pinging only the author) and then deletes the original, so Discord shows the reply over a
+"message deleted". Baked into the classifier and not configurable: a message where the author appears to be in genuine
+danger, disclosing abuse or threats against them, or reaching out about self-harm is treated as `distress` and never
+removed or called out. Guards: bots/webhooks/the bot's own messages are skipped, very short messages are skipped, at
+most 15 AI checks per author per 10 minutes, an 8 s per-author cooldown after acting (so a burst or an edit is not
+hit twice), and a failed delete keeps the reply and reports the missing Manage Messages permission. The engine needs
+the Message Content Intent (requested at start when it is on with at least one usable rule) and no persistent store;
+a status file and the Manager's Content Filter toggle expose it. After it acts, Social Awareness is not involved for
+that message. The Manager only toggles it on/off; rules are edited in Bots -> Advanced JSON.
+
 ## Shared AI Access And Runtime Ownership
 
 Access policy and runtime host ownership are separate problems.

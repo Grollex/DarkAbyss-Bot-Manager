@@ -408,4 +408,11 @@ RU = {
     "Insulting someone's mother or family": "Оскорбления матери или семьи",
     "Direct insults, name-calling": "Прямые оскорбления, обзывательства",
     "Hostility, bullying, aggression": "Враждебность, травля, агрессия",
+    # -- message_policy.py: custom rule config validation -----------------------------------
+    '"{key}" must be a list of at most {max} rules.': '"{key}" должно быть списком не более чем из {max} правил.',
+    'Each "{key}" rule must be an object.': 'Каждое правило в "{key}" должно быть объектом.',
+    'A "{key}" rule needs a non-empty "description".': 'Правилу в "{key}" нужен непустой "description".',
+    'A "{key}" rule needs at least one "reply_templates" entry.': 'Правилу в "{key}" нужен хотя бы один "reply_templates".',
+    'Duplicate rule id in "{key}": {id}.': 'Повторяющийся id правила в "{key}": {id}.',
+    "A \"{key}\" rule's \"applies_to\" must be \"everyone\" or a list of user IDs.": 'В правиле "{key}" поле "applies_to" должно быть "everyone" или списком ID пользователей.',
 }

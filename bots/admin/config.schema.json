@@ -163,6 +163,15 @@
         "type": "string",
         "pattern": "^(hate|threat|harassment|family|insult|toxicity)$"
       }
+    },
+    "message_policies_enabled": {
+      "type": "boolean"
+    },
+    "message_policies": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
     }
   }
 }
