@@ -1,33 +1,33 @@
 # DarkAbyss Bot Manager
 
-Windows-программа для запуска и настройки Discord-ботов:
+A Windows app for running and configuring several Discord bots from one place. Each bot has its own Discord token, process, settings, data and language (English or Russian). AI connections (Groq, Gemini) are shared: one default set for all bots, with an optional override per bot.
 
-- **Admin Bot (Kairo)** — администрирование сервера через slash-команды и ИИ (Groq / Gemini) с подтверждением действий; по желанию **Social Awareness**: понимает живой контекст сервера, помнит его мемы и шутки (Server Lore), сам решает — ответить, поставить реакцию, вернуться позже или промолчать, и замолкает по просьбе;
-- **Game Presence Bot (Group Up)** — предлагает поиграть вместе, когда несколько участников запускают одну игру, и зовёт в войс, где уже играют (упоминая весь войс);
-- **Stream Director Bot** — каждый Twitch-стрим превращает в живую сессию сообщества в Discord: карточка и тред, моменты, челленджи, опросы, итоги.
+I run it on my own Discord community server.
 
-У каждого бота свой Discord-токен, процесс, настройки, данные и язык (English / Русский). ИИ-подключения общие: базовый набор для всех ботов и, по желанию, свой выбор у отдельного бота.
+## Bots
 
-## Установка
+- **Admin Bot** (on the server it's called Kairo): moderation and server setup through slash commands and AI. The AI can only use a fixed list of actions, every plan needs approval, and risky steps need a second confirmation. There is an optional chat mode where it reads the conversation, remembers the server's inside jokes and chooses whether to answer, react or stay quiet. It goes quiet when asked.
+- **Game Presence Bot** (Group Up): when several members start the same game, it suggests playing together and calls them to the voice channel where others are already playing.
+- **Stream Director Bot**: for each Twitch stream it posts a card and a thread on Discord and runs highlights, challenges, polls and a recap.
 
-1. Скачай `DarkAbyssBotManager-<версия>-windows.zip` из [Releases](https://github.com/Grollex/DarkAbyss-Bot-Manager/releases/latest).
-2. Распакуй в постоянную папку с правом записи (например `%LOCALAPPDATA%\Programs\DarkAbyssBotManager`, не `Program Files`).
-3. Запускай `Launcher.exe`.
+## Install
 
-## Обновления
+1. Download `DarkAbyssBotManager-<version>-windows.zip` from [Releases](https://github.com/Grollex/DarkAbyss-Bot-Manager/releases/latest).
+2. Unzip it to a permanent folder you can write to, for example `%LOCALAPPDATA%\Programs\DarkAbyssBotManager` (not `Program Files`).
+3. Run `Launcher.exe`.
 
-Программа сама проверяет новые релизы (при запуске и каждые 6 часов). Когда выходит новая версия, в боковом меню появляется кнопка **⬆ Update to v…**: новая версия скачивается, проверяется (SHA-256), ставится рядом с текущей, Manager перезапускается и снова запускает работавших ботов. Если что-то пошло не так, остаётся текущая версия.
+## Updates
 
-Боты, токены, ИИ-ключи, настройки и логи хранятся отдельно — в `%LOCALAPPDATA%\DarkAbyssBotManager` — и обновлением не затрагиваются. В релизах только файлы программы: их собирает GitHub Actions из этого репозитория.
+When a new release is out, an **Update to v…** button appears in the sidebar. The update is checked against SHA-256 and installed next to the current version, and the bots that were running start again; if something fails, the old version stays. Tokens, AI keys, settings and logs are kept in `%LOCALAPPDATA%\DarkAbyssBotManager` and survive updates.
 
-## Для разработчика
+## Development
 
 ```bat
 pip install -r requirements-build.txt
 python -m unittest discover -s tests
-build_windows.bat 1.1.0
+build_windows.bat X.Y.Z
 ```
 
-Новый релиз: `git tag v1.1.0 && git push origin main v1.1.0` — workflow `.github/workflows/release.yml` прогоняет тесты, собирает и публикует релиз.
+To publish a release: `git tag vX.Y.Z && git push origin main vX.Y.Z`. The workflow in `.github/workflows/release.yml` runs the tests, builds the package and publishes it.
 
-Подробности: [README_RU.txt](README_RU.txt), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). In Russian: [README.ru.md](README.ru.md) and the full guide [README_RU.txt](README_RU.txt).
